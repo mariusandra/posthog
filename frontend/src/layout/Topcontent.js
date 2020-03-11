@@ -1,7 +1,6 @@
 import React, { Component } from 'react'
-import { NavLink } from 'react-router-dom';
 
-export default class Topcontent extends Component {
+export class Topcontent extends Component {
     render() {
         return (
         	<div>
