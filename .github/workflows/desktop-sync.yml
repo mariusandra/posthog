@@ -98,14 +98,17 @@ jobs:
               continue-on-error: true
               run: pnpm --filter=@posthog/desktop test
 
+            - name: Install Codex
+              if: steps.merge.outputs.state == 'conflicts' || steps.tests.outcome == 'failure'
+              run: npm install -g @openai/codex pnpm
+
             - name: Resolve with Codex
               if: steps.merge.outputs.state == 'conflicts' || steps.tests.outcome == 'failure'
               env:
-                  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+                  DESKTOP_SYNC_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
                   MERGE_STATE: ${{ steps.merge.outputs.state }}
               run: |
-                  npm install -g @openai/codex pnpm
-                  codex exec --dangerously-bypass-approvals-and-sandbox "You are running inside the desktop-sync workflow on the mariusandra/posthog fork. Merge state: $MERGE_STATE (either an in-progress conflicted merge of upstream master or the desktop PR branch, or a completed merge whose desktop tests fail). Read .agents/skills/syncing-desktop-fork/SKILL.md and follow it: finish the merge, fix what the merge broke, and leave the working tree committed and clean. Do not push."
+                  CODEX_API_KEY="$DESKTOP_SYNC_OPENAI_API_KEY" codex exec --dangerously-bypass-approvals-and-sandbox "You are running inside the desktop-sync workflow on the mariusandra/posthog fork. Merge state: $MERGE_STATE (either an in-progress conflicted merge of upstream master or the desktop PR branch, or a completed merge whose desktop tests fail). Read .agents/skills/syncing-desktop-fork/SKILL.md and follow it: finish the merge, fix what the merge broke, and leave the working tree committed and clean. Do not push."
 
             - name: Verify merge concluded
               run: |
