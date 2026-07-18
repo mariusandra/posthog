@@ -52,7 +52,7 @@ Status source: `scene: SceneExport` files, checked for `tabAwareScene()` / tabId
 - [x] `products/workflows/frontend/Workflows/WorkflowScene.tsx` (workflowSceneLogic)
 - [x] `products/workflows/frontend/WorkflowsScene.tsx` (workflowsSceneLogic)
 
-## Not tab aware — root logic exists but is not keyed by tabId (156)
+## Not tab aware — root logic exists but is not keyed by tabId (157)
 
 Deliberately kept on their current (rebuilt-since-June) architecture for now: **tracing**, **replay vision**, **metrics**, and the **logs viewer family** (project-scoped `LOGS_SCENE_VIEWER_ID` persistence). Convert these with care — they gained major features after the original tab support was removed.
 
@@ -131,6 +131,7 @@ Deliberately kept on their current (rebuilt-since-June) architecture for now: **
 - [ ] `frontend/src/scenes/project-homepage/ProjectHomepage.tsx` (projectHomepageLogic)
 - [ ] `frontend/src/scenes/project/Create/index.tsx` (teamLogic)
 - [ ] `frontend/src/scenes/project/PendingDeletion.tsx` (projectLogic)
+- [ ] `frontend/src/scenes/quickstart/Quickstart.tsx` (quickstartLogic)
 - [ ] `frontend/src/scenes/resource-transfer/ResourceTransfer.tsx` (resourceTransferLogic)
 - [ ] `frontend/src/scenes/session-recordings/detail/SessionRecordingDetail.tsx` (sessionRecordingDetailLogic)
 - [ ] `frontend/src/scenes/session-recordings/file-playback/SessionRecordingFilePlaybackScene.tsx` (sessionRecordingFilePlaybackSceneLogic)
