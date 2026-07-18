@@ -4,6 +4,8 @@ name: Desktop Fork Sync
 # desktop PR branch into the fork's `desktop` branch daily, with the OpenAI
 # Codex CLI resolving conflicts and merge fallout per
 # .agents/skills/syncing-desktop-fork/SKILL.md. Inert in PostHog/posthog.
+# The fork keeps its own .github/workflows tree: GITHUB_TOKEN deliberately lacks
+# permission to let repository-controlled code rewrite future workflow runs.
 #
 # Fork setup: enable Actions on the fork, enable this (scheduled workflows in
 # forks start disabled), and add the OPENAI_API_KEY secret.
@@ -49,6 +51,9 @@ jobs:
                   git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
                   git remote add upstream https://github.com/PostHog/posthog.git
 
+                  desktop_base=$(git rev-parse HEAD)
+                  echo "base=$desktop_base" >> "$GITHUB_OUTPUT"
+
                   # Merge master first (PostHog updates), then the desktop PR
                   # branch (desktop dev). Only fetch/merge the PR branch if it
                   # still exists upstream.
@@ -66,9 +71,16 @@ jobs:
                           echo "Already up to date with $ref"
                           continue
                       fi
-                      if git merge --no-edit "$ref"; then
+                      if git merge --no-edit --no-commit "$ref"; then
+                          # Keep the fork's workflow definitions. GITHUB_TOKEN
+                          # cannot (and should not) update workflow files.
+                          git restore --source="$desktop_base" --staged --worktree -- .github/workflows
+                          git commit --no-edit
                           if [ "$state" = up-to-date ]; then state=merged; fi
                       else
+                          # Resolve any workflow conflicts to the fork's side
+                          # before handing remaining conflicts to Codex.
+                          git restore --source="$desktop_base" --staged --worktree -- .github/workflows
                           echo "Conflicts merging $ref"
                           state=conflicts
                           break
@@ -106,11 +118,14 @@ jobs:
               if: steps.merge.outputs.state == 'conflicts' || steps.tests.outcome == 'failure'
               env:
                   DESKTOP_SYNC_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+                  DESKTOP_BASE_SHA: ${{ steps.merge.outputs.base }}
                   MERGE_STATE: ${{ steps.merge.outputs.state }}
               run: |
-                  CODEX_API_KEY="$DESKTOP_SYNC_OPENAI_API_KEY" codex exec --dangerously-bypass-approvals-and-sandbox "You are running inside the desktop-sync workflow on the mariusandra/posthog fork. Merge state: $MERGE_STATE (either an in-progress conflicted merge of upstream master or the desktop PR branch, or a completed merge whose desktop tests fail). Read .agents/skills/syncing-desktop-fork/SKILL.md and follow it: finish the merge, fix what the merge broke, and leave the working tree committed and clean. Do not push."
+                  CODEX_API_KEY="$DESKTOP_SYNC_OPENAI_API_KEY" codex exec --dangerously-bypass-approvals-and-sandbox "You are running inside the desktop-sync workflow on the mariusandra/posthog fork. Merge state: $MERGE_STATE (either an in-progress conflicted merge of upstream master or the desktop PR branch, or a completed merge whose desktop tests fail). Read .agents/skills/syncing-desktop-fork/SKILL.md and follow it: finish the merge, fix what the merge broke, and leave the working tree committed and clean. Keep .github/workflows exactly as it was at $DESKTOP_BASE_SHA. Do not push."
 
             - name: Verify merge concluded
+              env:
+                  DESKTOP_BASE_SHA: ${{ steps.merge.outputs.base }}
               run: |
                   if [ -f .git/MERGE_HEAD ]; then
                       echo "::error::Merge is still in progress"
@@ -120,6 +135,11 @@ jobs:
                   if [ -n "$(git status --porcelain)" ]; then
                       echo "::error::Working tree is not clean"
                       git status --porcelain
+                      exit 1
+                  fi
+                  if ! git diff --quiet "$DESKTOP_BASE_SHA" HEAD -- .github/workflows; then
+                      echo "::error::The sync changed fork-owned workflow files"
+                      git diff --stat "$DESKTOP_BASE_SHA" HEAD -- .github/workflows
                       exit 1
                   fi
 
