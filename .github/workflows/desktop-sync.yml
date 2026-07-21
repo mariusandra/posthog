@@ -154,7 +154,8 @@ jobs:
               run: git push origin HEAD:desktop
 
             # A GITHUB_TOKEN push doesn't fire push-triggered workflows, so kick
-            # the release check explicitly; it no-ops unless the version changed
+            # the release explicitly; it bumps the patch version itself when the
+            # current one is already released, so every sync ships a release
             - name: Dispatch release check
               if: steps.merge.outputs.state != 'up-to-date'
               env:

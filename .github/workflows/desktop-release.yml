@@ -1,11 +1,12 @@
 name: Desktop Release
 
-# Fork-only (mariusandra/posthog): when `version` in products/desktop/package.json
-# has no matching `desktop-v<version>` release yet, build the signed + notarized
-# macOS DMG and the Windows installer and publish them as a GitHub release on
-# the fork. Inert in PostHog/posthog. Mirrors build-desktop-app.yml but on
-# GitHub-hosted runners (the fork has no Depot) — keep the packaging steps in
-# the two files aligned when editing either.
+# Fork-only (mariusandra/posthog): build the signed + notarized macOS DMG and
+# the Windows installer and publish them as a GitHub release on the fork. If
+# `version` in products/desktop/package.json is already released, the patch
+# version is bumped and pushed to `desktop` first, so every run (including the
+# nightly desktop-sync dispatch) ships a release. Inert in PostHog/posthog.
+# Mirrors build-desktop-app.yml but on GitHub-hosted runners (the fork has no
+# Depot) — keep the packaging steps in the two files aligned when editing either.
 #
 # Fork secrets: APPLE_CODESIGN_CERT_BASE64, APPLE_CODESIGN_CERT_PASSWORD,
 # APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID.
@@ -25,41 +26,54 @@ concurrency:
 
 jobs:
     check-version:
-        name: Check for unreleased version
+        name: Determine release version
         if: github.repository == 'mariusandra/posthog'
         runs-on: ubuntu-latest
         timeout-minutes: 5
+        permissions:
+            contents: write
         outputs:
             version: ${{ steps.check.outputs.version }}
-            should_release: ${{ steps.check.outputs.should_release }}
+            # Later jobs build this commit — the bump commit when one was
+            # pushed — so the packaged app version matches the release tag
+            sha: ${{ steps.check.outputs.sha }}
         steps:
             - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
               with:
                   sparse-checkout: products/desktop
 
-            - name: Compare version against existing releases
+            - name: Bump patch version if current version is already released
               id: check
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
                   VERSION=$(jq -r .version products/desktop/package.json)
-                  echo "version=$VERSION" >> "$GITHUB_OUTPUT"
                   if gh release view "desktop-v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-                      echo "desktop-v$VERSION already released"
-                      echo "should_release=false" >> "$GITHUB_OUTPUT"
+                      echo "desktop-v$VERSION already released; bumping patch version"
+                      VERSION=$(cd products/desktop && npm version patch --no-git-tag-version | tail -1)
+                      VERSION=${VERSION#v}
+                      git config user.name "github-actions[bot]"
+                      git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                      git add products/desktop/package.json
+                      git commit -m "chore(desktop): bump version to $VERSION for release"
+                      # A GITHUB_TOKEN push doesn't fire push-triggered workflows,
+                      # so this can't retrigger this workflow in a loop
+                      git push origin HEAD:refs/heads/desktop
                   else
                       echo "desktop-v$VERSION not released yet"
-                      echo "should_release=true" >> "$GITHUB_OUTPUT"
                   fi
+                  echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+                  echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
     build-frontend:
         name: Build frontend bundle
         needs: check-version
-        if: needs.check-version.outputs.should_release == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 60
         steps:
             - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  ref: ${{ needs.check-version.outputs.sha }}
 
             - name: Install dependencies
               uses: ./.github/actions/pnpm-install
@@ -88,7 +102,6 @@ jobs:
     package-macos:
         name: Package macOS DMG (arm64, signed)
         needs: [check-version, build-frontend]
-        if: needs.check-version.outputs.should_release == 'true'
         runs-on: macos-14
         timeout-minutes: 60
         env:
@@ -103,6 +116,8 @@ jobs:
                   fi
 
             - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  ref: ${{ needs.check-version.outputs.sha }}
 
             - name: Install desktop dependencies
               uses: ./.github/actions/pnpm-install
@@ -142,7 +157,6 @@ jobs:
     package-windows:
         name: Package Windows installer (x64)
         needs: [check-version, build-frontend]
-        if: needs.check-version.outputs.should_release == 'true'
         runs-on: windows-latest
         timeout-minutes: 30
         steps:
@@ -153,6 +167,7 @@ jobs:
 
             - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
               with:
+                  ref: ${{ needs.check-version.outputs.sha }}
                   sparse-checkout: |
                       .github/actions
                       patches
@@ -188,7 +203,6 @@ jobs:
     release:
         name: Publish GitHub release
         needs: [check-version, package-macos, package-windows]
-        if: needs.check-version.outputs.should_release == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 10
         permissions:
@@ -205,6 +219,7 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
                   VERSION: ${{ needs.check-version.outputs.version }}
+                  TARGET_SHA: ${{ needs.check-version.outputs.sha }}
               run: |
                   # Asset names are version-less via artifactName in electron-builder.yml,
                   # keeping the landing page's /releases/latest/download/<name> links and
@@ -212,7 +227,7 @@ jobs:
                   # from the same base URL) stable across releases.
                   gh release create "desktop-v$VERSION" \
                       --repo "$GITHUB_REPOSITORY" \
-                      --target "$GITHUB_SHA" \
+                      --target "$TARGET_SHA" \
                       --title "PostHog Desktop $VERSION" \
                       --notes "PostHog Desktop $VERSION. macOS build is signed and notarized; the Windows installer is unsigned (SmartScreen: \"More info\" > \"Run anyway\"). Installed apps update automatically from this release feed." \
                       dist/*
