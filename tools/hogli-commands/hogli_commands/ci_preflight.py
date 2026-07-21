@@ -190,6 +190,12 @@ Status = Literal["pass", "fail", "advisory", "skipped"]
 # command must not hang the agent loop forever (output is captured, not streamed).
 _CHECK_TIMEOUT_SECONDS = 600
 
+# A diff this wide means the base ref is stale (e.g. a fork whose master never
+# synced), not that the push really touches thousands of files. Appending them
+# all as argv crashes with E2BIG before the check even runs, so skip with a
+# pointer instead — CI remains the gate.
+_MAX_CHECK_FILES = 2000
+
 
 def _run_diff_check(chk: DiffCheck, do_fix: bool) -> tuple[Status, str]:
     if chk.advice is not None:
@@ -212,6 +218,11 @@ def _run_diff_check(chk: DiffCheck, do_fix: bool) -> tuple[Status, str]:
         present = [f for f in chk.matched if (REPO_ROOT / f).exists()]
         if not present:
             return "skipped", "only deleted files"
+        if len(present) > _MAX_CHECK_FILES:
+            return (
+                "skipped",
+                f"{len(present)} files in diff — base ref looks stale, sync it (e.g. fork master) and retry",
+            )
         cmd += present
     if shutil.which(cmd[0]) is None:
         return "skipped", f"{cmd[0]} not found"
