@@ -35,6 +35,7 @@ import { ExperimentDebugPanel } from './ExperimentExecutionPathComparison'
 import { ExperimentFeedbackTab } from './ExperimentFeedbackTab'
 import { ExperimentHeader } from './ExperimentHeader'
 import { EditConclusionModal } from './ExperimentModals'
+import { ExperimentReplayTab } from './ExperimentReplayTab'
 import { ExperimentWarningBanner } from './ExperimentWarningBanners'
 import { ExposureCriteriaModal } from './ExposureCriteria'
 import { Exposures } from './Exposures'
@@ -132,6 +133,7 @@ const VariantsTab = (): JSX.Element => {
 export function ExperimentView({ tabId }: Pick<ExperimentSceneLogicProps, 'tabId'>): JSX.Element {
     const { experimentLoading, experimentId, experiment, isExperimentDraft, exposureCriteria, showDebugPanel } =
         useValues(experimentLogic)
+    const { featureFlags } = useValues(featureFlagLogic)
     const {
         setExperiment,
         setExposureCriteria,
@@ -206,6 +208,15 @@ export function ExperimentView({ tabId }: Pick<ExperimentSceneLogicProps, 'tabId
                                 ),
                                 content: <AiAnalysisTab />,
                             },
+                            ...(featureFlags[FEATURE_FLAGS.EXPERIMENT_RECORDINGS_TAB]
+                                ? [
+                                      {
+                                          key: 'recordings',
+                                          label: 'Recordings',
+                                          content: <ExperimentReplayTab experiment={experiment} />,
+                                      },
+                                  ]
+                                : []),
                             ...(!isExperimentDraft
                                 ? [
                                       {
