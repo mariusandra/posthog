@@ -7,6 +7,8 @@ import { Slide, ToastContainer } from 'react-toastify'
 import { PostHogProvider } from '@posthog/react'
 
 import { DesktopLinkContextMenu } from 'lib/components/DesktopLinkContextMenu/DesktopLinkContextMenu'
+import { ProductEmptyStateGate } from 'lib/components/ProductEmptyState/ProductEmptyStateGate'
+import { productSetupPreloadLogic } from 'lib/components/ProductEmptyState/productSetupPreloadLogic'
 import { MOCK_NODE_PROCESS } from 'lib/constants'
 import { useCancelAnimationsOnUnmount } from 'lib/hooks/useCancelAnimationsOnUnmount'
 import { useThemedHtml } from 'lib/hooks/useThemedHtml'
@@ -68,6 +70,10 @@ export function App(): JSX.Element | null {
 
     useMountedLogic(sceneLogic({ scenes: appScenes }))
     useMountedLogic(autofillReleaseLogic)
+
+    // Resolves product setup statuses on idle, so gated scenes open without a spinner.
+    useMountedLogic(productSetupPreloadLogic)
+
     // Unconditional so /oauth/callback's urlToAction is registered before routing. Inert in prod
     // (OAuth UI gated on preflight.is_debug); no timers/listeners, so cheap to always mount.
     useMountedLogic(oauthLogic)
@@ -160,10 +166,20 @@ function AppScene(): JSX.Element | null {
 
     let sceneElement: JSX.Element
     if (activeExportedScene?.component) {
-        const { component: SceneComponent } = activeExportedScene
+        const { component: SceneComponent, emptyState } = activeExportedScene
+        const sceneNode = <SceneComponent user={user} {...activeSceneComponentParamsWithTabId} />
+
+        // Scenes that declare an empty state are gated behind the product's
+        // setup screen until the product has data (or the user skips).
+        const resolvedNode = emptyState ? (
+            <ProductEmptyStateGate emptyState={emptyState}>{sceneNode}</ProductEmptyStateGate>
+        ) : (
+            sceneNode
+        )
+
         sceneElement = (
             <SceneAnimationRoot key={`scene-${activeSceneId}-${activeSceneLogicPropsWithTabId.tabId}`}>
-                <SceneComponent user={user} {...activeSceneComponentParamsWithTabId} />
+                {resolvedNode}
             </SceneAnimationRoot>
         )
     } else {
