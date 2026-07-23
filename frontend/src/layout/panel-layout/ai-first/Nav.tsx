@@ -14,8 +14,10 @@ import { Resizer } from 'lib/components/Resizer/Resizer'
 import { ResizerLogicProps, resizerLogic } from 'lib/components/Resizer/resizerLogic'
 import { keyBinds } from 'lib/components/Shortcuts/shortcuts'
 import { useShortcut } from 'lib/components/Shortcuts/useShortcut'
+import { FEATURE_FLAGS } from 'lib/constants'
 import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
 import { LemonButton } from 'lib/lemon-ui/LemonButton'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
 import { ButtonPrimitive } from 'lib/ui/Button/ButtonPrimitives'
 import { Collapsible } from 'lib/ui/Collapsible/Collapsible'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from 'lib/ui/DropdownMenu/DropdownMenu'
@@ -36,7 +38,7 @@ import {
     panelLayoutLogic,
 } from '~/layout/panel-layout/panelLayoutLogic'
 
-import { NavSearchButton } from '../../../lib/components/NavSearchButton/NavSearchButton'
+import { NavSearchBar, NavSearchButton } from '../../../lib/components/NavSearchButton/NavSearchButton'
 import { navigation3000Logic } from '../../navigation-3000/navigationLogic'
 import { CreateMenu } from '../menus/CreateMenu'
 import { NavBarFooter } from '../NavBarFooter'
@@ -143,7 +145,10 @@ export function Nav(): JSX.Element {
     } = useValues(panelLayoutLogic)
     const { mobileLayout: isMobileLayout } = useValues(navigation3000Logic)
     const { toggleCommand } = useActions(commandLogic)
+    const { featureFlags } = useValues(featureFlagLogic)
     const showCreateButton = useFeatureFlag('CREATE_BUTTON_NAV_EXPERIMENT', 'test')
+    // When expanded, the search-bar variant swaps the icon-only search button for a full-width bar below the header
+    const showNavSearchBar = featureFlags[FEATURE_FLAGS.CMD_K_NAV_EXPERIMENT] === 'search-bar' && !isLayoutNavCollapsed
 
     const resizerLogicProps: ResizerLogicProps = {
         logicKey: 'panel-layout-navbar',
@@ -219,7 +224,9 @@ export function Nav(): JSX.Element {
                     "More"), leaving only the traffic lights, tabs, and search up here */}
                 {!isDesktopApp() && <NewAccountMenu isLayoutNavCollapsed={isLayoutNavCollapsed} />}
 
-                <NavSearchButton isLayoutNavCollapsed={isLayoutNavCollapsed} toggleCommand={toggleCommand} />
+                {!showNavSearchBar && (
+                    <NavSearchButton isLayoutNavCollapsed={isLayoutNavCollapsed} toggleCommand={toggleCommand} />
+                )}
 
                 {isLayoutNavCollapsed && (
                     <ButtonPrimitive
@@ -334,6 +341,11 @@ export function Nav(): JSX.Element {
                 {!isDesktopApp() && (
                     <>
                         {headerRow}
+                        {showNavSearchBar && (
+                            <div className="px-2 py-1">
+                                <NavSearchBar toggleCommand={toggleCommand} />
+                            </div>
+                        )}
                         {createButton}
                     </>
                 )}
