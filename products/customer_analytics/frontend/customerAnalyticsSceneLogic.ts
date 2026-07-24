@@ -49,6 +49,15 @@ export interface CustomerAnalyticsSceneLogicProps {
     tabId: string
 }
 
+type ActiveTab = 'dashboard' | 'journeys' | 'accounts' | 'notes' | 'announcements'
+
+const SCENE_KEY_TO_TAB: Record<string, ActiveTab> = {
+    customerAnalyticsJourneys: 'journeys',
+    customerAnalyticsAccounts: 'accounts',
+    customerAnalyticsNotes: 'notes',
+    customerAnalyticsAnnouncements: 'announcements',
+}
+
 export interface InsightDefinition {
     name: string
     description?: string
@@ -96,8 +105,8 @@ export interface customerAnalyticsSceneLogicValues {
     aggregationLabel: (groupTypeIndex: number | null | undefined, deferToUserWording?: boolean) => Noun // groupsModel
     groupTypesRaw: Array<GroupType> // groupsModel
     groupsEnabled: boolean // groupsModel
-    sceneKey: any // sceneLogic
-    activeTab: 'accounts' | 'dashboard' | 'journeys' | 'notes'
+    sceneKey: string | null // sceneLogic
+    activeTab: ActiveTab
     activeUsersInsights: InsightDefinition[]
     breadcrumbs: Breadcrumb[]
     businessType: BusinessType
@@ -160,7 +169,7 @@ export interface customerAnalyticsSceneLogicActions {
 export interface customerAnalyticsSceneLogicMeta {
     __keaTypeGenInternalSelectorTypes: {
         tabId: (arg: string) => string
-        activeTab: (sceneKey: string | null) => 'accounts' | 'dashboard' | 'journeys' | 'notes'
+        activeTab: (sceneKey: string | null) => ActiveTab
         customerLabel: (
             aggregationLabel: (groupTypeIndex: number | null | undefined, deferToUserWording?: boolean) => Noun, // groupsModel
             businessType: BusinessType,
@@ -339,18 +348,7 @@ export const customerAnalyticsSceneLogic = kea<customerAnalyticsSceneLogicType>(
         ],
         activeTab: [
             (s) => [s.sceneKey],
-            (sceneKey: string | null): 'dashboard' | 'journeys' | 'accounts' | 'notes' => {
-                if (sceneKey === 'customerAnalyticsJourneys') {
-                    return 'journeys'
-                }
-                if (sceneKey === 'customerAnalyticsAccounts') {
-                    return 'accounts'
-                }
-                if (sceneKey === 'customerAnalyticsNotes') {
-                    return 'notes'
-                }
-                return 'dashboard'
-            },
+            (sceneKey: string | null): ActiveTab => (sceneKey && SCENE_KEY_TO_TAB[sceneKey]) || 'dashboard',
         ],
         breadcrumbs: [
             () => [],

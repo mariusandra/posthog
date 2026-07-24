@@ -24,7 +24,6 @@ import { isDataTableNode } from '~/queries/utils'
 import { ActivityScope, Breadcrumb, Group, GroupTypeIndex, PropertyFilterType, PropertyOperator } from '~/types'
 
 import { CUSTOMER_ANALYTICS_DEFAULT_QUERY_TAGS } from 'products/customer_analytics/frontend/constants'
-import { revenueAnalyticsLogic } from 'products/revenue_analytics/frontend/revenueAnalyticsLogic'
 
 import type { FeatureFlagsSet } from '../../lib/logic/featureFlagLogic'
 import type { Noun } from '../../models/groupsModel'
@@ -77,7 +76,6 @@ export interface groupLogicValues {
     featureFlags: FeatureFlagsSet // featureFlagLogic
     aggregationLabel: (groupTypeIndex: number | null | undefined, deferToUserWording?: boolean) => Noun // groupsModel
     groupTypes: Map<GroupTypeIndex, GroupType> // groupsModel
-    isRevenueAnalyticsEnabled: boolean // revenueAnalyticsLogic
     currentTeamId: number | null // teamLogic
     backNavigation: GroupBackNavigation | null
     backTo: Breadcrumb
@@ -257,8 +255,6 @@ export const groupLogic = kea<groupLogicType>([
             ['groupTypes', 'aggregationLabel'],
             featureFlagLogic,
             ['featureFlags'],
-            revenueAnalyticsLogic,
-            ['isRevenueAnalyticsEnabled'],
         ],
     })),
     actions(() => ({
@@ -284,11 +280,6 @@ export const groupLogic = kea<groupLogicType>([
             null as { mrr: number | null; lifetimeValue: number | null } | null,
             {
                 loadGroupRevenueAnalyticsData: async () => {
-                    // Check if revenue analytics is available
-                    if (!values.isRevenueAnalyticsEnabled) {
-                        return null
-                    }
-
                     try {
                         const response = await api.query<HogQLQuery>({
                             kind: NodeKind.HogQLQuery,

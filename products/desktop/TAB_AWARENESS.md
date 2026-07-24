@@ -196,7 +196,6 @@ Deliberately kept on their current (rebuilt-since-June) architecture for now: **
 - [ ] `products/replay_vision/frontend/replay_scanners/ScannerEditorScene.tsx` (scannerEditorSceneLogic)
 - [ ] `products/replay_vision/frontend/replay_scanners/VisionActionRunScene.tsx` (visionActionRunSceneLogic)
 - [ ] `products/replay_vision/frontend/replay_scanners/VisionActionScene.tsx` (visionActionSceneLogic)
-- [ ] `products/revenue_analytics/frontend/RevenueAnalyticsScene.tsx` (revenueAnalyticsLogic)
 - [ ] `products/review_hog/frontend/CodeReviewScene.tsx` (reviewHogSettingsLogic)
 - [ ] `products/session_summaries/frontend/SessionGroupSummaryScene.tsx` (sessionGroupSummarySceneLogic)
 - [ ] `products/skills/frontend/LLMSkillScene.tsx` (llmSkillLogic)

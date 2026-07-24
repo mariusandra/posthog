@@ -233,7 +233,7 @@ export function Info({ tabId }: Pick<ExperimentSceneLogicProps, 'tabId'>): JSX.E
                                 onChange={(value) => setTempDescription(value)}
                                 placeholder="Add your hypothesis for this test"
                                 minRows={6}
-                                maxLength={400}
+                                maxLength={3000}
                             />
                         </LemonModal>
                     </div>

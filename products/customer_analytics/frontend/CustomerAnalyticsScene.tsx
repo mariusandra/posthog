@@ -30,6 +30,7 @@ import { SessionInsights } from 'products/customer_analytics/frontend/components
 
 import { AccountNotesTabContent } from './components/AccountNotes/AccountNotesTabContent'
 import { AccountsTabContent } from './components/Accounts/AccountsTabContent'
+import { AnnouncementsTabContent } from './components/Announcements/AnnouncementsTabContent'
 import { CustomerJourneys } from './components/CustomerJourneys/CustomerJourneys'
 import { CustomerJourneySelect } from './components/CustomerJourneys/CustomerJourneySelect'
 import { customerJourneysLogic } from './components/CustomerJourneys/customerJourneysLogic'
@@ -82,9 +83,12 @@ function CustomerAnalyticsSceneContent({ tabId }: { tabId?: string }): JSX.Eleme
         reportCustomerAnalyticsViewed()
     })
 
-    // Accounts and Notes are gated by CUSTOMER_ANALYTICS_CSP; without it the tabs do not
-    // exist, so guessed `/customer_analytics/accounts` / `/customer_analytics/notes` URLs are 404s.
-    if ((activeTab === 'accounts' || activeTab === 'notes') && !featureFlags[FEATURE_FLAGS.CUSTOMER_ANALYTICS_CSP]) {
+    // Accounts, Notes and Announcements are gated by CUSTOMER_ANALYTICS_CSP; without it the tabs do
+    // not exist, so guessed `/customer_analytics/{accounts,notes,announcements}` URLs are 404s.
+    if (
+        (activeTab === 'accounts' || activeTab === 'notes' || activeTab === 'announcements') &&
+        !featureFlags[FEATURE_FLAGS.CUSTOMER_ANALYTICS_CSP]
+    ) {
         return <NotFound object="page" />
     }
 
@@ -119,6 +123,12 @@ function CustomerAnalyticsSceneContent({ tabId }: { tabId?: string }): JSX.Eleme
             label: 'Notes',
             content: <AccountNotesTabContent />,
             link: combineUrl(urls.customerAnalyticsNotes(), searchParams).url,
+        })
+        tabs.push({
+            key: 'announcements',
+            label: 'Announcements',
+            content: <AnnouncementsTabContent />,
+            link: combineUrl(urls.customerAnalyticsAnnouncements(), searchParams).url,
         })
     }
 
