@@ -73,6 +73,7 @@ export interface dashboardsModelValues {
     pagedDashboards: PaginatedResponse<DashboardBasicType> | null
     pagedDashboardsLoading: boolean
     pagingDashboardsCompleted: boolean
+    awaitingCurrentTeam: boolean
     pinSortedDashboards: (DashboardBasicType | DashboardType<QueryBasedInsightModel<Node<Record<string, any>>>>)[]
     pinnedDashboards: (DashboardBasicType | DashboardType<QueryBasedInsightModel<Node<Record<string, any>>>>)[]
     rawDashboards: Record<string, DashboardBasicType | DashboardType<QueryBasedInsightModel>>
@@ -86,6 +87,9 @@ export interface dashboardsModelActions {
         dashboard: DashboardType<QueryBasedInsightModel<Node<Record<string, any>>>>
     }
     dashboardsFullyLoaded: () => {
+        value: true
+    }
+    deferInitialLoad: () => {
         value: true
     }
     delayedDeleteDashboard: (id: number) => {
@@ -343,6 +347,8 @@ export const dashboardsModel = kea<dashboardsModelType>([
     actions(() => ({
         // we page through the dashboards and need to manually track when that is finished
         dashboardsFullyLoaded: true,
+        // the initial load ran before the current team was known, so it fetched nothing
+        deferInitialLoad: true,
         delayedDeleteDashboard: (id: number) => ({ id }),
         setDiveSourceId: (id: InsightShortId | null) => ({ id }),
         addDashboardSuccess: (dashboard: DashboardType<QueryBasedInsightModel>) => ({ dashboard }),
@@ -422,6 +428,11 @@ export const dashboardsModel = kea<dashboardsModelType>([
                     }
 
                     if (!teamLogic.values.currentTeam) {
+                        // afterMount fires this once on a permanently-mounted logic, so without
+                        // flagging the bail the empty page would be cached for the rest of the
+                        // session and the list would silently stay empty. The listener below
+                        // retries as soon as the team lands.
+                        actions.deferInitialLoad()
                         return { count: 0, next: null, previous: null, results: [] }
                     }
 
@@ -556,6 +567,15 @@ export const dashboardsModel = kea<dashboardsModelType>([
                 dashboardsFullyLoaded: () => true,
             },
         ],
+        // `loadDashboards` clears this before the loader runs, so a bail can set it again
+        // on the next attempt without the two racing
+        awaitingCurrentTeam: [
+            false,
+            {
+                loadDashboards: () => false,
+                deferInitialLoad: () => true,
+            },
+        ],
         redirect: [
             true,
             {
@@ -661,6 +681,14 @@ export const dashboardsModel = kea<dashboardsModelType>([
         ],
     })),
     listeners(({ actions, values }) => ({
+        // The team arriving is the only signal that the deferred initial load can now
+        // succeed. Guarded on the flag because this action also fires on ordinary team
+        // updates (including one dispatched from this file), which must not refetch.
+        [teamLogic.actionTypes.loadCurrentTeamSuccess]: () => {
+            if (values.awaitingCurrentTeam) {
+                actions.loadDashboards()
+            }
+        },
         loadDashboardsSuccess: ({ pagedDashboards }) => {
             if (pagedDashboards?.next) {
                 actions.loadDashboards(pagedDashboards.next)

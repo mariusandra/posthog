@@ -39,6 +39,15 @@ declare global {
         posthog?: posthog
         /** Set by the PostHog desktop app's local server (products/desktop) when the frontend runs inside Electron */
         __POSTHOG_DESKTOP__?: { version: string; platform?: string }
+        /**
+         * Bridge exposed by the desktop app's preload (products/desktop/src/preload). Only the
+         * members the frontend uses are declared; the full surface lives in the desktop package,
+         * which the frontend deliberately does not import from.
+         */
+        posthogDesktop?: {
+            closeWindow: () => Promise<void>
+            onMenuCommand: (handler: (command: 'new-tab' | 'close-tab') => void) => () => void
+        }
         ESBUILD_LOAD_SCRIPT: (name) => void
         ESBUILD_LOAD_CHUNKS: (name) => void
         ESBUILD_LOADED_CHUNKS: Set<string>

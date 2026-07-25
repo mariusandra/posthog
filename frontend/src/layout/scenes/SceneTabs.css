@@ -1,3 +1,11 @@
+/* The active tab is painted with --scene-layout-background so it reads as continuous with the
+   scene below it. Canvas scenes (Navigation3000 sets the variable from `canvasBackground`, which
+   today means notebooks) point it at the canvas colour, which made their tab a different white
+   from every other tab. The strip stays on the page colour so every active tab matches. */
+.scene-tab-row {
+    --scene-layout-background: var(--color-bg-primary);
+}
+
 .scene-tab--pinned {
     max-width: 36px;
     padding-right: 0.5rem;

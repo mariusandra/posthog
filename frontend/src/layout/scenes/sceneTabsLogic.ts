@@ -368,10 +368,33 @@ export const sceneTabsLogic = kea<sceneTabsLogicType>([
             keepAlive.clear()
         }
     }),
-    afterMount(({ actions }) => {
+    afterMount(({ actions, values, cache }) => {
         if (!isDesktopApp()) {
             return
         }
+
+        // Cmd+W / Cmd+T are owned by the app menu, which cannot touch tabs itself — they live
+        // here. Closing the last tab falls through to closing the window, so the shortcut still
+        // ends up doing what it does everywhere else once there is nothing left to close.
+        // `pauseOnPageHidden: false`: a hidden window can be focused and sent a command in the
+        // same breath, and a subscription still being re-established would swallow it.
+        cache.disposables.add(
+            () =>
+                window.posthogDesktop?.onMenuCommand((command) => {
+                    if (command === 'new-tab') {
+                        actions.newTab()
+                        return
+                    }
+                    const { activeTab, tabs } = values
+                    if (!activeTab || tabs.length <= 1) {
+                        void window.posthogDesktop?.closeWindow()
+                    } else {
+                        actions.removeTab(activeTab, { source: 'keyboard_shortcut' })
+                    }
+                }),
+            'desktop-menu-commands',
+            { pauseOnPageHidden: false }
+        )
         const { currentLocation } = router.values
         const currentTab = freshTab({
             pathname: addProjectIdIfMissing(currentLocation.pathname),
@@ -414,6 +437,25 @@ export const sceneTabsLogic = kea<sceneTabsLogicType>([
         // otherwise point the previously active tab at where the app actually is. sceneLogic's
         // own afterMount already created a tab for the current location; setTabs replaces it.
         const restored = persisted.map((tab) => ({ ...tab, sceneParams: undefined }))
+
+        // Whatever ends up active points at the location the app is already at, and the boot
+        // tab has that scene loaded. The router won't fire again for a location it is already
+        // on, so without inheriting the boot tab's scene the active tab has no scene to render
+        // and sits on a spinner until it is closed and reopened. Its transient loading title
+        // and icon are dropped for the same reason: nothing would refresh them either.
+        const bootTab = sceneLogic.findMounted()?.values.activeTab
+        const adoptBootScene = (tab: SceneTab): SceneTab => ({
+            ...tab,
+            sceneId: bootTab?.sceneId,
+            sceneKey: bootTab?.sceneKey,
+            sceneParams: bootTab?.sceneParams,
+            // Title and icon come from the boot tab for the same reason as the scene: they
+            // describe the location this tab now shows, and nothing else will refresh them
+            // once the scene is inherited rather than loaded. A user's own rename lives in
+            // `customTitle` and is left alone.
+            ...(bootTab?.title && bootTab.title !== 'Loading...' ? { title: bootTab.title } : {}),
+            iconType: bootTab?.iconType && bootTab.iconType !== 'loading' ? bootTab.iconType : 'blank',
+        })
         const matchIndex = restored.findIndex(
             (tab) =>
                 tab.pathname === currentTab.pathname &&
@@ -421,7 +463,11 @@ export const sceneTabsLogic = kea<sceneTabsLogicType>([
                 (tab.hash ?? '') === currentTab.hash
         )
         if (matchIndex !== -1) {
-            actions.setTabs(restored.map((tab, i) => ({ ...tab, active: i === matchIndex })))
+            actions.setTabs(
+                restored.map((tab, i) =>
+                    i === matchIndex ? adoptBootScene({ ...tab, active: true }) : { ...tab, active: false }
+                )
+            )
             return
         }
         const activeIndex = Math.max(
@@ -431,7 +477,7 @@ export const sceneTabsLogic = kea<sceneTabsLogicType>([
         actions.setTabs(
             restored.map((tab, i) =>
                 i === activeIndex
-                    ? {
+                    ? adoptBootScene({
                           ...tab,
                           active: true,
                           pathname: currentTab.pathname,
@@ -440,7 +486,7 @@ export const sceneTabsLogic = kea<sceneTabsLogicType>([
                           title: 'Loading...',
                           iconType: 'loading' as const,
                           customTitle: undefined,
-                      }
+                      })
                     : { ...tab, active: false }
             )
         )

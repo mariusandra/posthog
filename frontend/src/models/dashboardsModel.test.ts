@@ -243,6 +243,25 @@ describe('the dashboards model', () => {
             currentTeam: expect.objectContaining({ primary_dashboard: primaryDashboardId }),
         })
     })
+
+    it('loads dashboards once the team arrives, when it mounted before the team was known', async () => {
+        // The model fetches once from afterMount and is permanently mounted, so before the
+        // retry existed a mount that beat the team to it cached an empty page and the
+        // dashboards list stayed silently empty for the whole session
+        initKeaTests()
+        teamLogic.actions.loadCurrentTeamSuccess(null)
+
+        logic = dashboardsModel()
+        logic.mount()
+
+        await expectLogic(logic).toDispatchActions(['deferInitialLoad'])
+        expect(logic.values.nameSortedDashboards).toHaveLength(0)
+
+        teamLogic.actions.loadCurrentTeamSuccess(MOCK_DEFAULT_TEAM)
+
+        await expectLogic(logic).toDispatchActions(['loadDashboards', 'loadDashboardsSuccess'])
+        expect(logic.values.nameSortedDashboards.length).toBeGreaterThan(0)
+    })
 })
 
 describe('mergeTileTextUpdatesIntoDashboard', () => {
