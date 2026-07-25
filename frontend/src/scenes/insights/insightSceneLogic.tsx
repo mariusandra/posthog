@@ -12,6 +12,7 @@ import {
 } from 'kea'
 import type { BreakPointFunction } from 'kea'
 import { objectsEqual } from 'kea-test-utils'
+import posthog from 'posthog-js'
 
 import api from 'lib/api'
 import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
@@ -718,7 +719,10 @@ export const insightSceneLogic = kea<insightSceneLogicType>([
         setInsightMode: sharedListeners.reloadInsightLogic,
         setSceneState: [
             sharedListeners.reloadInsightLogic,
-            ({ sceneSource }) => {
+            ({ insightId, insightMode, alertId, sceneSource }) => {
+                if (insightMode === ItemMode.Alerts && !alertId) {
+                    posthog.capture('insight alert modal opened', { insight_short_id: insightId })
+                }
                 // Only open here when the scene panel already exists; otherwise Info isn't in
                 // `enabledTabs` yet and SidePanel's fallback reroutes to Max. The fresh-navigation
                 // case is handled by the `setScenePanelIsPresent` listener below.

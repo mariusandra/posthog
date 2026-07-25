@@ -218,6 +218,7 @@ export enum Scene {
     AIObservabilityUsers = 'AIObservabilityUsers',
     Logs = 'Logs',
     MCPAnalytics = 'MCPAnalytics',
+    MCPAnalyticsToolDetail = 'MCPAnalyticsToolDetail',
     LogsAlertDetail = 'LogsAlertDetail',
     LogsAlertNotificationDetail = 'LogsAlertNotificationDetail',
     LogsSamplingNew = 'LogsSamplingNew',
@@ -352,6 +353,11 @@ export const sceneToAccessControlResourceType: Partial<Record<Scene, AccessContr
     [Scene.Insight]: AccessControlResourceType.Insight,
     [Scene.SavedInsights]: AccessControlResourceType.Insight,
 
+    // Heatmaps
+    [Scene.Heatmaps]: AccessControlResourceType.Heatmap,
+    [Scene.Heatmap]: AccessControlResourceType.Heatmap,
+    [Scene.HeatmapNew]: AccessControlResourceType.Heatmap,
+
     // Notebooks
     [Scene.Notebook]: AccessControlResourceType.Notebook,
     [Scene.Notebooks]: AccessControlResourceType.Notebook,
@@ -429,6 +435,10 @@ export const sceneToAccessControlResourceType: Partial<Record<Scene, AccessContr
     [Scene.AIObservabilityTags]: AccessControlResourceType.Tagger,
     [Scene.AIObservabilityTrace]: AccessControlResourceType.LlmAnalytics,
     [Scene.AIObservabilityUsers]: AccessControlResourceType.LlmAnalytics,
+
+    // MCP analytics
+    [Scene.MCPAnalytics]: AccessControlResourceType.McpAnalytics,
+    [Scene.MCPAnalyticsToolDetail]: AccessControlResourceType.McpAnalytics,
 
     // Skills
     [Scene.Skill]: AccessControlResourceType.LlmSkill,
