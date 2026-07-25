@@ -10,7 +10,10 @@ import { app, BrowserWindow, dialog, shell } from 'electron'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 
-import { registerIpcHandlers } from './ipc.ts'
+import { IPC_CHANNELS } from '../shared/ipc.ts'
+import { clearLoginSession, isLoginWebContents } from './browser-login.ts'
+import { identityFromMe } from './identity.ts'
+import { discardSession, registerIpcHandlers } from './ipc.ts'
 import { buildAppMenu } from './menu.ts'
 import { OAuthBrowserFlow } from './oauth.ts'
 import { isFrontendBuilt, type LocalBackend, startLocalBackend } from './server/backend.ts'
@@ -98,20 +101,28 @@ async function main(): Promise<void> {
                 cacheDir: path.join(app.getPath('userData'), 'offline-cache'),
                 getAuth: () => state.getFreshAuth(),
                 onOAuthCallback: (query) => oauthFlow.handleCallback(query),
-                onSignOutRequested: () => {
-                    state.signOut()
-                    showShell()
-                },
+                // The app's own sign-out button posts to /logout, which never reaches the
+                // upstream, so it has to run the same teardown as the shell's
+                onSignOutRequested: () => void signOutCompletely(),
                 onAuthRejected: () => {
                     void state.handleAuthRejected().then((signedOut) => {
                         if (signedOut) {
                             showShell()
+                            // The session is already dead upstream; just stop the stored
+                            // cookies from signing the next person in without a prompt
+                            void clearLoginSession()
                         }
                     })
+                },
+                onUpstreamCookies: (setCookieHeaders) => {
+                    if (state.updateCookies(setCookieHeaders)) {
+                        showShell()
+                    }
                 },
                 upstreamHeaders: { 'user-agent': `PostHog-Desktop/${app.getVersion()}` },
                 desktopVersion: app.getVersion(),
                 desktopPlatform: process.platform,
+                getMembershipLevel: () => state.membershipLevel(),
             },
             store.get('port')
         )
@@ -156,15 +167,64 @@ async function main(): Promise<void> {
         return win
     }
 
+    /**
+     * Re-reads the signed-in identity through the local proxy, so it goes through the
+     * same auth, cookie and offline-cache handling as any other request (the cached
+     * @me response means this still works offline).
+     */
+    const refreshIdentity = async (): Promise<void> => {
+        if (!state.getAuth()) {
+            return
+        }
+        try {
+            const response = await fetch(`${backend.origin}/api/users/@me/`, {
+                headers: { origin: backend.origin },
+                signal: AbortSignal.timeout(15000),
+            })
+            if (response.ok) {
+                state.rememberIdentity(identityFromMe(await response.json()))
+            }
+        } catch {
+            // Unreachable and uncached: the next launch tries again
+        }
+    }
+
+    const signOutCompletely = async (): Promise<void> => {
+        // Capture before signOut() clears the cookies, so the session can still be revoked
+        const discarded = discardSession(state)
+        state.signOut()
+        showShell()
+        await discarded
+    }
+
     const updater = new AppUpdater()
     updater.start()
 
-    registerIpcHandlers(state, oauthFlow, { showShell, showApp })
+    /**
+     * The tab strip lives in the renderer, so tab commands are forwarded to the focused
+     * window. A window showing the sign-in shell has no tabs, so it gets the plain
+     * window behavior instead.
+     */
+    const appWindowForMenu = (): BrowserWindow | null => {
+        const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0] ?? null
+        return win && win.webContents.getURL().startsWith(backend.origin) ? win : null
+    }
+
+    registerIpcHandlers(state, oauthFlow, { showShell, showApp, signOutCompletely })
     buildAppMenu({
         showShell,
         newWindow: () => {
             if (state.getAuth() && state.snapshot().frontendBuilt) {
                 openAppWindow(`${backend.origin}/`)
+            }
+        },
+        newTab: () => appWindowForMenu()?.webContents.send(IPC_CHANNELS.menuCommand, 'new-tab'),
+        closeTab: () => {
+            const win = appWindowForMenu()
+            if (win) {
+                win.webContents.send(IPC_CHANNELS.menuCommand, 'close-tab')
+            } else {
+                BrowserWindow.getFocusedWindow()?.close()
             }
         },
         checkForUpdates: () => updater.checkInteractively(),
@@ -186,6 +246,11 @@ async function main(): Promise<void> {
         }
     })
     app.on('web-contents-created', (_event, contents) => {
+        // The sign-in window has to reach identity providers on their own domains,
+        // which the local-origin confinement below would block outright
+        if (isLoginWebContents(contents)) {
+            return
+        }
         contents.setWindowOpenHandler(({ url }) => {
             // Local-origin URLs open a new PostHog window ("open in new window" in the
             // app, window.open, target=_blank on internal links); everything else goes
@@ -198,6 +263,12 @@ async function main(): Promise<void> {
             return { action: 'deny' }
         })
         contents.on('will-navigate', (event, url) => {
+            // Re-checked at navigation time, not just at creation time: this listener
+            // cannot be detached once attached, so it has to be able to stand down on
+            // its own if these contents turn out to belong to a sign-in
+            if (isLoginWebContents(contents)) {
+                return
+            }
             const stayingLocal = url.startsWith(backend.origin) || url.startsWith('file://')
             if (!stayingLocal) {
                 event.preventDefault()
@@ -212,6 +283,14 @@ async function main(): Promise<void> {
     })
 
     if (state.getAuth() && state.snapshot().frontendBuilt) {
+        // Awaited only when the level is unknown, because index.html has to carry the
+        // access-control context on its very first render; otherwise refresh in the
+        // background so a changed membership is picked up by the next launch
+        if (state.membershipLevel() === null) {
+            await refreshIdentity()
+        } else {
+            void refreshIdentity()
+        }
         showApp()
     } else {
         showShell()

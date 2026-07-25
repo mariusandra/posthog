@@ -1,7 +1,9 @@
 /**
- * The shell UI: region selection, sign-in, and account management. Browser
- * sign-in (OAuth) is the primary path for cloud regions; a pasted personal API
- * key remains available as a fallback and is the only option for custom hosts.
+ * The shell UI: region selection, sign-in, and account management. Signing in
+ * through the PostHog login window is the primary path, because it is the only
+ * one that authenticates the app for the whole product. OAuth browser sign-in
+ * and a pasted personal API key stay available behind a disclosure; both use
+ * bearer tokens, which parts of the API refuse regardless of their scopes.
  * Everything here works offline except the sign-in itself.
  */
 
@@ -27,6 +29,9 @@ const signinCard = el<HTMLElement>('signin-card')
 const signedinCard = el<HTMLElement>('signedin-card')
 const regionsContainer = el<HTMLElement>('regions')
 const customHostInput = el<HTMLInputElement>('custom-host')
+const sessionSignInButton = el<HTMLButtonElement>('session-sign-in')
+const toggleAlternativesButton = el<HTMLButtonElement>('toggle-alternatives')
+const alternatives = el<HTMLElement>('alternatives')
 const browserSignInButton = el<HTMLButtonElement>('browser-sign-in')
 const toggleApiKeyButton = el<HTMLButtonElement>('toggle-api-key')
 const apiKeyForm = el<HTMLElement>('api-key-form')
@@ -35,18 +40,23 @@ const signInButton = el<HTMLButtonElement>('sign-in')
 const errorText = el<HTMLElement>('error')
 const statusText = el<HTMLElement>('status')
 const frontendWarning = el<HTMLElement>('frontend-warning')
+const tokenAuthWarning = el<HTMLElement>('token-auth-warning')
 
 let selectedRegion: CloudRegion = 'us'
 let browserSignInAvailable: Record<CloudRegion, boolean> = { us: true, eu: true, custom: false }
+let alternativesOpen = false
 let apiKeyFormOpen = false
 let signingIn = false
+let sessionFlowSeq = 0
 let browserFlowSeq = 0
 
 function renderSignInMethods(): void {
+    alternatives.classList.toggle('Shell--hidden', !alternativesOpen)
+    toggleAlternativesButton.textContent = alternativesOpen ? 'Hide other options' : 'Other ways to sign in'
     const browserAvailable = browserSignInAvailable[selectedRegion]
     browserSignInButton.classList.toggle('Shell--hidden', !browserAvailable)
     toggleApiKeyButton.parentElement?.classList.toggle('Shell--hidden', !browserAvailable)
-    // Without browser sign-in the API key form is the only path, so it is always open
+    // Without browser sign-in the API key form is the only alternative, so it is always open
     apiKeyForm.classList.toggle('Shell--hidden', browserAvailable && !apiKeyFormOpen)
     toggleApiKeyButton.textContent = apiKeyFormOpen ? 'Hide the API key form' : 'Use a personal API key instead'
 }
@@ -74,6 +84,7 @@ function render(state: DesktopState): void {
         el<HTMLElement>('account-email').textContent = state.signedInEmail || 'unknown'
         el<HTMLElement>('account-host').textContent = state.apiHost ? `on ${state.apiHost}` : ''
         el<HTMLButtonElement>('open-app').disabled = !state.frontendBuilt
+        tokenAuthWarning.classList.toggle('Shell__warning--visible', state.authMethod !== 'session')
     } else {
         setRegion(state.settings.region)
         customHostInput.value = state.settings.customHost
@@ -90,17 +101,30 @@ regionsContainer.addEventListener('click', (event) => {
     }
 })
 
+toggleAlternativesButton.addEventListener('click', () => {
+    alternativesOpen = !alternativesOpen
+    renderSignInMethods()
+})
+
 toggleApiKeyButton.addEventListener('click', () => {
     apiKeyFormOpen = !apiKeyFormOpen
     renderSignInMethods()
 })
 
-el<HTMLButtonElement>('open-key-settings').addEventListener('click', () => {
+function selectedHost(): string {
     const host =
         selectedRegion === 'custom'
             ? customHostInput.value.trim() || 'https://us.posthog.com'
             : `https://${selectedRegion}.posthog.com`
-    void desktop.openExternal(`${host.replace(/\/$/, '')}/settings/user-api-keys`)
+    return host.replace(/\/$/, '')
+}
+
+el<HTMLButtonElement>('open-key-settings').addEventListener('click', () => {
+    void desktop.openExternal(`${selectedHost()}/settings/user-api-keys`)
+})
+
+el<HTMLButtonElement>('open-password-settings').addEventListener('click', () => {
+    void desktop.openExternal(`${selectedHost()}/settings/user-profile`)
 })
 
 async function completeSignIn(): Promise<void> {
@@ -109,6 +133,29 @@ async function completeSignIn(): Promise<void> {
     render(state)
     if (state.signedIn && state.frontendBuilt) {
         void desktop.openApp()
+    }
+}
+
+async function signInWithSession(): Promise<void> {
+    const seq = ++sessionFlowSeq
+    sessionSignInButton.disabled = true
+    sessionSignInButton.textContent = 'Waiting for the sign-in window...'
+    showError('')
+    try {
+        const result = await desktop.signInWithSession({
+            region: selectedRegion,
+            customHost: customHostInput.value,
+        })
+        if (result.ok) {
+            await completeSignIn()
+        } else if (seq === sessionFlowSeq) {
+            showError(result.error)
+        }
+    } finally {
+        if (seq === sessionFlowSeq) {
+            sessionSignInButton.disabled = false
+            sessionSignInButton.textContent = 'Sign in'
+        }
     }
 }
 
@@ -161,6 +208,7 @@ async function signIn(): Promise<void> {
     }
 }
 
+sessionSignInButton.addEventListener('click', () => void signInWithSession())
 browserSignInButton.addEventListener('click', () => void signInWithBrowser())
 signInButton.addEventListener('click', () => void signIn())
 apiKeyInput.addEventListener('keydown', (event) => {
@@ -170,9 +218,22 @@ apiKeyInput.addEventListener('keydown', (event) => {
 })
 
 el<HTMLButtonElement>('open-app').addEventListener('click', () => void desktop.openApp())
-el<HTMLButtonElement>('sign-out').addEventListener('click', async () => {
-    await desktop.signOut()
-    render(await desktop.getState())
+
+const signOutButton = el<HTMLButtonElement>('sign-out')
+signOutButton.addEventListener('click', async () => {
+    if (signOutButton.disabled) {
+        return
+    }
+    // Signing out revokes the session upstream, so this waits on the network
+    signOutButton.disabled = true
+    signOutButton.textContent = 'Signing out...'
+    try {
+        await desktop.signOut()
+        render(await desktop.getState())
+    } finally {
+        signOutButton.disabled = false
+        signOutButton.textContent = 'Sign out'
+    }
 })
 
 void desktop.getState().then(render)

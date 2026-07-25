@@ -31,7 +31,15 @@ export interface DesktopSettings {
     oauthExpiresAt: number | null
     /** OAuth client the stored tokens were issued to */
     oauthClientId: string | null
+    /** Client ids this install registered per API host, so it registers once per instance */
+    oauthRegisteredClients: Record<string, string>
+    /** Session and CSRF cookies from a browser sign-in, JSON then encrypted with safeStorage */
+    encryptedSessionCookies: string | null
+    /** User agent the stored session was created under; reused so it does not look like a new device */
+    sessionUserAgent: string | null
     signedInEmail: string | null
+    /** Organization membership level from /api/users/@me/, for the access-control app context */
+    membershipLevel: number | null
 }
 
 export const DEFAULT_SETTINGS: DesktopSettings = {
@@ -44,7 +52,11 @@ export const DEFAULT_SETTINGS: DesktopSettings = {
     encryptedOauthAccessToken: null,
     oauthExpiresAt: null,
     oauthClientId: null,
+    oauthRegisteredClients: {},
+    encryptedSessionCookies: null,
+    sessionUserAgent: null,
     signedInEmail: null,
+    membershipLevel: null,
 }
 
 export class JsonStore<T extends object> {

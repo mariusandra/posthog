@@ -20,11 +20,25 @@ describe('buildIndexHtml', () => {
         assert.match(html, /as="font"/)
     })
 
-    test('keeps the app-context global unset so the app boots from the API', () => {
+    test('keeps the app-context global unset while signed out', () => {
         const html = buildIndexHtml(manifest)
         assert.doesNotMatch(html, /POSTHOG_APP_CONTEXT/)
         assert.match(html, /window\.JS_URL = ''/)
         assert.match(html, /<div id="root"><\/div>/)
+    })
+
+    test('injects the access-control context once a membership level is known', () => {
+        // Without it every scene and control gated by userHasAccess denies, because the
+        // frontend treats an unknown access level as no access
+        const admin = buildIndexHtml(manifest, { membershipLevel: 15 })
+        assert.match(admin, /window\.POSTHOG_APP_CONTEXT/)
+        assert.match(admin, /var isAdmin = true/)
+
+        const member = buildIndexHtml(manifest, { membershipLevel: 1 })
+        assert.match(member, /var isAdmin = false/)
+
+        // Null is the signed-out/unknown case and must stay indistinguishable from before
+        assert.doesNotMatch(buildIndexHtml(manifest, { membershipLevel: null }), /POSTHOG_APP_CONTEXT/)
     })
 
     test('exposes the desktop version and platform to the frontend', () => {

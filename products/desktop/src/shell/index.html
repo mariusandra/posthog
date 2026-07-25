@@ -133,6 +133,10 @@
                 margin: 12px 0 4px;
                 text-align: center;
             }
+            /* The base hint pulls up to sit under an input; following a button it needs the space back */
+            .Shell__hint--below {
+                margin-top: 8px;
+            }
             .Shell__hint button {
                 background: none;
                 border: 0;
@@ -216,6 +220,31 @@
                 color: var(--accent-hover);
                 font-size: 12px;
             }
+            .Shell__note {
+                background: rgb(255 255 255 / 4%);
+                border: 1px solid var(--border);
+                border-left: 3px solid var(--accent);
+                border-radius: 6px;
+                color: var(--muted);
+                font-size: 12px;
+                line-height: 1.5;
+                padding: 10px 12px;
+                margin: 0 0 12px;
+            }
+            .Shell__note strong {
+                color: var(--text);
+                display: block;
+                margin-bottom: 3px;
+            }
+            .Shell__note button {
+                background: none;
+                border: 0;
+                color: var(--accent-hover);
+                font: inherit;
+                cursor: pointer;
+                padding: 0;
+                text-decoration: underline;
+            }
             .Shell--hidden {
                 display: none;
             }
@@ -256,9 +285,15 @@
             <section class="Shell__card" id="signin-card">
                 <span class="Shell__label">Region</span>
                 <div class="Shell__regions" id="regions">
-                    <button class="Shell__region" data-region="us" type="button">US Cloud<small>us.posthog.com</small></button>
-                    <button class="Shell__region" data-region="eu" type="button">EU Cloud<small>eu.posthog.com</small></button>
-                    <button class="Shell__region" data-region="custom" type="button">Custom<small>self-hosted or dev</small></button>
+                    <button class="Shell__region" data-region="us" type="button">
+                        US Cloud<small>us.posthog.com</small>
+                    </button>
+                    <button class="Shell__region" data-region="eu" type="button">
+                        EU Cloud<small>eu.posthog.com</small>
+                    </button>
+                    <button class="Shell__region" data-region="custom" type="button">
+                        Custom<small>self-hosted or dev</small>
+                    </button>
                 </div>
                 <input
                     class="Shell__input Shell--hidden"
@@ -268,19 +303,48 @@
                     autocomplete="off"
                     spellcheck="false"
                 />
-                <button class="Shell__button" id="browser-sign-in" type="button">Sign in with browser</button>
-                <p class="Shell__hint Shell__hint--toggle">
-                    <button id="toggle-api-key" type="button">Use a personal API key instead</button>
+                <button class="Shell__button" id="session-sign-in" type="button">Sign in</button>
+                <p class="Shell__hint Shell__hint--below">
+                    Opens a PostHog login window. Sign in with your password, GitHub, GitLab, or SAML.
                 </p>
-                <div id="api-key-form" class="Shell--hidden">
-                    <label class="Shell__label" for="api-key">Personal API key</label>
-                    <input class="Shell__input" id="api-key" type="password" placeholder="phx_..." autocomplete="off" />
-                    <p class="Shell__hint">
-                        Create one with all scopes under
-                        <button id="open-key-settings" type="button">Settings &rsaquo; Personal API keys</button>
-                        in PostHog.
+                <div class="Shell__note">
+                    <strong>Google sign-in won't work in that window.</strong> Google blocks sign-in from windows
+                    embedded in an app, so the button is there but stops with "this browser or app may not be secure".
+                    If Google is the only way into your account, set a password and use that here. You can add one in
+                    <button id="open-password-settings" type="button">Settings &rsaquo; User profile</button>, or with
+                    "Forgot password?" on the PostHog login page.
+                </div>
+                <p class="Shell__hint Shell__hint--toggle">
+                    <button id="toggle-alternatives" type="button">Other ways to sign in</button>
+                </p>
+                <div id="alternatives" class="Shell--hidden">
+                    <p class="Shell__hint Shell__hint--below">
+                        Access tokens cannot reach every part of PostHog. Billing, search, and Max will not load.
                     </p>
-                    <button class="Shell__button" id="sign-in" type="button">Sign in</button>
+                    <button class="Shell__button Shell__button--secondary" id="browser-sign-in" type="button">
+                        Sign in with browser
+                    </button>
+                    <p class="Shell__hint Shell__hint--toggle">
+                        <button id="toggle-api-key" type="button">Use a personal API key instead</button>
+                    </p>
+                    <div id="api-key-form" class="Shell--hidden">
+                        <label class="Shell__label" for="api-key">Personal API key</label>
+                        <input
+                            class="Shell__input"
+                            id="api-key"
+                            type="password"
+                            placeholder="phx_..."
+                            autocomplete="off"
+                        />
+                        <p class="Shell__hint">
+                            Create one with all scopes under
+                            <button id="open-key-settings" type="button">Settings &rsaquo; Personal API keys</button>
+                            in PostHog.
+                        </p>
+                        <button class="Shell__button Shell__button--secondary" id="sign-in" type="button">
+                            Sign in with key
+                        </button>
+                    </div>
                 </div>
                 <p class="Shell__error" id="error"></p>
             </section>
@@ -289,6 +353,10 @@
                 <div class="Shell__account">
                     <span class="Shell__dot"></span>
                     <span>Signed in as <strong id="account-email"></strong> <span id="account-host"></span></span>
+                </div>
+                <div class="Shell__warning" id="token-auth-warning">
+                    You are signed in with an access token, so billing, search, and Max will not load. Sign out and sign
+                    in again to use the whole app.
                 </div>
                 <button class="Shell__button" id="open-app" type="button">Open PostHog</button>
                 <button class="Shell__button Shell__button--secondary" id="sign-out" type="button">Sign out</button>

@@ -19,14 +19,28 @@ import * as http from 'node:http'
 import * as path from 'node:path'
 import { Readable } from 'node:stream'
 
+import { isSignedOutRedirect, needsCsrfToken } from '../cookies.ts'
 import { buildIndexHtml, type PreloadManifest } from './html.ts'
 
-export interface UpstreamAuth {
+interface UpstreamAuthBase {
     /** e.g. https://us.posthog.com (no trailing slash) */
     apiHost: string
-    /** Personal API key, sent as a bearer token */
-    accessToken: string
 }
+
+/**
+ * How the proxy authenticates upstream. `cookie` replays a real browser session
+ * and reaches the whole product; `bearer` (personal API key or OAuth token) is
+ * denied on INTERNAL viewsets and on unlisted DRF actions no matter its scopes.
+ */
+export type UpstreamAuth =
+    | (UpstreamAuthBase & { mode: 'bearer'; accessToken: string })
+    | (UpstreamAuthBase & {
+          mode: 'cookie'
+          cookieHeader: string
+          csrfToken: string | null
+          /** User agent the session was created under; kept stable to avoid device drift */
+          userAgent: string | null
+      })
 
 export interface LocalBackendOptions {
     /** Directory containing the built PostHog frontend (frontend/dist) */
@@ -41,12 +55,16 @@ export interface LocalBackendOptions {
     onSignOutRequested: () => void
     /** Called when the upstream rejects the stored credentials (e.g. a revoked API key) */
     onAuthRejected?: () => void
+    /** Set-Cookie headers from the upstream, so a rotated session cookie is not lost */
+    onUpstreamCookies?: (setCookieHeaders: string[]) => void
     /** Extra headers to send upstream, e.g. a desktop User-Agent */
     upstreamHeaders?: Record<string, string>
     /** Desktop app version, exposed to the frontend as window.__POSTHOG_DESKTOP__ */
     desktopVersion?: string
     /** Node process.platform of the main process, exposed as window.__POSTHOG_DESKTOP__.platform */
     desktopPlatform?: string
+    /** Organization membership level of the signed-in user, for the access-control app context */
+    getMembershipLevel?: () => number | null
 }
 
 export interface LocalBackend {
@@ -142,6 +160,64 @@ export function isProxyPath(pathname: string): boolean {
     return PROXY_PREFIXES.some((prefix) => pathname === prefix.replace(/\/$/, '') || pathname.startsWith(prefix))
 }
 
+/**
+ * Path prefixes that reach Django and therefore need the user's credentials. The
+ * rest of PROXY_PREFIXES is the capture edge and CDN-served static JS, which
+ * authenticate with the project token in the payload; sending a session cookie
+ * there would expose it far more widely than anything needs.
+ */
+const AUTHENTICATED_PREFIXES = ['/api/', '/_preflight', '/uploaded_media/', '/media/', '/avatars/']
+
+export function needsCredentials(pathname: string): boolean {
+    return AUTHENTICATED_PREFIXES.some(
+        (prefix) => pathname === prefix.replace(/\/$/, '') || pathname.startsWith(prefix)
+    )
+}
+
+/**
+ * Whether a request to the loopback server came from the app itself.
+ *
+ * The server has no way to authenticate its caller, and in cookie mode it answers
+ * by minting a first-party-looking request: it replaces Origin with the upstream's
+ * own and attaches a valid CSRF token. Without this check any page open in the
+ * user's ordinary browser could POST form-encoded data here (a CORS-simple request,
+ * so no preflight to block it) and have the write executed as the signed-in user.
+ * Only a definite cross-origin signal is rejected, so requests that legitimately
+ * carry neither header (image loads, top-level navigations) still work.
+ */
+export function isSameOriginRequest(headers: http.IncomingHttpHeaders, localOrigin: string | null): boolean {
+    if (headers['sec-fetch-site'] === 'cross-site') {
+        return false
+    }
+    const origin = headers['origin']
+    return !(typeof origin === 'string' && localOrigin !== null && origin !== localOrigin)
+}
+
+/** `/api/environments/2/query/HogQLQuery/?x=1` -> the kind segment and the query string */
+const QUERY_KIND_PATH = /^(\/api\/(?:environments|projects)\/[^/]+\/query)\/[A-Z][A-Za-z]*\/?(\?.*)?$/
+
+/**
+ * Drops the query-kind path segment the frontend appends to every query request.
+ *
+ * That segment routes to QueryViewSet's `create_with_kind` action, which is absent
+ * from the viewset's scope action lists, so APIScopePermission can derive no scope
+ * for it and denies every token — including one holding `*`. The kind-less endpoint
+ * runs the identical code path (`create_with_kind` just calls `create`, after
+ * checking the path kind matches the body kind, which is already in the body), so
+ * rewriting recovers insights, replay, web analytics and error tracking for
+ * bearer-authenticated sessions. Session auth reaches both, and is left untouched.
+ */
+export function rewriteBearerPath(method: string, pathWithQuery: string): string {
+    // POST-only because `create_with_kind` is: `retrieve`/`destroy` sit at
+    // /query/<client_query_id>/, and a caller-chosen id of e.g. "AbcQuery" would
+    // otherwise match this pattern and turn a cancel into a call on the collection
+    if (method.toUpperCase() !== 'POST') {
+        return pathWithQuery
+    }
+    const match = QUERY_KIND_PATH.exec(pathWithQuery)
+    return match ? `${match[1]}/${match[2] || ''}` : pathWithQuery
+}
+
 function cacheFileFor(cacheDir: string, pathname: string): string {
     return path.join(cacheDir, `${pathname.replace(/[^a-zA-Z0-9@._-]+/g, '_')}.json`)
 }
@@ -195,9 +271,12 @@ async function proxyRequest(
         })
         return
     }
+    const authenticated = needsCredentials(pathname)
 
     const method = req.method || 'GET'
-    const targetUrl = auth.apiHost + (req.url || pathname)
+    const requestPath = req.url || pathname
+    const upstreamPath = auth.mode === 'bearer' ? rewriteBearerPath(method, requestPath) : requestPath
+    const targetUrl = auth.apiHost + upstreamPath
     const headers: Record<string, string> = {}
     for (const [name, value] of Object.entries(req.headers)) {
         if (typeof value === 'string' && !STRIPPED_REQUEST_HEADERS.has(name.toLowerCase())) {
@@ -205,7 +284,27 @@ async function proxyRequest(
         }
     }
     Object.assign(headers, options.upstreamHeaders)
-    headers['authorization'] = `Bearer ${auth.accessToken}`
+    if (!authenticated) {
+        // Capture and static paths: no credentials to leak, nothing to authenticate
+    } else if (auth.mode === 'cookie') {
+        headers['cookie'] = auth.cookieHeader
+        // Django's CSRF check compares Origin against the request host. The renderer's
+        // real origin is the loopback server, which would never match, so both Origin
+        // and Referer are replaced with the upstream's own.
+        headers['origin'] = auth.apiHost
+        headers['referer'] = auth.apiHost + upstreamPath
+        // Determined entirely by the stored session: a value the renderer supplied
+        // would be a token for a different (loopback) origin and only ever wrong
+        delete headers['x-csrftoken']
+        if (auth.csrfToken && needsCsrfToken(method)) {
+            headers['x-csrftoken'] = auth.csrfToken
+        }
+        if (auth.userAgent) {
+            headers['user-agent'] = auth.userAgent
+        }
+    } else {
+        headers['authorization'] = `Bearer ${auth.accessToken}`
+    }
 
     const hasBody = method !== 'GET' && method !== 'HEAD'
     const cacheable = method === 'GET' && OFFLINE_CACHEABLE_PATHS.has(pathname)
@@ -248,6 +347,17 @@ async function proxyRequest(
     // let the host drop back to the sign-in shell instead of a dead SPA login form
     if (pathname === '/api/users/@me/' && upstream.status === 401) {
         options.onAuthRejected?.()
+    }
+
+    if (auth.mode === 'cookie' && authenticated) {
+        const setCookies = upstream.headers.getSetCookie()
+        if (setCookies.length) {
+            options.onUpstreamCookies?.(setCookies)
+        }
+        // An expired or risk-flushed session redirects to /login rather than 401ing
+        if (isSignedOutRedirect(upstream.status, upstream.headers.get('location'))) {
+            options.onAuthRejected?.()
+        }
     }
 
     const responseHeaders: Record<string, string> = {}
@@ -323,9 +433,19 @@ function oauthCallbackHtml(ok: boolean, message: string): string {
 
 export async function startLocalBackend(options: LocalBackendOptions, preferredPort: number): Promise<LocalBackend> {
     const manifest = readPreloadManifest(options.distDir)
-    const indexHtml = manifest
-        ? buildIndexHtml(manifest, { desktopVersion: options.desktopVersion, desktopPlatform: options.desktopPlatform })
-        : null
+    // Rebuilt per request rather than once at startup: the access-control context
+    // depends on who is signed in, which is not known until they are
+    const renderIndexHtml = (): string | null =>
+        manifest
+            ? buildIndexHtml(manifest, {
+                  desktopVersion: options.desktopVersion,
+                  desktopPlatform: options.desktopPlatform,
+                  membershipLevel: options.getMembershipLevel?.() ?? null,
+              })
+            : null
+
+    // Assigned once the port is known; until then no request can have reached us anyway
+    let localOrigin: string | null = null
 
     const server = http.createServer((req, res) => {
         const url = new URL(req.url || '/', 'http://localhost')
@@ -364,6 +484,14 @@ export async function startLocalBackend(options: LocalBackendOptions, preferredP
             return
         }
         if (isProxyPath(pathname)) {
+            if (!isSameOriginRequest(req.headers, localOrigin)) {
+                sendJson(res, 403, {
+                    type: 'authentication_error',
+                    code: 'desktop_cross_origin',
+                    detail: 'Cross-origin requests to the PostHog desktop server are not allowed.',
+                })
+                return
+            }
             proxyRequest(req, res, pathname, options).catch(() => {
                 if (!res.headersSent) {
                     sendJson(res, 502, { type: 'server_error', code: 'desktop_proxy_error', detail: 'Proxy error' })
@@ -375,6 +503,7 @@ export async function startLocalBackend(options: LocalBackendOptions, preferredP
             sendJson(res, 404, { detail: 'Not found' })
             return
         }
+        const indexHtml = renderIndexHtml()
         if (!indexHtml) {
             res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' })
             res.end('The PostHog frontend is not built. Run: pnpm --filter=@posthog/frontend build')
@@ -385,9 +514,10 @@ export async function startLocalBackend(options: LocalBackendOptions, preferredP
     })
 
     const port = await listen(server, preferredPort)
+    localOrigin = `http://127.0.0.1:${port}`
     return {
         port,
-        origin: `http://127.0.0.1:${port}`,
+        origin: localOrigin,
         close: () =>
             new Promise<void>((resolve, reject) => {
                 server.close((error) => (error ? reject(error) : resolve()))

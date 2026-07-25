@@ -22,8 +22,27 @@ An Electron app that runs the PostHog frontend natively, straight from this repo
 ```
 
 - The main process runs a loopback HTTP server that plays Django's role locally: it serves the built frontend (`frontend/dist`) and a generated `index.html` without `POSTHOG_APP_CONTEXT`, so the app bootstraps itself from `/_preflight/` and `/api/users/@me/`.
-- Backend paths (`/api/`, `/_preflight`, `/uploaded_media/`, ...) are proxied to the configured cloud region with the personal API key attached as a bearer token. The key is encrypted at rest with Electron `safeStorage` and never reaches the renderer.
+- Backend paths (`/api/`, `/_preflight`, `/uploaded_media/`, ...) are proxied to the configured cloud region with the stored credentials attached. Credentials are encrypted at rest with Electron `safeStorage` and never reach the renderer.
 - The app shell, all static assets, and the settings UI work with no internet connection. Key bootstrap responses are cached on disk and served stale when the cloud is unreachable.
+
+## Signing in
+
+Three methods exist, and only the first reaches the whole product.
+
+**Session sign-in (default).** "Sign in" opens a window on `{host}/login` in its own persisted partition, and the user signs in normally: password, Google, SAML and 2FA all work, because it is a real Chromium hitting the real site. Once a session cookie is present that `/api/users/@me/` accepts, the cookies are read out of the partition ([`browser-login.ts`](./src/main/browser-login.ts)) and the proxy replays them upstream from then on, exactly as a browser would. That means it also sends `X-CSRFToken` and an `Origin` matching the upstream host on unsafe methods, captures `Set-Cookie` so a rotated session key is not lost, and reuses the user agent the session was created under so the requests do not look like a different device to PostHog's session-risk scoring. A redirect to `/login` is treated as an expired session and drops back to this shell. Signing out, from this shell or from inside the app, revokes the session upstream and clears the partition.
+
+This reaches everything the website reaches, which is everything the app needs. It is not literally every endpoint: scopes in `INTERNAL_API_SCOPE_OBJECTS` are denied to session auth too (`posthog/permissions.py`), by design, since those are programmatic-only.
+
+Two limits are worth knowing. Credentials go only to the Django-backed prefixes (`needsCredentials` in [`server/backend.ts`](./src/main/server/backend.ts)); the capture and static paths authenticate with the project token in the payload and never see the cookie. And the loopback server rejects requests carrying a foreign `Origin` or `Sec-Fetch-Site: cross-site`, because it cannot otherwise tell the app's own requests from a page open in the user's ordinary browser, and it answers by minting a first-party request upstream. That closes the browser vector; a local process running as the same user is outside the threat model either way, since it can already read the app's storage.
+
+Google is the exception. Google refuses to complete a sign-in in a browser window embedded in an app, and that check is deliberate: an embedding app can read what you type. The app does not try to defeat it, so a Google-only account has to set a password (via "Forgot password?") or use another provider. The sign-in screen says so.
+
+**Bearer sign-in (OAuth browser flow, or a pasted personal API key).** Both authenticate with a bearer token, and tokens cannot reach all of the API no matter how broad their scopes are. `APIScopePermission` denies any request whose required scope it cannot derive, and `*` does not override that. Two cases produce it:
+
+- viewsets marked `scope_object = "INTERNAL"` (billing, search, tags, notifications, Max's core memory, the SQL editor's tab state, and others), and
+- custom DRF `@action` methods whose name is not listed in the viewset's `scope_object_read_actions` / `scope_object_write_actions`.
+
+The second case includes `QueryViewSet.create_with_kind`, which is where the frontend sends every query, so a bearer-authenticated app would lose insights, replay, web analytics and error tracking wholesale. The proxy works around that one specific case by dropping the query-kind path segment (`rewriteBearerPath` in [`server/backend.ts`](./src/main/server/backend.ts)); the kind-less endpoint runs identical code. The rest have no client-side workaround, so bearer sign-in stays a fallback and the shell says what will not load.
 
 ## Running it
 
@@ -35,9 +54,13 @@ pnpm turbo build --filter=@posthog/frontend
 pnpm --filter=@posthog/desktop start
 ```
 
-Sign in by choosing a region (US Cloud, EU Cloud, or a custom host) and clicking "Sign in with browser": the app opens PostHog Cloud's OAuth consent flow in your system browser (password, Google or SAML — whatever your account uses), receives the callback on its local loopback server, and stores the refresh token encrypted with `safeStorage`. Access tokens are refreshed automatically before they expire.
+Choose a region (US Cloud, EU Cloud, or a custom host) and click "Sign in". See [Signing in](#signing-in) above for what that does and why the alternatives under "Other ways to sign in" are limited.
 
-Alternatively, use "Use a personal API key instead" and paste a key created in PostHog under Settings › Personal API keys (give it all scopes you want the app to be able to use). A personal API key is the only option for custom hosts, unless `POSTHOG_DESKTOP_OAUTH_CLIENT_ID` points at an OAuth app registered on that instance.
+Both bearer options remain available: the OAuth browser flow opens PostHog's consent screen in your system browser and stores the refresh token encrypted with `safeStorage`, refreshing access tokens before they expire; or paste a personal API key created under Settings › Personal API keys. The OAuth flow registers this install as its own public PKCE client on first use (RFC 7591 dynamic client registration at `/oauth/register`), caching the returned client id per host, so it works against any instance including self-hosted. `POSTHOG_DESKTOP_OAUTH_CLIENT_ID` overrides that with a hand-registered app.
+
+## Access control
+
+PostHog's frontend gates scenes, buttons and panels on `resource_access_control`, and it fails closed: with no level for a resource it treats you as having none. Those maps only ever come from Django's server-rendered app context, and no API serves them, so an app that bootstraps from the API alone had every gated surface denied. The local server therefore synthesizes just that part of `POSTHOG_APP_CONTEXT` from the organization membership level captured at sign-in ([`server/access-context.ts`](./src/main/server/access-context.ts)); everything else stays absent so the API bootstrap is unchanged. It is UI-only, since the server re-checks each of these, and it is optimistic for RBAC-restricted members, who may see a control whose request is then refused.
 
 ## Development
 

@@ -1,14 +1,12 @@
 /**
  * OAuth 2.0 authorization-code + PKCE login through the system browser.
  *
- * PostHog Cloud runs a django-oauth-toolkit authorization server with public
- * PKCE clients pre-registered per region. We use PostHog Code's client IDs:
- * they are registered with the portless loopback redirect http://localhost/callback,
- * which the server's RFC 8252 port-flexible matching extends to any ephemeral
- * port (see validate_redirect_uri in posthog/api/oauth/views.py). The flow:
- * open {host}/oauth/authorize in the real browser, receive the code on the
- * local loopback server's /callback, exchange it at {host}/oauth/token/.
- * Access tokens (pha_...) authenticate the API exactly like personal API keys.
+ * PostHog runs a django-oauth-toolkit authorization server. The app registers
+ * itself as a public PKCE client on first use (see registerOAuthClient), then:
+ * open {host}/oauth/authorize in the real browser, receive the code on the local
+ * loopback server's /callback, exchange it at {host}/oauth/token/. Access tokens
+ * (pha_...) authenticate the API exactly like personal API keys, which means they
+ * reach less of it than a browser session does — see the README.
  *
  * This module must stay free of Electron imports so it can be unit tested with
  * plain Node.
@@ -16,15 +14,13 @@
 
 import { createHash, randomBytes } from 'node:crypto'
 
-import type { CloudRegion } from '../shared/ipc.ts'
-
-/** Registered public PKCE client IDs per cloud region (none for self-hosted).
- * These are PostHog Code's registered apps, reused until the desktop app has
- * its own registrations with a http://localhost/callback redirect URI. */
-export const OAUTH_CLIENT_IDS: Record<Exclude<CloudRegion, 'custom'>, string> = {
-    us: 'HCWoE0aRFMYxIxFNTTwkOORn5LBjOt2GVDzwSw5W',
-    eu: 'AIvijgMS0dxKEmr5z6odvRd8Pkh5vts3nPTzgzU9',
-}
+/**
+ * The redirect URI registered for the app's own client. Registered portless so the
+ * server's RFC 8252 loopback matching accepts whatever port the local server ends up
+ * on (validate_redirect_uri in posthog/api/oauth/views.py extends that flexibility to
+ * `localhost`, not just 127.0.0.1).
+ */
+export const OAUTH_REDIRECT_URI = 'http://localhost/callback'
 
 /** All scopes, mirroring what an all-access personal API key grants. */
 const OAUTH_SCOPE = '*'
@@ -35,12 +31,50 @@ const FLOW_TIMEOUT_MS = 5 * 60 * 1000
 /** Refresh when the access token has less than this long to live. */
 export const REFRESH_MARGIN_MS = 60 * 1000
 
-export function oauthClientIdFor(region: CloudRegion): string | null {
-    // Override for testing against a self-registered OAuth app (any region)
-    if (process.env.POSTHOG_DESKTOP_OAUTH_CLIENT_ID) {
-        return process.env.POSTHOG_DESKTOP_OAUTH_CLIENT_ID
+/**
+ * Registers this installation as its own OAuth client (RFC 7591 dynamic client
+ * registration, which PostHog serves unauthenticated at /oauth/register).
+ *
+ * The app used to borrow two hardcoded client IDs. Those belong to the sandbox
+ * agent application, whose tokens are only ever minted server-side, so it has no
+ * loopback redirect registered and the consent flow failed with "Mismatching
+ * redirect URI". Registering our own also makes browser sign-in work against any
+ * instance, self-hosted included, instead of just the two clouds.
+ *
+ * `scope` is deliberately omitted: a self-registered client cannot hold privileged
+ * scopes anyway, and leaving the ceiling empty lets the server grant its default
+ * breadth rather than pinning a list that would drift.
+ */
+export async function registerOAuthClient(apiHost: string): Promise<string> {
+    let response: Response
+    try {
+        response = await fetch(`${apiHost}/oauth/register/`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                // Not "PostHog ..." — the server blocks names starting with it so a
+                // self-registered client cannot present itself as the official app
+                client_name: 'Desktop app for PostHog',
+                redirect_uris: [OAUTH_REDIRECT_URI],
+                grant_types: ['authorization_code', 'refresh_token'],
+                response_types: ['code'],
+                token_endpoint_auth_method: 'none',
+            }),
+            signal: AbortSignal.timeout(20000),
+        })
+    } catch {
+        throw new Error(`Could not reach ${apiHost} to register the app.`)
     }
-    return region === 'custom' ? null : OAUTH_CLIENT_IDS[region]
+    const data = (await response.json().catch(() => ({}))) as { client_id?: string; error_description?: string }
+    if (!response.ok || !data.client_id) {
+        throw new Error(data.error_description || `Could not register the app with ${apiHost}.`)
+    }
+    return data.client_id
+}
+
+/** Env override, for testing against a hand-registered OAuth app. */
+export function oauthClientIdOverride(): string | null {
+    return process.env.POSTHOG_DESKTOP_OAUTH_CLIENT_ID || null
 }
 
 export interface TokenSet {

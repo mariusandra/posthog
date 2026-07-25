@@ -5,11 +5,14 @@
  * that is still a Django template (it `{% include %}`s head.html for the app context and
  * asset URLs). The desktop app has no Django, so we generate an equivalent document here:
  * same chunk loader contract (`window.ESBUILD_LOAD_SCRIPT` / `window.ESBUILD_LOAD_CHUNKS`),
- * assets resolved from `dist/preload-manifest.json`, and crucially NO
- * `window.POSTHOG_APP_CONTEXT` — when the context global is absent, `preflightLogic` and
- * `userLogic` fetch `/_preflight/` and `/api/users/@me/` themselves, which the local
- * backend proxies to the configured PostHog Cloud region.
+ * assets resolved from `dist/preload-manifest.json`, and a `window.POSTHOG_APP_CONTEXT`
+ * carrying only the access-control maps (see access-context.ts) — everything else is
+ * left absent so `preflightLogic` and `userLogic` still fetch `/_preflight/` and
+ * `/api/users/@me/` themselves, which the local backend proxies to the configured
+ * PostHog Cloud region.
  */
+
+import { appContextScript, isAdminMembership } from './access-context.ts'
 
 export interface PreloadManifest {
     /** e.g. "static/index-ABC123.css" */
@@ -43,6 +46,11 @@ export interface BuildIndexHtmlOptions {
     desktopVersion?: string
     /** Node process.platform of the main process, e.g. "darwin" — the frontend uses it to reserve space for macOS traffic lights */
     desktopPlatform?: string
+    /**
+     * Organization membership level of the signed-in user, used to synthesize the
+     * access-control app context. Null when signed out, which omits the context entirely.
+     */
+    membershipLevel?: number | null
 }
 
 export function buildIndexHtml(manifest: PreloadManifest, options: BuildIndexHtmlOptions = {}): string {
@@ -59,6 +67,13 @@ export function buildIndexHtml(manifest: PreloadManifest, options: BuildIndexHtm
     for (const url of [...manifest.js, ...manifest.authenticatedJs]) {
         preloadLinks.push(`<link rel="modulepreload" href="/${url}">`)
     }
+
+    // Signed out there is no membership level to derive from, and the SPA is only ever
+    // shown signed in, so omitting the context keeps the pre-sign-in boot exactly as it was
+    const accessContextScript =
+        options.membershipLevel === undefined || options.membershipLevel === null
+            ? ''
+            : appContextScript(isAdminMembership(options.membershipLevel))
 
     // Same loader contract as common/esbuilder/utils.mjs `copyIndexHtml`, minus the
     // per-scene chunk map (which only exists inside the Django-rendered index.html).
@@ -92,6 +107,7 @@ window.ESBUILD_LOAD_SCRIPT(${escapeForScript(jsEntry)})
         <link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32x32.png">
         <style>${CRITICAL_CSS}</style>
         ${preloadLinks.join('\n        ')}
+        ${accessContextScript ? `<script>${accessContextScript}</script>` : ''}
         <script>${loaderScript}</script>
     </head>
     <body>
