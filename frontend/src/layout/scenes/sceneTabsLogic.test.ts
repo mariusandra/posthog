@@ -89,31 +89,55 @@ describe('sceneTabsLogic', () => {
         expect(router.values.location.pathname).toEqual(prefixed('/activity/explore'))
     })
 
-    describe('fresh desktop windows ("open in new window")', () => {
-        // prefixed() needs the team context from initKeaTests, so build the fixture per-test
-        const persistedTabs = (): Record<string, any>[] => [
-            {
-                id: 'pin1',
-                pathname: prefixed('/dashboard/1'),
-                search: '',
-                hash: '',
-                title: 'Pinned dashboard',
-                iconType: 'dashboard',
-                active: false,
-                pinned: true,
-            },
-            {
-                id: 'tab2',
-                pathname: prefixed('/insights'),
-                search: '',
-                hash: '',
-                title: 'Insights',
-                iconType: 'insight',
-                active: true,
-                pinned: false,
-            },
-        ]
+    // prefixed() needs the team context from initKeaTests, so build the fixture per-test
+    const persistedTabs = (): Record<string, any>[] => [
+        {
+            id: 'pin1',
+            pathname: prefixed('/dashboard/1'),
+            search: '',
+            hash: '',
+            title: 'Pinned dashboard',
+            iconType: 'dashboard',
+            active: false,
+            pinned: true,
+        },
+        {
+            id: 'tab2',
+            pathname: prefixed('/insights'),
+            search: '',
+            hash: '',
+            title: 'Insights',
+            iconType: 'insight',
+            active: true,
+            pinned: false,
+        },
+    ]
 
+    describe('primary desktop window restore', () => {
+        beforeEach(() => {
+            window.__POSTHOG_DESKTOP__ = { version: 'test' }
+            sessionStorage.clear()
+        })
+
+        afterEach(() => {
+            delete window.__POSTHOG_DESKTOP__
+        })
+
+        it('a cold boot restores the saved tab set instead of clobbering it with the boot tab', () => {
+            initKeaTests()
+            localStorage.setItem('posthog-desktop-scene-tabs', JSON.stringify(persistedTabs()))
+            router.actions.push('/insights')
+            logic = sceneTabsLogic.build()
+            logic.mount()
+
+            expect(logic.values.tabs).toHaveLength(2)
+            expect(logic.values.tabs[0]).toMatchObject({ id: 'pin1', pinned: true, active: false })
+            expect(logic.values.tabs[1]).toMatchObject({ id: 'tab2', pathname: prefixed('/insights'), active: true })
+            expect(JSON.parse(localStorage.getItem('posthog-desktop-scene-tabs')!)).toHaveLength(2)
+        })
+    })
+
+    describe('fresh desktop windows ("open in new window")', () => {
         const mountFreshWindowAt = (location: string): void => {
             initKeaTests()
             router.actions.push(location)

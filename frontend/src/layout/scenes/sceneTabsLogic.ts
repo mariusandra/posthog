@@ -5,7 +5,13 @@ import { subscriptions } from 'kea-subscriptions'
 import { isDesktopApp, isDesktopFreshWindow } from 'lib/utils/isDesktopApp'
 import { addProjectIdIfMissing } from 'lib/utils/kea-router'
 import { NEW_INTERNAL_TAB } from 'lib/utils/newInternalTab'
-import { DESKTOP_TABS_STORAGE_KEY, TabOpenSource, generateTabId, sceneLogic } from 'scenes/sceneLogic'
+import {
+    DESKTOP_TABS_STORAGE_KEY,
+    TabOpenSource,
+    generateTabId,
+    markDesktopTabsRestored,
+    sceneLogic,
+} from 'scenes/sceneLogic'
 import { SceneTab } from 'scenes/sceneTypes'
 
 import type { InsightShortId } from '~/types'
@@ -376,6 +382,9 @@ export const sceneTabsLogic = kea<sceneTabsLogicType>([
         })
 
         const persisted = getPersistedTabs()
+        // Persistence is gated on this so sceneLogic's boot placeholder tab (dispatched via
+        // setTabs before this afterMount runs) cannot clobber the saved set we just read
+        markDesktopTabsRestored()
 
         // Windows opened via "open in new window" / File → New window start with just the
         // opened location plus the pinned tabs, instead of cloning the whole saved tab set

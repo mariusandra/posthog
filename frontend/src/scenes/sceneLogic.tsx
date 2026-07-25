@@ -123,10 +123,20 @@ const getBootstrappedHomepage = (): SceneTab | null => {
 /** localStorage key the desktop app persists its tab set under (see layout/scenes/sceneTabsLogic). */
 export const DESKTOP_TABS_STORAGE_KEY = 'posthog-desktop-scene-tabs'
 
+// The boot sequence dispatches setTabs with a single placeholder tab before the desktop restore
+// layer (layout/scenes/sceneTabsLogic) has read the saved set; persisting that early write would
+// clobber the saved tabs, so persistence stays off until the restore has run.
+let desktopTabsRestored = false
+
+/** Called by the desktop restore layer once it has read the saved tab set, enabling persistence. */
+export function markDesktopTabsRestored(): void {
+    desktopTabsRestored = true
+}
+
 const persistTabs = (tabs: SceneTab[], _homepage: SceneTab | null): void => {
     // Tabs are persisted only in the desktop app; additional ("fresh") windows don't persist —
     // the primary window owns the saved tab set.
-    if (!isDesktopApp() || isDesktopFreshWindow() || tabs.length === 0) {
+    if (!isDesktopApp() || !desktopTabsRestored || isDesktopFreshWindow() || tabs.length === 0) {
         return
     }
     try {
@@ -647,6 +657,8 @@ export const sceneLogic = kea<sceneLogicType>([
         cache.lastTrackedSceneByTab = {} as Record<string, { sceneId?: string; sceneKey?: string }>
         cache.initialNavigationTabCreated = false
         cache.lastRegisteredTabCount = null as number | null
+        // A fresh sceneLogic lifecycle means the desktop restore hasn't run yet for it
+        desktopTabsRestored = false
     }),
     actions({
         /* 1. Prepares to open the scene, as the listener may override and do something
