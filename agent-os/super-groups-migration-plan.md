@@ -58,7 +58,7 @@ The enrollment property is **always** `$feature_enrollment/{flag_key}` — this 
 2. **On flag key rename**, `_update_super_groups_for_key_change()` in `posthog/api/feature_flag.py` rewrites the enrollment key to match the new flag key
 3. **Migration 0748** (`posthog/migrations/0748_update_featureflag_super_groups.py`) was specifically written to fix historical cases where the enrollment key drifted out of sync — it forced `$feature_enrollment/{flag.key}` for every active flag
 
-There is no case where a flag's super_groups references a _different_ flag's enrollment key. The data is fully redundant with `flag.key`, so evaluation code can construct the key at runtime (same pattern as the Rust service constructing `holdout-{id}` for holdouts).
+There is no case where a flag's `super_groups` references a _different_ flag's enrollment key. The data is fully redundant with `flag.key`, so evaluation code can construct the key at runtime (same pattern as the Rust service constructing `holdout-{id}` for holdouts).
 
 ### Design decisions
 
