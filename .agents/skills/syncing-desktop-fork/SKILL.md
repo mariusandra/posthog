@@ -78,5 +78,6 @@ Fix failures the merge introduced; if a failure clearly pre-exists on upstream m
 ## After the sync
 
 Push `desktop` to the fork (`origin` in CI).
-The sync workflow then dispatches `desktop-release.yml`, which compares `version` in `products/desktop/package.json` against the existing `desktop-v<version>` release tag and, when the version changed, builds and publishes a new signed macOS DMG and Windows installer as a GitHub release on the fork.
-If that version is already released, the release workflow bumps its patch version before building.
+The sync workflow then dispatches `desktop-release.yml`, which selects the next `year.month.index` version from the UTC release date and existing GitHub releases.
+The index starts at zero each month and increases after each published release.
+The workflow writes the version to `products/desktop/package.json` before building and publishing the signed macOS DMG and Windows installer under `desktop-v<version>`.

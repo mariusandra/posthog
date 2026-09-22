@@ -13,5 +13,5 @@
         "esModuleInterop": true,
         "forceConsistentCasingInFileNames": true
     },
-    "include": ["src/**/*.ts", "build.mjs", "scripts/*.mjs"]
+    "include": ["src/**/*.ts", "build.mjs", "scripts/*.mjs", "scripts/*.ts"]
 }

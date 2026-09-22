@@ -1,10 +1,10 @@
 name: Desktop Release
 
 # Fork-only (mariusandra/posthog): build the signed + notarized macOS DMG and
-# the Windows installer and publish them as a GitHub release on the fork. If
-# `version` in products/desktop/package.json is already released, the patch
-# version is bumped and pushed to `desktop` first, so every run (including the
-# nightly desktop-sync dispatch) ships a release. Inert in PostHog/posthog.
+# the Windows installer and publish them as a GitHub release on the fork.
+# Versions use the UTC year and month plus a release index starting at zero.
+# The package version is committed before building so installers and update
+# metadata match the release tag. Inert in PostHog/posthog.
 # Mirrors build-desktop-app.yml but on GitHub-hosted runners (the fork has no
 # Depot) — keep the packaging steps in the two files aligned when editing either.
 #
@@ -42,16 +42,19 @@ jobs:
               with:
                   sparse-checkout: products/desktop
 
-            - name: Bump patch version if current version is already released
+            - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+              with:
+                  node-version-file: .nvmrc
+
+            - name: Select the next calendar release version
               id: check
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
-                  VERSION=$(jq -r .version products/desktop/package.json)
-                  if gh release view "desktop-v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-                      echo "desktop-v$VERSION already released; bumping patch version"
-                      VERSION=$(cd products/desktop && npm version patch --no-git-tag-version | tail -1)
-                      VERSION=${VERSION#v}
+                  gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[].tag_name' \
+                      > "$RUNNER_TEMP/desktop-release-tags.txt"
+                  VERSION=$(node products/desktop/scripts/release-version.ts "$RUNNER_TEMP/desktop-release-tags.txt")
+                  if ! git diff --quiet -- products/desktop/package.json; then
                       git config user.name "github-actions[bot]"
                       git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
                       git add products/desktop/package.json
@@ -59,8 +62,6 @@ jobs:
                       # A GITHUB_TOKEN push doesn't fire push-triggered workflows,
                       # so this can't retrigger this workflow in a loop
                       git push origin HEAD:refs/heads/desktop
-                  else
-                      echo "desktop-v$VERSION not released yet"
                   fi
                   echo "version=$VERSION" >> "$GITHUB_OUTPUT"
                   echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"

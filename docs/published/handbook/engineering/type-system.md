@@ -21,6 +21,9 @@ Run `pnpm --filter=@posthog/frontend typescript:check` after building workspace 
 The full frontend type graph can exceed a standard GitHub runner's available memory.
 The desktop fork's sync workflow adds 8 GiB of swap and sets `GOMEMLIMIT=10GiB` to give the typechecker more headroom on a standard runner.
 
+Desktop releases use `year.month.index`, with the UTC month and a zero-based index derived from existing GitHub releases.
+The selected version is written to `products/desktop/package.json` before building so the installers, update metadata, and `desktop-v<version>` tag agree.
+
 ## Backend → Frontend (API responses)
 
 We use [Orval](https://orval.dev/) to generate TypeScript types and API client functions from our OpenAPI schema.

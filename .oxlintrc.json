@@ -5,7 +5,6 @@
         "builtin": true
     },
     "ignorePatterns": [
-        "products/desktop",
         "node_modules",
         "dist",
         "build",
