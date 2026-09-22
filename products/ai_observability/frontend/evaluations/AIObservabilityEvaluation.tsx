@@ -1,5 +1,4 @@
 import { useActions, useValues } from 'kea'
-import { Field, Form } from 'kea-forms'
 import { combineUrl, router } from 'kea-router'
 import { useRef } from 'react'
 
@@ -21,37 +20,59 @@ import {
 import { AccessControlAction } from 'lib/components/AccessControlAction'
 import { DurationPicker } from 'lib/components/DurationPicker/DurationPicker'
 import { NotFound } from 'lib/components/NotFound'
+import { TZLabel } from 'lib/components/TZLabel'
+import { FEATURE_FLAGS } from 'lib/constants'
+import { LemonField } from 'lib/lemon-ui/LemonField'
 import { lemonToast } from 'lib/lemon-ui/LemonToast'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { pluralize } from 'lib/utils/strings'
 import { SceneExport } from 'scenes/sceneTypes'
 
 import { SceneBreadcrumbBackButton } from '~/layout/scenes/components/SceneBreadcrumbs'
+import { SceneStickyBar } from '~/layout/scenes/components/SceneStickyBar'
 import { InsightVizNode, NodeKind } from '~/queries/schema/schema-general'
 import { urls } from '~/scenes/urls'
 import { AccessControlLevel, AccessControlResourceType, ChartDisplayType, HogQLMathType } from '~/types'
 
 import { useAttachedContext } from 'products/posthog_ai/frontend/api/logics'
 
+import { ByokModelPickerNotice } from '../ByokModelPickerNotice'
 import { getModelPickerFooterLink, ModelPicker } from '../ModelPicker'
 import { modelPickerLogic } from '../modelPickerLogic'
 import { providerKeyStateIssueDescription, providerLabel } from '../settings/providerKeyStateUtils'
+import { EvaluationBackfillsTab } from './components/EvaluationBackfillsTab'
 import { EvaluationCodeEditor } from './components/EvaluationCodeEditor'
 import { EvaluationPromptEditor } from './components/EvaluationPromptEditor'
 import { EvaluationReportConfig } from './components/EvaluationReportConfig'
+import { EvaluationReportsCallout } from './components/EvaluationReportsCallout'
 import { EvaluationReportsTab } from './components/EvaluationReportsTab'
 import { EvaluationRunsTable } from './components/EvaluationRunsTable'
 import { EvaluationTriggers } from './components/EvaluationTriggers'
-import { EVALUATION_SUMMARY_MAX_RUNS } from './constants'
+import { EVALUATION_RUNS_QUERY_LIMIT, evaluationPassedHogQL, evaluationPassRateHogQL } from './constants'
 import {
+    evaluationOffersSessionTarget,
     evaluationSupportsReports,
-    evaluationSupportsRunSummary,
+    evaluationSupportsRunOutcomes,
     evaluationTypeHasEditableCriteria,
     evaluationTypeUsesModelConfiguration,
     isBooleanEvaluationOutput,
 } from './evaluationCapabilities'
 import { evaluationReportLogic } from './evaluationReportLogic'
-import { DEFAULT_TRACE_WINDOW_SECONDS, LLMEvaluationLogicProps, llmEvaluationLogic } from './llmEvaluationLogic'
+import {
+    DEFAULT_SESSION_MAX_AGE_SECONDS,
+    DEFAULT_SESSION_QUIET_PERIOD_SECONDS,
+    DEFAULT_SESSION_WINDOW_SECONDS,
+    DEFAULT_TRACE_MAX_AGE_SECONDS,
+    DEFAULT_TRACE_QUIET_PERIOD_SECONDS,
+    DEFAULT_TRACE_WINDOW_SECONDS,
+    LLMEvaluationLogicProps,
+    hasUnsetConditionRollout,
+    llmEvaluationLogic,
+} from './llmEvaluationLogic'
 import { statusReasonLabel, statusReasonRecoveryLabel } from './statusDisplay'
-import { EvaluationTarget, EvaluationType } from './types'
+import { EvaluationSettleStrategy, EvaluationTarget, EvaluationType } from './types'
+
+const RUNS_BACKFILL_TIME_FORMAT = { formatDate: 'MMM D, YYYY', formatTime: 'HH:mm' }
 
 export function AIObservabilityEvaluation(): JSX.Element {
     const {
@@ -63,6 +84,8 @@ export function AIObservabilityEvaluation(): JSX.Element {
         formValid,
         isNewEvaluation,
         runsSummary,
+        runsBackfillId,
+        runsBackfill,
         evaluationProviderKeyIssue,
         activeTab,
         canEnable,
@@ -70,16 +93,21 @@ export function AIObservabilityEvaluation(): JSX.Element {
         modelSelectionRequired,
     } = useValues(llmEvaluationLogic)
     const { searchParams } = useValues(router)
+    const { featureFlags } = useValues(featureFlagLogic)
+    const settlingStrategyEnabled = !!featureFlags[FEATURE_FLAGS.LLM_ANALYTICS_EVAL_SETTLING_STRATEGY]
+    const backfillsEnabled = !!featureFlags[FEATURE_FLAGS.LLM_ANALYTICS_EVAL_BACKFILLS]
     const {
         setEvaluationName,
         setEvaluationDescription,
         setEvaluationEnabled,
         setAllowsNA,
+        setTrueIsFailure,
         saveEvaluation,
         resetEvaluation,
         setEvaluationType,
         setEvaluationTarget,
-        setTraceWindowSeconds,
+        setSettleStrategy,
+        patchTargetConfig,
         setActiveTab,
     } = useActions(llmEvaluationLogic)
     const { push } = useActions(router)
@@ -104,13 +132,21 @@ export function AIObservabilityEvaluation(): JSX.Element {
 
     const isHog = evaluation.evaluation_type === 'hog'
     const isSentiment = evaluation.evaluation_type === 'sentiment'
+    const isAggregateTarget = evaluation.target === 'trace' || evaluation.target === 'session'
+    const isSessionTarget = evaluation.target === 'session'
+    const offersSessionTarget = evaluationOffersSessionTarget(evaluation, settlingStrategyEnabled)
+    // Read the stored strategy whether or not the flag is on. The flag gates the *picker*, not what
+    // the row contains: an API- or MCP-created session eval is inactivity, and forcing fixed_window
+    // here rendered a "wait 30 minutes" field holding a default the config never had.
+    const effectiveStrategy: EvaluationSettleStrategy =
+        evaluation.target_config.strategy ?? (isSessionTarget ? 'inactivity' : 'fixed_window')
     const isReportableEvaluation = evaluationSupportsReports(evaluation)
-    const supportsRunSummary = evaluationSupportsRunSummary(evaluation)
+    const supportsRunOutcomes = evaluationSupportsRunOutcomes(evaluation)
     const isBooleanOutput = isBooleanEvaluationOutput(evaluation.output_type)
     const hasEditableCriteria = evaluationTypeHasEditableCriteria(evaluation.evaluation_type)
 
     const trendInsightUrl =
-        supportsRunSummary && !isNewEvaluation && evaluation.id
+        supportsRunOutcomes && !isNewEvaluation && evaluation.id
             ? urls.insightNew({
                   query: {
                       kind: NodeKind.InsightVizNode,
@@ -122,7 +158,7 @@ export function AIObservabilityEvaluation(): JSX.Element {
                                   event: '$ai_evaluation',
                                   custom_name: `${evaluation.name} — Pass rate`,
                                   math: HogQLMathType.HogQL,
-                                  math_hogql: `if(countIf(properties.$ai_evaluation_result IS NOT NULL) > 0, countIf(properties.$ai_evaluation_result = 1) / countIf(properties.$ai_evaluation_result IS NOT NULL) * 100, 0)`,
+                                  math_hogql: evaluationPassRateHogQL(evaluationPassedHogQL(evaluation)),
                                   properties: [
                                       {
                                           key: '$ai_evaluation_id',
@@ -172,11 +208,15 @@ export function AIObservabilityEvaluation(): JSX.Element {
     const hasSelectedJudgeModel = !modelSelectionRequired || Boolean(evaluation.model_configuration?.model.trim())
     const hasName = evaluation.name.length > 0
     const basicFieldsValid = hasName && configValid
-    const percentageUnset = evaluation.conditions.some((c) => (c.rollout_percentage ?? 0) === 0)
+    const percentageUnset = hasUnsetConditionRollout(evaluation.conditions)
     const percentageOutOfRange = evaluation.conditions.some(
         (c) => (c.rollout_percentage ?? 0) > 100 || (c.rollout_percentage ?? 0) < 0
     )
     const hasConditions = evaluation.conditions.length > 0
+    // The save writes the evaluation configuration and then returns to the evaluations list. Runs
+    // edits nothing, and Backfills holds a setup this save does not carry, plus its own Start
+    // button, so leaving the page from either tab only does what the user did not ask for.
+    const showSaveAction = activeTab !== 'runs' && activeTab !== 'backfills'
     const saveButtonDisabledReason = !hasName
         ? 'Add a name for this evaluation'
         : !configValid
@@ -251,9 +291,11 @@ export function AIObservabilityEvaluation(): JSX.Element {
         <div className="space-y-6">
             <SceneBreadcrumbBackButton />
             {/* Header */}
-            <div className="flex justify-between items-start pb-4 border-b">
-                <div className="space-y-2">
-                    <h1 className="text-2xl font-semibold">{isNewEvaluation ? 'New evaluation' : evaluation.name}</h1>
+            <SceneStickyBar hasSceneTitleSection={false} className="flex justify-between items-start gap-2 space-y-0">
+                <div className="space-y-2 min-w-0">
+                    <h1 className="text-2xl font-semibold break-words">
+                        {isNewEvaluation ? 'New evaluation' : evaluation.name}
+                    </h1>
                     <div className="flex items-center gap-2">
                         {isNewEvaluation ? (
                             <LemonTag type="primary">New</LemonTag>
@@ -273,7 +315,7 @@ export function AIObservabilityEvaluation(): JSX.Element {
                         )}
                     </div>
                 </div>
-                <div className="flex gap-2">
+                <div className="flex gap-2 shrink-0">
                     {trendInsightUrl ? (
                         <LemonButton
                             type="secondary"
@@ -298,10 +340,11 @@ export function AIObservabilityEvaluation(): JSX.Element {
                     <LemonButton type="secondary" icon={<IconArrowLeft />} onClick={handleCancel}>
                         {hasUnsavedChanges ? 'Cancel' : 'Back'}
                     </LemonButton>
-                    {activeTab !== 'runs' && (
+                    {showSaveAction && (
                         <AccessControlAction
-                            resourceType={AccessControlResourceType.LlmAnalytics}
+                            resourceType={AccessControlResourceType.Evaluation}
                             minAccessLevel={AccessControlLevel.Editor}
+                            userAccessLevel={evaluation.user_access_level ?? undefined}
                         >
                             <LemonButton
                                 type="primary"
@@ -314,7 +357,7 @@ export function AIObservabilityEvaluation(): JSX.Element {
                         </AccessControlAction>
                     )}
                 </div>
-            </div>
+            </SceneStickyBar>
 
             {evaluation.status === 'error' && (
                 <LemonBanner type="error">
@@ -363,12 +406,24 @@ export function AIObservabilityEvaluation(): JSX.Element {
                         content: (
                             <div className="max-w-6xl">
                                 <div className="flex justify-between items-center mb-4">
-                                    <p className="text-muted text-sm m-0">
-                                        History of when this evaluation has been executed.
-                                        {runsSummary && runsSummary.total > EVALUATION_SUMMARY_MAX_RUNS && (
-                                            <> The table below shows the latest {EVALUATION_SUMMARY_MAX_RUNS} runs.</>
+                                    <div className="min-w-0">
+                                        <p className="text-muted text-sm m-0">
+                                            History of when this evaluation has been executed.
+                                            {runsSummary && runsSummary.total > EVALUATION_RUNS_QUERY_LIMIT && (
+                                                <>
+                                                    {' '}
+                                                    The table below shows the latest {EVALUATION_RUNS_QUERY_LIMIT} runs.
+                                                </>
+                                            )}
+                                        </p>
+
+                                        {isReportableEvaluation && (
+                                            <EvaluationReportsCallout
+                                                evaluationId={evaluation.id}
+                                                onReportsClick={() => setActiveTab('reports')}
+                                            />
                                         )}
-                                    </p>
+                                    </div>
                                     {runsSummary && (
                                         <div className="flex flex-col items-end gap-1">
                                             <div className="flex gap-4 text-sm">
@@ -376,7 +431,7 @@ export function AIObservabilityEvaluation(): JSX.Element {
                                                     <div className="font-semibold text-lg">{runsSummary.total}</div>
                                                     <div className="text-muted">Total runs</div>
                                                 </div>
-                                                {supportsRunSummary && (
+                                                {supportsRunOutcomes && (
                                                     <div className="text-center">
                                                         <div className="font-semibold text-lg text-success">
                                                             {runsSummary.successRate}%
@@ -384,7 +439,7 @@ export function AIObservabilityEvaluation(): JSX.Element {
                                                         <div className="text-muted">Success rate</div>
                                                     </div>
                                                 )}
-                                                {supportsRunSummary && evaluation.output_config.allows_na && (
+                                                {supportsRunOutcomes && evaluation.output_config.allows_na && (
                                                     <div className="text-center">
                                                         <div className="font-semibold text-lg">
                                                             {runsSummary.applicabilityRate}%
@@ -399,10 +454,51 @@ export function AIObservabilityEvaluation(): JSX.Element {
                                                     <div className="text-muted">Errors</div>
                                                 </div>
                                             </div>
-                                            <div className="text-muted text-xs">Across all runs, all time</div>
+                                            <div className="text-muted text-xs">
+                                                {runsBackfillId ? 'From this backfill' : 'Across all runs, all time'}
+                                            </div>
                                         </div>
                                     )}
                                 </div>
+                                {runsBackfillId && (
+                                    <LemonBanner
+                                        type="info"
+                                        className="mb-4"
+                                        action={{
+                                            children: 'Show all runs',
+                                            onClick: () =>
+                                                router.actions.push(
+                                                    router.values.location.pathname,
+                                                    { ...router.values.searchParams, backfill_id: undefined },
+                                                    router.values.hashParams
+                                                ),
+                                        }}
+                                    >
+                                        <span className="font-semibold">Showing runs from one backfill.</span>
+                                        {runsBackfill && (
+                                            <>
+                                                {' '}
+                                                It covered {pluralize(
+                                                    runsBackfill.total_count,
+                                                    runsBackfill.target
+                                                )}{' '}
+                                                between{' '}
+                                                <TZLabel
+                                                    time={runsBackfill.window_start}
+                                                    timestampStyle="absolute"
+                                                    {...RUNS_BACKFILL_TIME_FORMAT}
+                                                />
+                                                {' and '}
+                                                <TZLabel
+                                                    time={runsBackfill.window_end}
+                                                    timestampStyle="absolute"
+                                                    {...RUNS_BACKFILL_TIME_FORMAT}
+                                                />
+                                                .
+                                            </>
+                                        )}
+                                    </LemonBanner>
+                                )}
                                 <EvaluationRunsTable />
                             </div>
                         ),
@@ -415,7 +511,21 @@ export function AIObservabilityEvaluation(): JSX.Element {
                             content: (
                                 <EvaluationReportsTab
                                     evaluationId={evaluation.id}
+                                    userAccessLevel={evaluation.user_access_level ?? undefined}
                                     onConfigureClick={() => setActiveTab('configuration')}
+                                />
+                            ),
+                        },
+                    !isNewEvaluation &&
+                        backfillsEnabled && {
+                            key: 'backfills',
+                            label: 'Backfills',
+                            'data-attr': 'llma-evaluation-backfills-tab',
+                            content: (
+                                <EvaluationBackfillsTab
+                                    evaluationId={evaluation.id}
+                                    userAccessLevel={evaluation.user_access_level ?? undefined}
+                                    onConfigurationClick={() => setActiveTab('configuration')}
                                 />
                             ),
                         },
@@ -425,34 +535,34 @@ export function AIObservabilityEvaluation(): JSX.Element {
                         'data-attr': 'llma-evaluation-configuration-tab',
                         content: (
                             <div className="max-w-4xl">
-                                <Form logic={llmEvaluationLogic} formKey="evaluation" className="space-y-6">
+                                <div className="space-y-6">
                                     {/* Basic Information */}
                                     <div className="bg-bg-light border rounded p-6">
                                         <h3 className="text-lg font-semibold mb-4">Basic information</h3>
 
                                         <div className="space-y-4">
-                                            <Field name="name" label="Name">
+                                            <LemonField.Pure label="Name">
                                                 <LemonInput
                                                     value={evaluation.name}
                                                     onChange={setEvaluationName}
                                                     placeholder="e.g., Helpfulness Check"
                                                     maxLength={100}
                                                 />
-                                            </Field>
+                                            </LemonField.Pure>
 
                                             {evaluationMethodOptions.length > 1 && (
-                                                <Field name="evaluation_type" label="Method">
+                                                <LemonField.Pure label="Method">
                                                     <LemonSelect
                                                         value={evaluation.evaluation_type}
                                                         onChange={(value) => setEvaluationType(value as EvaluationType)}
                                                         options={evaluationMethodOptions}
                                                         fullWidth
                                                     />
-                                                </Field>
+                                                </LemonField.Pure>
                                             )}
                                             <p className="text-muted text-sm -mt-2">
                                                 {isSentiment ? (
-                                                    'Classify the sentiment of only the last user message on each matching generation event with a sentiment classifier, not LLM calls.'
+                                                    'Classify the sentiment of only the last user message on each matching generation event with a sentiment classifier, not LLM calls. The classifier is trained on English, so labels are unreliable for other languages. For a multilingual agent, use an LLM judge instead.'
                                                 ) : isHog ? (
                                                     <>
                                                         Run deterministic{' '}
@@ -460,23 +570,27 @@ export function AIObservabilityEvaluation(): JSX.Element {
                                                             Hog code
                                                         </Link>{' '}
                                                         against{' '}
-                                                        {evaluation.target === 'trace'
-                                                            ? 'the whole trace'
-                                                            : 'each generation'}
+                                                        {isSessionTarget
+                                                            ? 'the whole session'
+                                                            : evaluation.target === 'trace'
+                                                              ? 'the whole trace'
+                                                              : 'each generation'}
                                                         . No LLM cost.
                                                     </>
                                                 ) : (
                                                     `Use an LLM to evaluate ${
-                                                        evaluation.target === 'trace'
-                                                            ? 'the whole trace'
-                                                            : 'each generation'
+                                                        isSessionTarget
+                                                            ? 'the whole session'
+                                                            : evaluation.target === 'trace'
+                                                              ? 'the whole trace'
+                                                              : 'each generation'
                                                     } against a natural-language prompt.`
                                                 )}
                                             </p>
 
                                             {!isSentiment && (
                                                 <>
-                                                    <Field name="target" label="Evaluate">
+                                                    <LemonField.Pure label="Evaluate">
                                                         <LemonSelect<EvaluationTarget>
                                                             value={evaluation.target ?? 'generation'}
                                                             onChange={setEvaluationTarget}
@@ -489,38 +603,134 @@ export function AIObservabilityEvaluation(): JSX.Element {
                                                                     value: 'trace',
                                                                     label: 'Whole trace',
                                                                 },
+                                                                ...(offersSessionTarget
+                                                                    ? [
+                                                                          {
+                                                                              value: 'session' as const,
+                                                                              label: 'Whole session',
+                                                                          },
+                                                                      ]
+                                                                    : []),
                                                             ]}
                                                             fullWidth
                                                         />
-                                                    </Field>
+                                                    </LemonField.Pure>
                                                     <p className="text-muted text-sm -mt-2">
-                                                        {evaluation.target === 'trace'
-                                                            ? 'Runs once per trace on all of its events together, after a delay that lets the trace complete.'
-                                                            : 'Runs on each matching generation event individually, right after it is ingested.'}
+                                                        {isSessionTarget
+                                                            ? 'Runs once per session on every trace it contains, after the session settles. Only fires for events that carry an AI session id.'
+                                                            : evaluation.target === 'trace'
+                                                              ? 'Runs once per trace on all of its events together, after it settles.'
+                                                              : 'Runs on each matching generation event individually, right after it is ingested.'}
                                                     </p>
-                                                    {evaluation.target === 'trace' && (
-                                                        <Field name="trace_window" label="Wait before evaluating">
-                                                            <div className="space-y-1">
-                                                                <DurationPicker
-                                                                    value={
-                                                                        evaluation.target_config.window_seconds ??
-                                                                        DEFAULT_TRACE_WINDOW_SECONDS
-                                                                    }
-                                                                    onChange={setTraceWindowSeconds}
-                                                                />
-                                                                <p className="text-muted text-xs">
-                                                                    How long to wait after the first matching generation
-                                                                    before pulling the whole trace (10s–2h). Captured
-                                                                    when the run is scheduled — changing it won't affect
-                                                                    trace runs already in flight.
-                                                                </p>
-                                                            </div>
-                                                        </Field>
+                                                    {isAggregateTarget && (
+                                                        <>
+                                                            {settlingStrategyEnabled && (
+                                                                <LemonField.Pure label="Evaluate when">
+                                                                    <LemonSelect<EvaluationSettleStrategy>
+                                                                        value={effectiveStrategy}
+                                                                        onChange={setSettleStrategy}
+                                                                        options={[
+                                                                            {
+                                                                                value: 'fixed_window',
+                                                                                label: 'A fixed delay has passed',
+                                                                            },
+                                                                            {
+                                                                                value: 'inactivity',
+                                                                                label: isSessionTarget
+                                                                                    ? 'The session goes quiet'
+                                                                                    : 'The trace goes quiet',
+                                                                            },
+                                                                        ]}
+                                                                        fullWidth
+                                                                    />
+                                                                </LemonField.Pure>
+                                                            )}
+                                                            {effectiveStrategy === 'fixed_window' ? (
+                                                                <LemonField.Pure label="Wait before evaluating">
+                                                                    <div className="space-y-1">
+                                                                        <DurationPicker
+                                                                            value={
+                                                                                evaluation.target_config
+                                                                                    .window_seconds ??
+                                                                                (isSessionTarget
+                                                                                    ? DEFAULT_SESSION_WINDOW_SECONDS
+                                                                                    : DEFAULT_TRACE_WINDOW_SECONDS)
+                                                                            }
+                                                                            onChange={(value) => {
+                                                                                if (
+                                                                                    evaluation.target_config
+                                                                                        .strategy === 'inactivity'
+                                                                                ) {
+                                                                                    setSettleStrategy('fixed_window')
+                                                                                }
+                                                                                patchTargetConfig({
+                                                                                    window_seconds: value,
+                                                                                })
+                                                                            }}
+                                                                        />
+                                                                        <p className="text-muted text-xs">
+                                                                            {isSessionTarget
+                                                                                ? "How long to wait after the first matching generation before pulling the whole session (10s to 7 days). Captured when the run is scheduled, so changing it won't affect runs already in flight."
+                                                                                : "How long to wait after the first matching generation before pulling the whole trace (10s–2h). Captured when the run is scheduled — changing it won't affect trace runs already in flight."}
+                                                                        </p>
+                                                                    </div>
+                                                                </LemonField.Pure>
+                                                            ) : (
+                                                                <>
+                                                                    <LemonField.Pure label="Quiet period">
+                                                                        <div className="space-y-1">
+                                                                            <DurationPicker
+                                                                                value={
+                                                                                    evaluation.target_config
+                                                                                        .quiet_period_seconds ??
+                                                                                    (isSessionTarget
+                                                                                        ? DEFAULT_SESSION_QUIET_PERIOD_SECONDS
+                                                                                        : DEFAULT_TRACE_QUIET_PERIOD_SECONDS)
+                                                                                }
+                                                                                onChange={(value) =>
+                                                                                    patchTargetConfig({
+                                                                                        quiet_period_seconds: value,
+                                                                                    })
+                                                                                }
+                                                                            />
+                                                                            <p className="text-muted text-xs">
+                                                                                {isSessionTarget
+                                                                                    ? 'Evaluate once the session has had no new activity for this long (10s to 24 hours). Sessions often pause for a while mid-conversation, so a longer quiet period means fewer verdicts on a session that was not finished.'
+                                                                                    : 'Evaluate once the trace has had no new activity for this long (10s–30m).'}
+                                                                            </p>
+                                                                        </div>
+                                                                    </LemonField.Pure>
+                                                                    <LemonField.Pure label="Evaluate by">
+                                                                        <div className="space-y-1">
+                                                                            <DurationPicker
+                                                                                value={
+                                                                                    evaluation.target_config
+                                                                                        .max_age_seconds ??
+                                                                                    (isSessionTarget
+                                                                                        ? DEFAULT_SESSION_MAX_AGE_SECONDS
+                                                                                        : DEFAULT_TRACE_MAX_AGE_SECONDS)
+                                                                                }
+                                                                                onChange={(value) =>
+                                                                                    patchTargetConfig({
+                                                                                        max_age_seconds: value,
+                                                                                    })
+                                                                                }
+                                                                            />
+                                                                            <p className="text-muted text-xs">
+                                                                                {isSessionTarget
+                                                                                    ? 'Always evaluate once the session is this old, even if it is still active (1m to 7 days).'
+                                                                                    : "Always evaluate once the trace is this old, even if it's still active (1m–2h)."}
+                                                                            </p>
+                                                                        </div>
+                                                                    </LemonField.Pure>
+                                                                </>
+                                                            )}
+                                                        </>
                                                     )}
                                                 </>
                                             )}
 
-                                            <Field name="description" label="Description (optional)">
+                                            <LemonField.Pure label="Description (optional)">
                                                 <LemonTextArea
                                                     value={evaluation.description || ''}
                                                     onChange={setEvaluationDescription}
@@ -528,7 +738,7 @@ export function AIObservabilityEvaluation(): JSX.Element {
                                                     rows={2}
                                                     maxLength={500}
                                                 />
-                                            </Field>
+                                            </LemonField.Pure>
 
                                             <div className="flex items-center gap-2">
                                                 <Tooltip
@@ -554,8 +764,7 @@ export function AIObservabilityEvaluation(): JSX.Element {
                                             </div>
 
                                             {isBooleanOutput && (
-                                                <Field
-                                                    name="allows_na"
+                                                <LemonField.Pure
                                                     label={
                                                         <div className="flex items-center gap-1">
                                                             <span>Allow N/A responses</span>
@@ -586,7 +795,33 @@ export function AIObservabilityEvaluation(): JSX.Element {
                                                                   : 'Evaluation returns true or false'}
                                                         </span>
                                                     </div>
-                                                </Field>
+                                                </LemonField.Pure>
+                                            )}
+
+                                            {isBooleanOutput && (
+                                                <LemonField.Pure
+                                                    label={
+                                                        <div className="flex items-center gap-1">
+                                                            <span>A true result flags a problem</span>
+                                                            <Tooltip title="Turn this on when the evaluation looks for something you don't want, like a struggling user or a hallucination. A true result then counts as a fail in reports and pass rates. The evaluation results themselves don't change.">
+                                                                <IconInfo className="text-muted text-base" />
+                                                            </Tooltip>
+                                                        </div>
+                                                    }
+                                                >
+                                                    <div className="flex items-center gap-2">
+                                                        <LemonSwitch
+                                                            checked={evaluation.output_config.true_is_failure ?? false}
+                                                            onChange={setTrueIsFailure}
+                                                            data-attr="llma-evaluation-true-is-failure-switch"
+                                                        />
+                                                        <span className="text-muted text-sm">
+                                                            {evaluation.output_config.true_is_failure
+                                                                ? 'A true result counts as a fail'
+                                                                : 'A true result counts as a pass'}
+                                                        </span>
+                                                    </div>
+                                                </LemonField.Pure>
                                             )}
                                         </div>
                                     </div>
@@ -610,16 +845,47 @@ export function AIObservabilityEvaluation(): JSX.Element {
                                     <div ref={triggersRef} className="bg-bg-light border rounded p-6">
                                         <h3 className="text-lg font-semibold mb-4">Triggers</h3>
                                         <p className="text-muted text-sm mb-4">
-                                            Configure when this evaluation should run on your LLM generations.
+                                            The evaluation runs on generations that match any one of these condition
+                                            sets. Within a set, all filters must match, and sampling decides how many of
+                                            the matching generations get evaluated.
+                                            {evaluation.target === 'trace' && (
+                                                <>
+                                                    {' '}
+                                                    Conditions match individual generations. The whole trace is
+                                                    evaluated once any of its generations matches, and sampling applies
+                                                    per trace.
+                                                </>
+                                            )}
                                         </p>
                                         <EvaluationTriggers />
+                                        <div className="bg-bg-light border rounded p-3 text-sm mt-6">
+                                            <h4 className="font-semibold mb-2">Examples:</h4>
+                                            <ul className="space-y-1 text-muted list-disc list-inside">
+                                                <li>
+                                                    <strong>10% of all generations:</strong> Set 10% sampling with no
+                                                    filter conditions
+                                                </li>
+                                                <li>
+                                                    <strong>5% of GPT-4 generations:</strong> Set 5% sampling with
+                                                    $ai_model = "gpt-4o"
+                                                </li>
+                                                <li>
+                                                    <strong>Exclude internal users:</strong> Set 100% sampling with
+                                                    person property is_internal ≠ true
+                                                </li>
+                                                <li>
+                                                    <strong>High-cost generations:</strong> Set 100% sampling with
+                                                    $ai_total_cost_usd &gt; 0.01
+                                                </li>
+                                            </ul>
+                                        </div>
                                     </div>
 
                                     {/* Scheduled Reports (inline config for new evaluations) */}
                                     {isNewEvaluation && isReportableEvaluation && (
                                         <EvaluationReportConfig evaluationId="new" />
                                     )}
-                                </Form>
+                                </div>
 
                                 {/* Scheduled Reports (for existing evaluations, outside the form) */}
                                 {!isNewEvaluation && isReportableEvaluation && (
@@ -657,7 +923,7 @@ function EvaluationModelPicker(): JSX.Element {
             </p>
 
             <div className="space-y-4">
-                <Field name="model" label="Model">
+                <LemonField.Pure label="Model">
                     <div>
                         <ModelPicker
                             model={selectedModel}
@@ -669,11 +935,12 @@ function EvaluationModelPicker(): JSX.Element {
                             selectedModelName={selectedModelName}
                             data-attr="evaluation-model-selector"
                         />
+                        <ByokModelPickerNotice />
                         {modelSelectionRequired && !selectedModel && (
                             <p className="text-sm text-danger mt-1">Select a judge model.</p>
                         )}
                     </div>
-                </Field>
+                </LemonField.Pure>
             </div>
         </div>
     )

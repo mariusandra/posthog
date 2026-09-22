@@ -85,6 +85,39 @@ describe('sourceSettingsLogic', () => {
         ])
     })
 
+    it('updates a large schema group optimistically with one batch save', async () => {
+        const schemas = Array.from({ length: 300 }, (_, index) =>
+            makeSchema({ id: `schema-${index}`, name: `public.table_${index}` })
+        )
+        jest.spyOn(api.externalDataSources, 'get').mockResolvedValue(makeSource(schemas))
+        const bulkUpdateSchemasSpy = jest
+            .spyOn(api.externalDataSources, 'bulkUpdateSchemas')
+            .mockImplementation(async (_id, updates) =>
+                updates.map((update) => ({ ...schemas.find((schema) => schema.id === update.id)!, ...update }))
+            )
+
+        logic = sourceSettingsLogic({ id: 'source-1' })
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+        jest.useFakeTimers()
+
+        logic.actions.updateSchemas(schemas.map((schema) => ({ ...schema, should_sync: true })))
+
+        expect(logic.values.source?.schemas.every((schema) => schema.should_sync)).toBe(true)
+        expect(bulkUpdateSchemasSpy).not.toHaveBeenCalled()
+
+        await jest.advanceTimersByTimeAsync(500)
+
+        expect(bulkUpdateSchemasSpy).toHaveBeenCalledTimes(1)
+        expect(bulkUpdateSchemasSpy.mock.calls[0][1]).toHaveLength(300)
+        expect(bulkUpdateSchemasSpy.mock.calls[0][1]).toEqual(
+            expect.arrayContaining([
+                { id: 'schema-0', should_sync: true },
+                { id: 'schema-299', should_sync: true },
+            ])
+        )
+    })
+
     it('keeps newer queued changes when an older save resolves later', async () => {
         let resolveFirstRequest: ((schema: ExternalDataSourceSchema) => void) | null = null
         const bulkUpdateSchemasSpy = jest.spyOn(api.externalDataSources, 'bulkUpdateSchemas').mockImplementation(
@@ -160,6 +193,32 @@ describe('sourceSettingsLogic', () => {
         ])
         expect(logic.values.source?.schemas[0].sync_frequency).toBe('24hour')
         expect(logic.values.source?.schemas[0].enabled_columns).toEqual(['id', 'name'])
+    })
+
+    it('bulk sync method edit batches every selected table into one request', async () => {
+        jest.spyOn(api.externalDataSources, 'get').mockResolvedValue(
+            makeSource([
+                makeSchema({ id: 'schema-1', sync_type: 'incremental', incremental_field: 'updated_at' }),
+                makeSchema({ id: 'schema-2', sync_type: 'incremental', incremental_field: 'created_at' }),
+            ])
+        )
+        const bulkUpdateSchemasSpy = jest
+            .spyOn(api.externalDataSources, 'bulkUpdateSchemas')
+            .mockImplementation(async (_id, schemas) => schemas.map((partial) => ({ ...makeSchema(), ...partial })))
+
+        logic = sourceSettingsLogic({ id: 'source-1' })
+        logic.mount()
+        await expectLogic(logic).toFinishAllListeners()
+        jest.useFakeTimers()
+
+        logic.actions.bulkSetSyncMethod(logic.values.source!.schemas, 'full_refresh')
+        await jest.advanceTimersByTimeAsync(500)
+
+        expect(bulkUpdateSchemasSpy).toHaveBeenCalledTimes(1)
+        expect(bulkUpdateSchemasSpy).toHaveBeenLastCalledWith('source-1', [
+            { id: 'schema-1', sync_type: 'full_refresh' },
+            { id: 'schema-2', sync_type: 'full_refresh' },
+        ])
     })
 
     it('sends a changed writable field discovered by diff, not a fixed allowlist', async () => {

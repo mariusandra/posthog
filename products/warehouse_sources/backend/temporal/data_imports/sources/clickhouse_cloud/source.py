@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.clickhouse_cloud.clickhouse_cloud import (
     ClickhouseCloudResumeConfig,
@@ -30,6 +24,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.clickhousecloud import (
     ClickhouseCloudSourceConfig,
 )
@@ -47,7 +42,7 @@ class ClickhouseCloudSource(ResumableSource[ClickhouseCloudSourceConfig, Clickho
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.CLICKHOUSE_CLOUD,
+            name=ExternalDataSourceType.CLICKHOUSECLOUD,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="ClickHouse Cloud (ClickHouse, Inc.)",
             releaseStatus=ReleaseStatus.ALPHA,
@@ -130,7 +125,10 @@ Generate an API key from your [ClickHouse Cloud console](https://console.clickho
         if validate_clickhouse_cloud_credentials(config.key_id, config.key_secret):
             return True, None
 
-        return False, "Invalid ClickHouse Cloud API key ID or secret"
+        return False, (
+            "Your ClickHouse Cloud API key was rejected. Check the key ID and secret, or create a new key "
+            "in your ClickHouse Cloud console, then reconnect."
+        )
 
     def get_resumable_source_manager(self, inputs: SourceInputs) -> ResumableSourceManager[ClickhouseCloudResumeConfig]:
         return ResumableSourceManager[ClickhouseCloudResumeConfig](inputs, ClickhouseCloudResumeConfig)

@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.airtable.airtable import (
     airtable_source,
@@ -27,6 +21,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.airtable import (
     AirtableSourceConfig,
 )
@@ -54,7 +49,7 @@ class AirtableSource(SimpleSource[AirtableSourceConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.AIRTABLE,
+            name=ExternalDataSourceType.AIRTABLE,
             category=DataWarehouseSourceCategory.PRODUCTIVITY,
             label="Airtable",
             caption="""Enter your Airtable personal access token to pull your Airtable bases into the PostHog Data warehouse.
@@ -62,7 +57,7 @@ class AirtableSource(SimpleSource[AirtableSourceConfig]):
 Create a personal access token at [airtable.com/create/tokens](https://airtable.com/create/tokens) with the `data.records:read` and `schema.bases:read` scopes, and grant it access to the bases you want to sync. Records are synced from every table of every base the token can access.""",
             iconPath="/static/services/airtable.png",
             docsUrl="https://posthog.com/docs/cdp/sources/airtable",
-            releaseStatus=ReleaseStatus.ALPHA,
+            releaseStatus=ReleaseStatus.GA,
             fields=cast(
                 list[FieldType],
                 [
@@ -99,7 +94,10 @@ Create a personal access token at [airtable.com/create/tokens](https://airtable.
         if validate_airtable_credentials(config.personal_access_token):
             return True, None
 
-        return False, "Invalid Airtable personal access token"
+        return (
+            False,
+            "Invalid Airtable personal access token. Check that the token is correct and has access to the bases you want to sync, then try again.",
+        )
 
     def source_for_pipeline(self, config: AirtableSourceConfig, inputs: SourceInputs) -> SourceResponse:
         return airtable_source(

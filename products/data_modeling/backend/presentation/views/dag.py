@@ -1,17 +1,27 @@
+import re
 from typing import cast
 
 from django.db.models import Count
 
-from rest_framework import serializers, viewsets
-from rest_framework.exceptions import ValidationError
+from rest_framework import serializers, status, viewsets
+from rest_framework.exceptions import APIException, ValidationError
 
 from posthog.api.routing import TeamAndOrgViewSetMixin
 
+from products.data_modeling.backend.facade.api import delete_dag_schedules
 from products.data_modeling.backend.facade.models import DAG, RESERVED_DAG_NAMES
 from products.warehouse_sources.backend.facade.models import (
     sync_frequency_interval_to_sync_frequency,
     sync_frequency_to_sync_frequency_interval,
 )
+
+# C0 controls, DEL, C1 controls, and the Unicode line/paragraph separators.
+CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+class ScheduleTeardownUnavailable(APIException):
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    default_detail = "Couldn't remove this DAG's schedules, so it wasn't deleted. Try again in a few minutes."
 
 
 class DAGSerializer(serializers.ModelSerializer):
@@ -19,7 +29,10 @@ class DAGSerializer(serializers.ModelSerializer):
     sync_frequency = serializers.CharField(
         required=False,
         allow_null=True,
-        help_text="Sync frequency string (e.g. '24hour', '7day')",
+        help_text=(
+            "Legacy DAG-level cadence string (e.g. '24hour', '7day'). Scheduling is driven by each "
+            "model's own sync frequency, so a PATCH that changes this value is rejected."
+        ),
     )
 
     class Meta:
@@ -58,6 +71,11 @@ class DAGSerializer(serializers.ModelSerializer):
         return value
 
     def validate_name(self, value: str) -> str:
+        # DAG names are echoed into management-command output, the confirmation prompt of
+        # destructive fleet tooling, and logs. A control character there can erase or rewrite the
+        # surrounding text, so reject it at the boundary rather than escaping at each display site.
+        if CONTROL_CHARACTERS.search(value):
+            raise serializers.ValidationError("Name cannot contain control characters.")
         is_rename = self.instance is not None and value != self.instance.name
         if is_rename:
             instance = cast(DAG, self.instance)
@@ -82,7 +100,13 @@ class DAGSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("System-managed DAGs cannot be edited.")
         sync_frequency = validated_data.pop("sync_frequency", None)
         if sync_frequency is not None:
-            validated_data["sync_frequency_interval"] = sync_frequency_to_sync_frequency_interval(sync_frequency)
+            # The frontend spreads the whole DAG into every PATCH, so an unchanged
+            # echo of the current frequency must pass; only a real change is rejected.
+            current = sync_frequency_interval_to_sync_frequency(instance.sync_frequency_interval)
+            if sync_frequency != current:
+                raise serializers.ValidationError(
+                    "Sync frequency is managed per model on this team. Edit each model's sync frequency instead."
+                )
         return super().update(instance, validated_data)
 
 
@@ -100,4 +124,7 @@ class DAGViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet):
             raise ValidationError("The default DAG cannot be deleted.")
         if instance.is_managed:
             raise ValidationError("System-managed DAGs cannot be deleted.")
+        # Keep the DAG row when teardown fails: it is the only handle left for finding the schedules.
+        if not delete_dag_schedules(str(instance.id)).ok:
+            raise ScheduleTeardownUnavailable()
         instance.delete()

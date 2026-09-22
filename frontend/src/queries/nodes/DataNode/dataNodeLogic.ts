@@ -5,6 +5,7 @@ import {
     afterMount,
     beforeUnmount,
     connect,
+    isBreakpoint,
     kea,
     key,
     listeners,
@@ -21,7 +22,7 @@ import posthog from 'posthog-js'
 import api, { ApiMethodOptions } from 'lib/api'
 import { dayjs } from 'lib/dayjs'
 import { ConcurrencyController } from 'lib/utils/concurrencyController'
-import { uuid } from 'lib/utils/dom'
+import { inStorybook, inStorybookTestRunner, uuid } from 'lib/utils/dom'
 import { shouldCancelQuery } from 'lib/utils/requests'
 import { UNSAVED_INSIGHT_MIN_REFRESH_INTERVAL_MINUTES } from 'scenes/insights/insightLogic'
 import { compareDataNodeQuery, haveVariablesOrFiltersChanged, validateQuery } from 'scenes/insights/utils/queryUtils'
@@ -31,15 +32,18 @@ import { teamLogic } from 'scenes/teamLogic'
 import { userLogic } from 'scenes/userLogic'
 
 import { DataNodeCollectionProps, dataNodeCollectionLogic } from '~/queries/nodes/DataNode/dataNodeCollectionLogic'
+import { QueryScanPollResult, QueryScanState, resolveQueryScan } from '~/queries/nodes/DataNode/queryScan'
 import { removeExpressionComment } from '~/queries/nodes/DataTable/utils'
 import { performQuery } from '~/queries/query'
 import {
+    AccountsQuery,
+    AccountsQueryResponse,
+    AccountsTableQuery,
+    AccountsTableQueryResponse,
     ActorsQuery,
     ActorsQueryResponse,
     AnyResponseType,
     DashboardFilter,
-    AccountsQuery,
-    AccountsQueryResponse,
     DataNode,
     DataVisualizationNode,
     ErrorTrackingQuery,
@@ -57,6 +61,8 @@ import {
     MarketingAnalyticsTableQueryResponse,
     NodeKind,
     PersonsNode,
+    QueryScanAnalysis,
+    QueryScanResponse,
     QueryStatus,
     QueryTiming,
     RefreshType,
@@ -71,6 +77,7 @@ import {
 } from '~/queries/schema/schema-general'
 import {
     isAccountsQuery,
+    isAccountsTableQuery,
     isActorsQuery,
     isErrorTrackingQuery,
     isEventsQuery,
@@ -133,12 +140,43 @@ export interface DataNodeLogicProps {
     autoLoad?: boolean
     /** Override the maximum pagination limit. */
     maxPaginationLimit?: number
+    /** Stop pagination after this many accumulated rows. */
+    maxPaginationRows?: number
     /** Limit context sent to the /query endpoint */
     limitContext?: 'posthog_ai'
 }
 
 export const AUTOLOAD_INTERVAL = 30000
 const LOAD_MORE_ROWS_LIMIT = 10000
+
+// Backoff before each ask for a slow run's scan, holding at 30 s: the job starts with the run, so
+// the early asks are close together.
+export const QUERY_SCAN_POLL_DELAYS_MS = [2000, 4000, 8000, 15000, 30000]
+// Stop asking this long after the run: a job that has not finished by then is not coming back, and
+// its pending slot expires into a 404 around the same time.
+export const QUERY_SCAN_POLL_DEADLINE_MS = 600000
+
+// Loading and error states render the query id, so a random id per load
+// makes Storybook visual regression captures differ on every run
+const STORYBOOK_QUERY_ID = '00000000-0000-4000-8000-000000000000'
+
+const VALID_REFRESH_TYPES: ReadonlySet<RefreshType> = new Set([
+    'async',
+    'async_except_on_cache_miss',
+    'blocking',
+    'force_async',
+    'force_blocking',
+    'force_cache',
+    'lazy_async',
+])
+
+// Guards against callers that wire `loadData` straight to an event handler, so a React
+// MouseEvent (or any other non-RefreshType value) never reaches the query request body.
+function sanitizeRefreshType(refresh: unknown): RefreshType | undefined {
+    return typeof refresh === 'string' && VALID_REFRESH_TYPES.has(refresh as RefreshType)
+        ? (refresh as RefreshType)
+        : undefined
+}
 
 const concurrencyController = new ConcurrencyController(1)
 const webAnalyticsConcurrencyController = new ConcurrencyController(6)
@@ -268,6 +306,8 @@ export interface dataNodeLogicValues {
     queryLog: HogQLQueryResponse | null
     queryLogLoading: boolean
     queryLogQueryId: string | null
+    queryScan: QueryScanState | null
+    queryScanResult: QueryScanPollResult | null
     response:
         | ErrorTrackingQueryResponse
         | HogQLAutocompleteResponse
@@ -549,6 +589,9 @@ export interface dataNodeLogicActions {
         totalCount: number | null
         payload?: any
     }
+    pollQueryScan: () => {
+        value: true
+    }
     resetLoadingTimer: () => {
         value: true
     }
@@ -563,6 +606,13 @@ export interface dataNodeLogicActions {
     }
     setQueryLogQueryId: (queryId: string) => {
         queryId: string
+    }
+    setQueryScanResult: (
+        analysis: QueryScanAnalysis,
+        cacheKey: string
+    ) => {
+        analysis: QueryScanAnalysis
+        cacheKey: string
     }
     setResponse: (
         response: Exclude<AnyResponseType, undefined>
@@ -718,7 +768,8 @@ export interface dataNodeLogicMeta {
             responseError: string | null,
             dataLoading: boolean,
             isShowingCachedResults: boolean,
-            arg: any
+            arg: any,
+            arg2: any
         ) => DataNode | null
         canLoadNextData: (nextQuery: DataNode<Record<string, any>> | null, isShowingCachedResults: boolean) => boolean
         hasMoreData: (
@@ -833,6 +884,25 @@ export interface dataNodeLogicMeta {
         hasActiveFilters: (query: DataNode<Record<string, any>>) => boolean
         totalCountQuery: (query: DataNode<Record<string, any>>) => DataNode | null
         filteredCountQuery: (query: DataNode<Record<string, any>>, hasActiveFilters: boolean) => DataNode | null
+        queryScan: (
+            response:
+                | ErrorTrackingQueryResponse
+                | HogQLAutocompleteResponse
+                | HogQLMetadataResponse
+                | HogQLQueryResponse<any[]>
+                | HogQueryResponse
+                | LogAttributesQueryResponse
+                | LogValuesQueryResponse
+                | MetricsQueryResponse
+                | Record<string, any>
+                | SessionsQueryResponse
+                | TraceSpansAggregationQueryResponse
+                | TraceSpansAttributeBreakdownQueryResponse
+                | TraceSpansQueryResponse
+                | null,
+            responseErrorObject: Record<string, any> | null,
+            queryScanResult: QueryScanPollResult | null
+        ) => QueryScanState | null
     }
 }
 
@@ -891,7 +961,7 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
         ) {
             // For normal loads, use appropriate refresh type
             let refreshType: RefreshType
-            if (queryVarsHaveChanged) {
+            if (queryVarsHaveChanged || isAccountsTableQuery(props.query)) {
                 refreshType =
                     isInsightQueryNode(props.query) || isHogQLQuery(props.query) ? 'force_async' : 'force_blocking'
             } else {
@@ -910,8 +980,8 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
             alreadyRunningQueryId?: string,
             overrideQuery?: DataNode<Record<string, any>>
         ) => ({
-            refresh,
-            queryId: alreadyRunningQueryId || uuid(),
+            refresh: sanitizeRefreshType(refresh),
+            queryId: alreadyRunningQueryId || (inStorybook() || inStorybookTestRunner() ? STORYBOOK_QUERY_ID : uuid()),
             pollOnly: !!alreadyRunningQueryId,
             overrideQuery,
         }),
@@ -930,6 +1000,8 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
         resetLoadingTimer: true,
         setQueryLogQueryId: (queryId: string) => ({ queryId }),
         loadFilteredCount: true,
+        pollQueryScan: true,
+        setQueryScanResult: (analysis: QueryScanAnalysis, cacheKey: string) => ({ analysis, cacheKey }),
     }),
     loaders(({ actions, cache, values, props }) => ({
         response: [
@@ -1097,6 +1169,7 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                         isSessionsQuery(props.query) ||
                         isMarketingAnalyticsTableQuery(props.query) ||
                         isAccountsQuery(props.query) ||
+                        isAccountsTableQuery(props.query) ||
                         isWebStatsTableQuery(props.query)
                     ) {
                         const newResponse =
@@ -1122,6 +1195,7 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                             | SessionsQueryResponse
                             | MarketingAnalyticsTableQueryResponse
                             | AccountsQueryResponse
+                            | AccountsTableQueryResponse
                             | WebStatsTableQueryResponse
 
                         let results = [...(queryResponse?.results ?? []), ...(newResponse?.results ?? [])]
@@ -1290,6 +1364,13 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                 loadDataSuccess: () => null,
             },
         ],
+        queryScanResult: [
+            null as QueryScanPollResult | null,
+            {
+                loadData: () => null,
+                setQueryScanResult: (_, { analysis, cacheKey }) => ({ cacheKey, analysis }),
+            },
+        ],
         responseError: [
             null as string | null,
             {
@@ -1383,7 +1464,10 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                         const response = await performQuery(query)
                         breakpoint()
                         return response?.results?.[0]?.[0] || 0
-                    } catch (error) {
+                    } catch (error: any) {
+                        if (isBreakpoint(error)) {
+                            throw error
+                        }
                         posthog.captureException(error, { action: 'load filtered count in dataNodeLogic' })
                         return null
                     }
@@ -1425,6 +1509,7 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                     | import('~/queries/schema/schema-general').HogQueryResponse
                     | import('~/queries/schema/schema-general').LogAttributesQueryResponse
                     | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsHistogramQueryResponse
                     | import('~/queries/schema/schema-general').MetricsQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
@@ -1466,6 +1551,7 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                 s.dataLoading,
                 s.isShowingCachedResults,
                 (_, props) => props.maxPaginationLimit,
+                (_, props) => props.maxPaginationRows,
             ],
             (
                 query: DataNode<Record<string, any>>,
@@ -1480,6 +1566,7 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                     | import('~/queries/schema/schema-general').HogQueryResponse
                     | import('~/queries/schema/schema-general').LogAttributesQueryResponse
                     | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsHistogramQueryResponse
                     | import('~/queries/schema/schema-general').MetricsQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
@@ -1487,7 +1574,8 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                 responseError: string | null,
                 dataLoading: boolean,
                 isShowingCachedResults: boolean,
-                maxPaginationLimit
+                maxPaginationLimit: number | undefined,
+                maxPaginationRows: number | undefined
             ): DataNode | null => {
                 if (isShowingCachedResults) {
                     return null
@@ -1504,43 +1592,58 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                         isSessionsQuery(query) ||
                         isMarketingAnalyticsTableQuery(query) ||
                         isAccountsQuery(query) ||
+                        isAccountsTableQuery(query) ||
                         isWebStatsTableQuery(query)) &&
                     !responseError &&
                     !dataLoading
                 ) {
-                    if (
-                        (
-                            response as
-                                | EventsQueryResponse
-                                | ActorsQueryResponse
-                                | GroupsQueryResponse
-                                | ErrorTrackingQueryResponse
-                                | TracesQueryResponse
-                                | SessionQueryResponse
-                                | SessionsQueryResponse
-                                | MarketingAnalyticsTableQueryResponse
-                                | AccountsQueryResponse
-                                | WebStatsTableQueryResponse
-                        )?.hasMore
-                    ) {
+                    const paginatedResponse = response as
+                        | EventsQueryResponse
+                        | ActorsQueryResponse
+                        | GroupsQueryResponse
+                        | ErrorTrackingQueryResponse
+                        | TracesQueryResponse
+                        | SessionQueryResponse
+                        | SessionsQueryResponse
+                        | MarketingAnalyticsTableQueryResponse
+                        | AccountsQueryResponse
+                        | AccountsTableQueryResponse
+                        | WebStatsTableQueryResponse
+
+                    if (paginatedResponse?.hasMore) {
+                        const remainingPaginationRows =
+                            maxPaginationRows === undefined
+                                ? undefined
+                                : maxPaginationRows - (paginatedResponse.results?.length ?? 0)
+                        if (remainingPaginationRows !== undefined && remainingPaginationRows <= 0) {
+                            return null
+                        }
+
                         const sortKey =
-                            isTracesQuery(query) || isSessionQuery(query)
+                            isTracesQuery(query) || isSessionQuery(query) || isAccountsTableQuery(query)
                                 ? null
                                 : (query.orderBy?.[0] ?? 'timestamp DESC')
                         if (isEventsQuery(query) && sortKey === 'timestamp DESC') {
                             const typedResults = (response as EventsQueryResponse)?.results
-                            const sortColumnIndex = query.select
-                                .map((hql) => removeExpressionComment(hql))
-                                .indexOf('timestamp')
+                            const cleanedColumns = query.select.map((hql) => removeExpressionComment(hql))
+                            const sortColumnIndex = cleanedColumns.indexOf('timestamp')
                             if (sortColumnIndex !== -1) {
-                                const lastTimestamp = typedResults?.[typedResults.length - 1]?.[sortColumnIndex]
+                                const lastRow = typedResults?.[typedResults.length - 1]
+                                const lastTimestamp = lastRow?.[sortColumnIndex]
                                 if (lastTimestamp) {
+                                    // Encode the last row's uuid into the cursor so pagination advances
+                                    // through events sharing a timestamp instead of dropping the ties past
+                                    // the page boundary. The backend splits `<timestamp>|<uuid>` back apart.
+                                    const lastUuid = extractCursorUuid(lastRow, cleanedColumns)
                                     const newQuery: EventsQuery = {
                                         ...query,
-                                        before: lastTimestamp,
-                                        limit: Math.max(
-                                            100,
-                                            Math.min(2 * (typedResults?.length || 100), effectivePaginationLimit)
+                                        before: lastUuid ? `${lastTimestamp}|${lastUuid}` : lastTimestamp,
+                                        limit: Math.min(
+                                            remainingPaginationRows ?? Number.POSITIVE_INFINITY,
+                                            Math.max(
+                                                100,
+                                                Math.min(2 * (typedResults?.length || 100), effectivePaginationLimit)
+                                            )
                                         ),
                                     }
                                     return newQuery
@@ -1558,12 +1661,14 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                                     | SessionsQueryResponse
                                     | MarketingAnalyticsTableQueryResponse
                                     | AccountsQueryResponse
+                                    | AccountsTableQueryResponse
                                     | WebStatsTableQueryResponse
                             )?.results
                             return {
                                 ...query,
                                 offset: typedResults?.length || 0,
                                 limit: Math.min(
+                                    remainingPaginationRows ?? Number.POSITIVE_INFINITY,
                                     effectivePaginationLimit,
                                     Math.max(100, 2 * (typedResults?.length || 100))
                                 ),
@@ -1577,6 +1682,7 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                                 | SessionsQuery
                                 | MarketingAnalyticsTableQuery
                                 | AccountsQuery
+                                | AccountsTableQuery
                                 | WebStatsTableQuery
                         }
                     }
@@ -1612,6 +1718,7 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                     | import('~/queries/schema/schema-general').HogQueryResponse
                     | import('~/queries/schema/schema-general').LogAttributesQueryResponse
                     | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsHistogramQueryResponse
                     | import('~/queries/schema/schema-general').MetricsQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
@@ -1635,6 +1742,7 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                     | import('~/queries/schema/schema-general').HogQueryResponse
                     | import('~/queries/schema/schema-general').LogAttributesQueryResponse
                     | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsHistogramQueryResponse
                     | import('~/queries/schema/schema-general').MetricsQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
@@ -1679,6 +1787,7 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                     | import('~/queries/schema/schema-general').HogQueryResponse
                     | import('~/queries/schema/schema-general').LogAttributesQueryResponse
                     | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsHistogramQueryResponse
                     | import('~/queries/schema/schema-general').MetricsQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
@@ -1702,6 +1811,7 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                     | import('~/queries/schema/schema-general').HogQueryResponse
                     | import('~/queries/schema/schema-general').LogAttributesQueryResponse
                     | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsHistogramQueryResponse
                     | import('~/queries/schema/schema-general').MetricsQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
@@ -1752,6 +1862,7 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                     | import('~/queries/schema/schema-general').HogQueryResponse
                     | import('~/queries/schema/schema-general').LogAttributesQueryResponse
                     | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsHistogramQueryResponse
                     | import('~/queries/schema/schema-general').MetricsQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
@@ -1774,6 +1885,7 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                     | import('~/queries/schema/schema-general').HogQueryResponse
                     | import('~/queries/schema/schema-general').LogAttributesQueryResponse
                     | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsHistogramQueryResponse
                     | import('~/queries/schema/schema-general').MetricsQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
                     | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
@@ -1805,7 +1917,6 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                 }
                 if (isEventsQuery(query)) {
                     return !!(
-                        query.event ||
                         (query.properties && query.properties.length > 0) ||
                         (query.where && query.where.length > 0) ||
                         (query.fixedProperties && query.fixedProperties.length > 0)
@@ -1838,8 +1949,7 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                         orderBy: undefined,
                         limit: undefined,
                         offset: undefined,
-                        // Remove all filters for total count
-                        event: undefined,
+                        // Keep the selected event scope while removing property filters.
                         properties: undefined,
                         where: undefined,
                     } as EventsQuery
@@ -1932,6 +2042,28 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
                 return null
             },
         ],
+        queryScan: [
+            (s) => [s.response, s.responseErrorObject, s.queryScanResult],
+            (
+                response:
+                    | ErrorTrackingQueryResponse
+                    | HogQLAutocompleteResponse
+                    | HogQLMetadataResponse
+                    | HogQLQueryResponse<any[]>
+                    | HogQueryResponse
+                    | LogAttributesQueryResponse
+                    | LogValuesQueryResponse
+                    | MetricsQueryResponse
+                    | Record<string, any>
+                    | SessionsQueryResponse
+                    | TraceSpansAggregationQueryResponse
+                    | TraceSpansAttributeBreakdownQueryResponse
+                    | TraceSpansQueryResponse
+                    | null,
+                responseErrorObject: Record<string, any> | null,
+                queryScanResult: QueryScanPollResult | null
+            ): QueryScanState | null => resolveQueryScan(response, responseErrorObject, queryScanResult),
+        ],
     })),
     listeners(({ actions, values, cache, props }) => ({
         abortAnyRunningQuery: () => {
@@ -1962,9 +2094,43 @@ export const dataNodeLogic = kea<dataNodeLogicType>([
             if ('query' in props.query) {
                 cache.localResults[JSON.stringify(props.query.query)] = response
             }
+            actions.pollQueryScan()
         },
         loadDataFailure: () => {
             actions.collectionNodeLoadDataFailure(props.key)
+            actions.pollQueryScan()
+        },
+        pollQueryScan: async (_, breakpoint) => {
+            const scan = values.queryScan
+            const cacheKey = scan?.cacheKey
+            if (!scan || !cacheKey || !scan.summary.analysis_requested || scan.summary.analysis) {
+                return
+            }
+            // The analysis lands after the response, and an error never carries one. Ask on a backoff
+            // until it is stored, the run is too old to wait for, or a request fails: a 404 is what a
+            // dead job looks like once its claim expires.
+            const lastDelayMs = QUERY_SCAN_POLL_DELAYS_MS[QUERY_SCAN_POLL_DELAYS_MS.length - 1]
+            let elapsedMs = 0
+            for (let attempt = 0; ; attempt++) {
+                const delayMs = QUERY_SCAN_POLL_DELAYS_MS[attempt] ?? lastDelayMs
+                if (elapsedMs + delayMs > QUERY_SCAN_POLL_DEADLINE_MS) {
+                    return
+                }
+                elapsedMs += delayMs
+                await breakpoint(delayMs)
+                let stored: QueryScanResponse
+                try {
+                    stored = await api.queryScan.get(cacheKey)
+                } catch {
+                    // The analysis is advice, so a missing or failed scan leaves the run's numbers as they are.
+                    return
+                }
+                breakpoint()
+                if (stored.analysis) {
+                    actions.setQueryScanResult(stored.analysis, cacheKey)
+                    return
+                }
+            }
         },
         loadNewDataSuccess: ({ response }) => {
             props.onData?.(response as Record<string, unknown> | null | undefined)
@@ -2055,4 +2221,24 @@ const dedupeResults = (arr: any[], key: string): any[] => {
             return acc
         }, {})
     )
+}
+
+// Pull the event uuid out of a result row to use as a stable pagination tiebreaker. It lives either
+// in the expanded `*` column (an object) or in an explicit `uuid` column.
+function extractCursorUuid(row: any[] | undefined, columns: string[]): string | undefined {
+    if (!row) {
+        return undefined
+    }
+    const starIndex = columns.indexOf('*')
+    if (starIndex !== -1) {
+        const starValue = row[starIndex]
+        if (starValue && typeof starValue === 'object' && typeof starValue.uuid === 'string') {
+            return starValue.uuid
+        }
+    }
+    const uuidIndex = columns.indexOf('uuid')
+    if (uuidIndex !== -1 && typeof row[uuidIndex] === 'string') {
+        return row[uuidIndex]
+    }
+    return undefined
 }

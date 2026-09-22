@@ -21,7 +21,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 SINGLE_LEAF = "single_leaf"
 STAGE2_COMPOSABLE = "stage2_composable"
@@ -33,6 +33,8 @@ EXCLUDED_HAS_COHORT_REF = "excluded_has_cohort_ref"
 EXCLUDED_CYCLE_DETECTED = "excluded_cycle_detected"
 EXCLUDED_UNRESOLVED_REF = "excluded_unresolved_ref"
 EXCLUDED_HAS_DROPPED_LEAF = "excluded_has_dropped_leaf"
+# HogVM RETURN, which the catalog loader appends to every stored program before loading it.
+_OP_RETURN = 38
 # Not a processor metric class: the Rust loader skips these cohorts entirely.
 PARSE_ERROR = "parse_error"
 
@@ -60,7 +62,7 @@ class ScreenedCohort:
 
 @dataclass(frozen=True)
 class _Leaf:
-    kind: str  # "person" | "behavioral" | "cohort_ref"
+    kind: Literal["person", "behavioral", "cohort_ref"]
     negated: bool = False
     window_days: Optional[float] = None
     ref_id: Optional[int] = None
@@ -118,7 +120,7 @@ def _is_absolute_datetime(raw: str) -> bool:
 # window length in days for the soundness check (fractional for "seconds", inf for "explicit").
 @dataclass(frozen=True)
 class _Window:
-    kind: str
+    kind: Literal["days", "seconds", "explicit"]
     days: float
 
 
@@ -198,16 +200,45 @@ def _interval_window(node: Mapping[str, Any]) -> Optional[_Window]:
     return _Window("days", float(time_value * _INTERVAL_DAYS[interval]))
 
 
-def _behavioral_window_days(node: Mapping[str, Any], value: str) -> Optional[float]:
-    """The leaf's window in days, or None when the state variant is unsupported (drop)."""
-    # Non-string values read as absent (Rust opt_string), so coerce before the presence check.
+def resolve_behavioral_window(node: Mapping[str, Any]) -> Optional[_Window]:
+    """The eviction window a behavioral leaf resolves to (``kind`` = days / seconds / explicit),
+    or ``None`` when it has no representable window (leaf drops).
+
+    Public entry point to the private window-resolution the eligibility screen uses, so the
+    recompute oracle (``recompute.py``) shares one window-semantics source. Mirror of
+    ``rust/cohort-core/src/leaf_state/select.rs`` ``eviction_window``: an ``explicit_datetime``(_to)
+    pair takes precedence over ``time_value``/``time_interval``. Non-string bounds read as absent
+    (Rust ``opt_string``), so coerce before the presence check.
+    """
     explicit_from = node.get("explicit_datetime") if isinstance(node.get("explicit_datetime"), str) else None
     explicit_to = node.get("explicit_datetime_to") if isinstance(node.get("explicit_datetime_to"), str) else None
     if explicit_from is not None or explicit_to is not None:
-        window = _explicit_window(explicit_from, explicit_to)
-    else:
-        window = _interval_window(node)
+        return _explicit_window(explicit_from, explicit_to)
+    return _interval_window(node)
 
+
+def explain_unsupported_window(node: Mapping[str, Any]) -> str:
+    """Why :func:`resolve_behavioral_window` returned ``None`` for this leaf.
+
+    Recompute needs the specific shape ``resolve_behavioral_window`` collapses to ``None`` so it can
+    SKIP with a precise reason. Mirror of the ``None`` branches of ``select.rs``
+    ``explicit_eviction_window`` — an unparseable present bound vs a relative range it cannot model —
+    plus the missing-interval case. The grammar stays centralized in :func:`_classify_bound`.
+    """
+    explicit_from = node.get("explicit_datetime") if isinstance(node.get("explicit_datetime"), str) else None
+    explicit_to = node.get("explicit_datetime_to") if isinstance(node.get("explicit_datetime_to"), str) else None
+    if explicit_from is None and explicit_to is None:
+        return "missing_window"
+    from_kind = _classify_bound(explicit_from)[0] if explicit_from is not None else None
+    to_kind = _classify_bound(explicit_to)[0] if explicit_to is not None else None
+    if from_kind == "unparseable" or to_kind == "unparseable":
+        return "unparseable_explicit_bound"
+    return "relative_range_unsupported"
+
+
+def _behavioral_window_days(node: Mapping[str, Any], value: str) -> Optional[float]:
+    """The leaf's window in days, or None when the state variant is unsupported (drop)."""
+    window = resolve_behavioral_window(node)
     if value == "performed_event":
         return window.days if window is not None else None
     # performed_event_multiple: only whole-day sliding windows ≥ 1 day are representable.
@@ -218,6 +249,22 @@ def _behavioral_window_days(node: Mapping[str, Any], value: str) -> Optional[flo
 
 def _valid_condition_hash(value: Any) -> bool:
     return isinstance(value, str) and len(value.encode("utf-8")) == 16
+
+
+def _loads_as_hog_program(bytecode: list[Any]) -> bool:
+    """Mirror of hogvm `Program::from_shared` header acceptance, checked per leaf by the catalog.
+
+    The loader appends a trailing RETURN before loading, so an empty stored program presents that
+    opcode as its marker and is rejected; a bare `["_H"]` takes the appended opcode as its version.
+
+    Not `common/hogvm/python/execute.py`: that loader accepts `_h` too and never reads the version,
+    so it would keep programs the Rust catalog drops.
+    """
+    marker = bytecode[0] if bytecode else _OP_RETURN
+    if marker != "_H":
+        return False
+    version = bytecode[1] if len(bytecode) > 1 else _OP_RETURN
+    return isinstance(version, int) and not isinstance(version, bool) and 0 <= version <= 2**64 - 1
 
 
 def _classify_leaf(node: Mapping[str, Any]) -> Union[_Leaf, str]:
@@ -245,8 +292,11 @@ def _classify_behavioral(node: Mapping[str, Any]) -> Union[_Leaf, str]:
         return "behavioral_action_key"
     if not _valid_condition_hash(node.get("conditionHash")):
         return "missing_condition_hash"
-    if not isinstance(node.get("bytecode"), list):
+    bytecode = node.get("bytecode")
+    if not isinstance(bytecode, list):
         return "missing_bytecode"
+    if not _loads_as_hog_program(bytecode):
+        return "malformed_bytecode"
     if not isinstance(key, str) or not key:
         return "malformed_leaf"
     window = _behavioral_window_days(node, value)
@@ -258,8 +308,11 @@ def _classify_behavioral(node: Mapping[str, Any]) -> Union[_Leaf, str]:
 def _classify_person(node: Mapping[str, Any]) -> Union[_Leaf, str]:
     if not _valid_condition_hash(node.get("conditionHash")):
         return "missing_condition_hash"
-    if not isinstance(node.get("bytecode"), list):
+    bytecode = node.get("bytecode")
+    if not isinstance(bytecode, list):
         return "missing_bytecode"
+    if not _loads_as_hog_program(bytecode):
+        return "malformed_bytecode"
     return _Leaf(kind="person", negated=_explicit_negation(node))
 
 

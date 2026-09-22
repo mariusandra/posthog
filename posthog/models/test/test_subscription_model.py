@@ -3,18 +3,19 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
-from freezegun import freeze_time
+import time_machine
 from posthog.test.base import BaseTest
 from unittest.mock import patch
 
 from django.conf import settings
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 import jwt
 from parameterized import parameterized
 
 from posthog.constants import AvailableFeature
+from posthog.event_usage import EventSource
 from posthog.jwt import PosthogJwtAudience
 
 from products.dashboards.backend.models.dashboard import Dashboard
@@ -23,14 +24,99 @@ from products.exports.backend.models.subscription import (
     UNSUBSCRIBE_TOKEN_EXP_DAYS,
     Subscription,
     SubscriptionDelivery,
+    attribute_subscription_saves,
     get_unsubscribe_token,
     unsubscribe_using_token,
 )
-from products.product_analytics.backend.models.insight import Insight
+from products.product_analytics.backend.facade.models import Insight
+
+
+class TestSubscriptionScheduling:
+    def test_weekly_schedule_ignores_stale_monthly_position(self) -> None:
+        subscription = Subscription(
+            frequency=Subscription.SubscriptionFrequency.WEEKLY,
+            interval=1,
+            start_date=datetime(2026, 8, 3, 9, tzinfo=ZoneInfo("UTC")),
+            byweekday=["monday", "wednesday", "friday"],
+            bysetpos=1,
+        )
+
+        assert subscription.summary == "sent every week on Monday, Wednesday and Friday"
+        assert subscription.rrule[0] == datetime(2026, 8, 3, 9, tzinfo=ZoneInfo("UTC"))
+        assert subscription.rrule[1] == datetime(2026, 8, 5, 9, tzinfo=ZoneInfo("UTC"))
+        assert subscription.rrule[2] == datetime(2026, 8, 7, 9, tzinfo=ZoneInfo("UTC"))
+
+    @parameterized.expand(
+        [
+            (
+                "daily_weekdays",
+                "daily",
+                ["monday", "tuesday", "wednesday", "thursday", "friday"],
+                datetime(2024, 1, 5, 9, 0, tzinfo=ZoneInfo("UTC")),
+                datetime(2024, 1, 8, 9, 0, tzinfo=ZoneInfo("UTC")),
+            ),
+            (
+                "weekly_multiple_days",
+                "weekly",
+                ["wednesday", "friday"],
+                datetime(2024, 1, 1, 9, 0, tzinfo=ZoneInfo("UTC")),
+                datetime(2024, 1, 3, 9, 0, tzinfo=ZoneInfo("UTC")),
+            ),
+        ]
+    )
+    @time_machine.travel("2024-01-01 08:00:00", tick=False)
+    def test_selected_weekdays_control_delivery_dates(
+        self,
+        _name: str,
+        frequency: str,
+        byweekday: list[str],
+        from_dt: datetime,
+        expected_next_delivery: datetime,
+    ) -> None:
+        next_delivery_date = Subscription._compute_next_delivery_date(
+            frequency=frequency,
+            interval=1,
+            start_date=datetime(2024, 1, 1, 9, 0, tzinfo=ZoneInfo("UTC")),
+            from_dt=from_dt,
+            byweekday=byweekday,
+        )
+
+        assert next_delivery_date == expected_next_delivery
+
+    @time_machine.travel("2024-01-01 08:00:00", tick=False)
+    def test_daily_interval_without_a_possible_weekday_returns_none(self) -> None:
+        next_delivery_date = Subscription._compute_next_delivery_date(
+            frequency="daily",
+            interval=7,
+            start_date=datetime(2024, 1, 1, 9, 0, tzinfo=ZoneInfo("UTC")),
+            byweekday=["tuesday"],
+        )
+
+        assert next_delivery_date is None
+
+
+class TestSubscriptionDeliveryConfig:
+    @parameterized.expand(
+        [
+            ("omitted_option", {}, "include_feedback", True),
+            ("malformed_config", "invalid", "include_images", True),
+            ("enabled_option", {"include_manage_link": True}, "include_manage_link", True),
+            ("disabled_option", {"include_manage_link": False}, "include_manage_link", False),
+        ]
+    )
+    def test_includes_delivery_part(self, _name: str, delivery_config, option: str, expected: bool) -> None:
+        subscription = Subscription(
+            delivery_config=delivery_config,
+            frequency=Subscription.SubscriptionFrequency.WEEKLY,
+            interval=1,
+            start_date=datetime(2026, 1, 1, tzinfo=ZoneInfo("UTC")),
+        )
+
+        assert subscription.includes_delivery_part(option) is expected
 
 
 @patch.object(settings, "JWT_SIGNING_KEY", "not-so-secret")
-@freeze_time("2022-01-01")
+@time_machine.travel("2022-01-01", tick=False)
 class TestSubscription(BaseTest):
     def _create_insight_subscription(self, **kwargs):
         insight = Insight.objects.create(team=self.team)
@@ -67,6 +153,23 @@ class TestSubscription(BaseTest):
             start_date=datetime(2022, 1, 1, tzinfo=ZoneInfo("UTC")),
             **kwargs,
         )
+
+    def test_analytics_event_runs_after_the_subscription_transaction_commits(self) -> None:
+        with (
+            patch("posthog.event_usage.posthoganalytics.capture") as mock_capture,
+            self.captureOnCommitCallbacks(execute=True),
+            attribute_subscription_saves({"source": EventSource.WEB}),
+        ):
+            with transaction.atomic():
+                self._create_subscription(
+                    prompt="Summarize signups",
+                    title="Weekly AI digest",
+                    created_by=self.user,
+                )
+                mock_capture.assert_not_called()
+
+        mock_capture.assert_called_once()
+        assert mock_capture.call_args.kwargs["properties"]["source"] == EventSource.WEB
 
     @parameterized.expand(
         [
@@ -162,7 +265,30 @@ class TestSubscription(BaseTest):
         subscription.save()
         assert old_date == subscription.next_delivery_date
 
-    @freeze_time("2022-01-11 09:55:00")
+    @parameterized.expand(
+        [
+            ("enabling_images_clears_plan", {"include_images": False}, {"include_images": True}, False),
+            ("images_already_enabled_keeps_plan", {"include_images": True}, {"include_images": True}, True),
+        ]
+    )
+    def test_deferred_delivery_config_preserves_plan_invalidation_state(
+        self, _name: str, initial_config: dict, updated_config: dict, plan_survives: bool
+    ) -> None:
+        plan = {"version": 1, "plan": {}}
+        subscription = self._create_subscription(
+            prompt="Summarize signups",
+            delivery_config=initial_config,
+            ai_query_plan=plan,
+        )
+
+        deferred_subscription = Subscription.objects.defer("delivery_config").get(id=subscription.id)
+        deferred_subscription.delivery_config = updated_config
+        deferred_subscription.save(update_fields=["delivery_config"])
+
+        subscription.refresh_from_db()
+        assert subscription.ai_query_plan == (plan if plan_survives else None)
+
+    @time_machine.travel("2022-01-11 09:55:00", tick=False)
     def test_set_next_delivery_date_when_in_upcoming_delta(self):
         subscription = Subscription.objects.create(
             id=1,
@@ -179,7 +305,7 @@ class TestSubscription(BaseTest):
 
         assert subscription.next_delivery_date == datetime(2022, 1, 12, 10, 0, 0, 0).replace(tzinfo=ZoneInfo("UTC"))
 
-    @freeze_time("2022-01-11 09:55:00")
+    @time_machine.travel("2022-01-11 09:55:00", tick=False)
     def test_set_next_delivery_date_when_days_behind(self):
         subscription = Subscription.objects.create(
             id=1,
@@ -234,11 +360,11 @@ class TestSubscription(BaseTest):
 
         token = get_unsubscribe_token(subscription, "test2@posthog.com")
 
-        with freeze_time(datetime(2022, 1, 1) + timedelta(days=UNSUBSCRIBE_TOKEN_EXP_DAYS + 1)):
+        with time_machine.travel(datetime(2022, 1, 1) + timedelta(days=UNSUBSCRIBE_TOKEN_EXP_DAYS + 1), tick=False):
             with pytest.raises(jwt.exceptions.ExpiredSignatureError):
                 unsubscribe_using_token(token)
 
-        with freeze_time(datetime(2022, 1, 1) + timedelta(days=UNSUBSCRIBE_TOKEN_EXP_DAYS - 1)):
+        with time_machine.travel(datetime(2022, 1, 1) + timedelta(days=UNSUBSCRIBE_TOKEN_EXP_DAYS - 1), tick=False):
             subscription = unsubscribe_using_token(token)
             assert "test2@posthog.com" not in subscription.target_value
 
@@ -321,12 +447,43 @@ class TestSubscription(BaseTest):
             (
                 "weekly_last_wednesday",
                 {"interval": 1, "frequency": "weekly", "byweekday": ["wednesday"], "bysetpos": -1},
-                "sent every week on the last Wednesday",
+                "sent every week on Wednesday",
             ),
             (
                 "weekly_wednesday_no_bysetpos",
                 {"interval": 1, "frequency": "weekly", "byweekday": ["wednesday"]},
-                "sent every week",
+                "sent every week on Wednesday",
+            ),
+            (
+                "daily_weekdays",
+                {
+                    "interval": 1,
+                    "frequency": "daily",
+                    "byweekday": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+                },
+                "sent every day on weekdays",
+            ),
+            (
+                "weekly_multiple_days",
+                {"interval": 1, "frequency": "weekly", "byweekday": ["monday", "wednesday", "friday"]},
+                "sent every week on Monday, Wednesday and Friday",
+            ),
+            (
+                "weekly_all_days",
+                {
+                    "interval": 1,
+                    "frequency": "weekly",
+                    "byweekday": [
+                        "monday",
+                        "tuesday",
+                        "wednesday",
+                        "thursday",
+                        "friday",
+                        "saturday",
+                        "sunday",
+                    ],
+                },
+                "sent every week on Monday, Tuesday, Wednesday, Thursday, Friday, Saturday and Sunday",
             ),
             (
                 "monthly_third_day",
@@ -356,7 +513,7 @@ class TestSubscription(BaseTest):
             ("third_weekday", 3, "sent every month on the third weekday"),
             ("fourth_weekday", 4, "sent every month on the fourth weekday"),
             ("last_weekday", -1, "sent every month on the last weekday"),
-            ("no_bysetpos", None, "sent every month"),
+            ("no_bysetpos", None, "sent every month on weekdays"),
         ]
     )
     def test_subscription_summary_weekday(self, _name, bysetpos, expected_summary):
@@ -524,7 +681,7 @@ class TestSubscription(BaseTest):
         ]
     )
     def test_weekday_rrule_edge_cases(self, _name, freeze_date, bysetpos, expected_next):
-        with freeze_time(freeze_date):
+        with time_machine.travel(freeze_date, tick=False):
             subscription = self._create_insight_subscription(
                 interval=1,
                 frequency="monthly",

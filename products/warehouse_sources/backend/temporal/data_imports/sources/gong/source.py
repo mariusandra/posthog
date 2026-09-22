@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -20,6 +14,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.gong import GongSourceConfig
 from products.warehouse_sources.backend.temporal.data_imports.sources.gong.gong import (
     GONG_BASE_URL,
@@ -45,7 +40,7 @@ class GongSource(ResumableSource[GongSourceConfig, GongResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.GONG,
+            name=ExternalDataSourceType.GONG,
             category=DataWarehouseSourceCategory.SALES,
             label="Gong",
             releaseStatus=ReleaseStatus.ALPHA,
@@ -59,8 +54,11 @@ Grant the following read scopes so the connected endpoints can sync:
 - `api:settings:scorecards:read`
 - `api:workspaces:read`
 
-To also sync the `calls_extensive` table (call participants and CRM associations), additionally grant:
+To also sync the `calls_extensive` table (call participants and CRM associations) and the `calls_content` table (Gong's Call Spotlight summaries), additionally grant:
 - `api:calls:read:extensive`
+
+To also sync the `transcripts` table (what was said on each call), additionally grant:
+- `api:calls:read:transcript`
 """,
             iconPath="/static/services/gong.png",
             docsUrl="https://posthog.com/docs/cdp/sources/gong",
@@ -109,6 +107,8 @@ To also sync the `calls_extensive` table (call participants and CRM associations
                 supports_incremental=endpoint_config.supports_incremental,
                 supports_append=endpoint_config.supports_incremental,
                 incremental_fields=endpoint_config.incremental_fields,
+                default_incremental_lookback_seconds=endpoint_config.default_incremental_lookback_seconds,
+                should_sync_default=endpoint_config.should_sync_default,
                 description="Only syncs the last 365 days on initial sync"
                 if endpoint_config.uses_date_window
                 else None,

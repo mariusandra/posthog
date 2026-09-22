@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -23,6 +17,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.taboola import (
     TaboolaSourceConfig,
 )
@@ -74,7 +69,7 @@ class TaboolaSource(ResumableSource[TaboolaSourceConfig, TaboolaResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.TABOOLA,
+            name=ExternalDataSourceType.TABOOLA,
             category=DataWarehouseSourceCategory.ADVERTISING,
             label="Taboola",
             caption="""Connect your Taboola account to pull your advertising data into the PostHog Data warehouse.

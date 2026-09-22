@@ -8,10 +8,10 @@ import requests
 from structlog.types import FilteringBoundLogger
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.apollo.settings import APOLLO_ENDPOINTS
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.http import make_tracked_session
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceResponse
 
 APOLLO_BASE_URL = "https://api.apollo.io/api/v1"
 # Search pages cap at 100 records and 500 pages (50k records per query).
@@ -124,13 +124,18 @@ def get_rows(
         reraise=True,
     )
     def fetch_page(page_number: int) -> dict[str, Any]:
-        body: dict[str, Any] = {"page": page_number, "per_page": PAGE_SIZE}
-        if config.sort_by_field is not None:
-            # Newest-first lets incremental runs stop at the watermark instead
-            # of paging through history (and keeps full scans deterministic).
-            body["sort_by_field"] = config.sort_by_field
-            body["sort_ascending"] = False
-        response = session.post(url, json=body, timeout=REQUEST_TIMEOUT_SECONDS)
+        page_params: dict[str, Any] = {"page": page_number, "per_page": PAGE_SIZE} if config.paginated else {}
+        if config.method == "GET":
+            response = session.get(url, params=page_params, timeout=REQUEST_TIMEOUT_SECONDS)
+        else:
+            query_params: dict[str, Any] = page_params if config.page_params_in_query else {}
+            body: dict[str, Any] = {} if config.page_params_in_query else dict(page_params)
+            if config.sort_by_field is not None:
+                # Newest-first lets incremental runs stop at the watermark instead
+                # of paging through history (and keeps full scans deterministic).
+                body["sort_by_field"] = config.sort_by_field
+                body["sort_ascending"] = False
+            response = session.post(url, params=query_params, json=body, timeout=REQUEST_TIMEOUT_SECONDS)
 
         if response.status_code == 429 or response.status_code >= 500:
             retry_after = (
@@ -173,6 +178,9 @@ def get_rows(
             yield items
 
         if crossed_watermark or not items:
+            break
+
+        if not config.paginated:
             break
 
         if page >= MAX_PAGES:

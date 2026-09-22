@@ -4,6 +4,7 @@ import { loaders } from 'kea-loaders'
 import { beforeUnload, combineUrl, router } from 'kea-router'
 
 import api from 'lib/api'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
 import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
 import { tabAwareUrlToAction } from 'lib/logic/scenes/tabAwareUrlToAction'
 import { removeProjectIdIfPresent } from 'lib/utils/kea-router'
@@ -316,12 +317,22 @@ export const sessionRecordingsPlaylistSceneLogic = kea<sessionRecordingsPlaylist
         ],
     })),
 
-    listeners(({ actions, values }) => ({
+    listeners(({ actions, values, props }) => ({
+        onPinnedChangeFailure: ({ error }) => {
+            lemonToast.error(`Failed to update collection: ${error}`)
+        },
         getPlaylistSuccess: ({ playlist }) => {
             if (playlist?.type === 'filters') {
-                router.actions.replace(
-                    combineUrl(urls.replay(ReplayTabs.Home), { savedFilterId: playlist.short_id }).url
-                )
+                // The load can resolve after the user has already navigated elsewhere (e.g. to Replay
+                // vision) - only redirect if they're still looking at this playlist's own route.
+                if (
+                    removeProjectIdIfPresent(router.values.location.pathname) ===
+                    removeProjectIdIfPresent(urls.replayPlaylist(props.shortId))
+                ) {
+                    router.actions.replace(
+                        combineUrl(urls.replay(ReplayTabs.Home), { savedFilterId: playlist.short_id }).url
+                    )
+                }
                 return
             }
 

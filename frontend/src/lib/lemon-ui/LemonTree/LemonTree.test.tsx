@@ -1,7 +1,8 @@
 import '@testing-library/jest-dom'
 
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
-import { createRef } from 'react'
+import userEvent from '@testing-library/user-event'
+import { createRef, useState } from 'react'
 
 import { LemonTree, LemonTreeRef, TreeDataItem } from './LemonTree'
 
@@ -18,7 +19,7 @@ const cancelAnimationFrameMock = (handle: number): void => {
     window.clearTimeout(handle)
 }
 
-describe('LemonTree virtualization', () => {
+describe('LemonTree', () => {
     let requestAnimationFrameSpy: jest.SpyInstance<number, [FrameRequestCallback]>
     let cancelAnimationFrameSpy: jest.SpyInstance<void, [number]>
 
@@ -69,6 +70,18 @@ describe('LemonTree virtualization', () => {
         await flushAnimationFrame()
     }
 
+    it('renders a standalone side action without dropdown content', () => {
+        render(
+            <LemonTree
+                data={[{ id: 'properties', name: 'properties' }]}
+                itemSideAction={() => null}
+                itemSideActionButton={() => <button>Filter properties</button>}
+            />
+        )
+
+        expect(screen.getByText('Filter properties')).toBeInTheDocument()
+    })
+
     it('renders only the visible window while scrolling', async () => {
         const data: TreeDataItem[] = [
             {
@@ -96,6 +109,53 @@ describe('LemonTree virtualization', () => {
             expect(screen.getByLabelText('tree item: child-30')).toBeInTheDocument()
         })
         expect(screen.queryByLabelText('tree item: child-0')).not.toBeInTheDocument()
+    })
+
+    it.each([false, true])('expands scrolled folders on the first click (nested: %s)', async (nested) => {
+        const folders: TreeDataItem[] = Array.from({ length: 60 }, (_, index) => ({
+            id: `folder-${index}`,
+            name: `folder-${index}`,
+            children: [{ id: `field-${index}`, name: `field-${index}` }],
+        }))
+        const data: TreeDataItem[] = [
+            {
+                id: 'root',
+                name: 'root',
+                children: nested ? [{ id: 'nested', name: 'nested', children: folders }] : folders,
+            },
+        ]
+        function ControlledTree(): JSX.Element {
+            const [expandedIds, setExpandedIds] = useState(nested ? ['root', 'nested'] : ['root'])
+            return (
+                <LemonTree
+                    data={data}
+                    expandedItemIds={expandedIds}
+                    onSetExpandedItemIds={setExpandedIds}
+                    onFolderClick={(item, expanded) => {
+                        if (item) {
+                            setExpandedIds((ids) => (expanded ? ids.filter((id) => id !== item.id) : [...ids, item.id]))
+                        }
+                    }}
+                    virtualized
+                />
+            )
+        }
+
+        const { container } = render(<ControlledTree />)
+        const viewport = setViewportHeight(container, 66)
+        act(() => screen.getByLabelText(`tree item: ${nested ? 'nested' : 'root'}`).focus())
+        await scrollViewport(viewport, 31 * 30)
+
+        const folder = screen.getByLabelText('tree item: folder-30')
+        await userEvent.click(folder)
+
+        expect(screen.getByLabelText('tree item: field-30')).toBeInTheDocument()
+        expect(folder).toHaveFocus()
+
+        await userEvent.click(folder)
+
+        expect(screen.queryByLabelText('tree item: field-30')).not.toBeInTheDocument()
+        expect(folder).toHaveFocus()
     })
 
     it('keeps ancestor rows mounted when focusing a deep descendant', async () => {
@@ -138,6 +198,52 @@ describe('LemonTree virtualization', () => {
         expect(nested).toBeInTheDocument()
         expect(grandchild).toHaveAttribute('aria-level', '3')
         expect(document.activeElement).toBe(grandchild)
+    })
+
+    it('scrolls an imperatively focused item to the top third after its folder expands', async () => {
+        const treeRef = createRef<LemonTreeRef>()
+        const data: TreeDataItem[] = [
+            {
+                id: 'root',
+                name: 'root',
+                children: [{ id: 'target', name: 'target' }],
+            },
+        ]
+        const boundsSpy = jest
+            .spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+            .mockImplementation(function (this: HTMLElement) {
+                const element = this
+                const top = element.dataset.id === 'target' ? 260 : 0
+                const height = element.dataset.id === 'target' ? 31 : 300
+                return {
+                    x: 0,
+                    y: top,
+                    top,
+                    bottom: top + height,
+                    left: 0,
+                    right: 100,
+                    width: 100,
+                    height,
+                    toJSON: () => ({}),
+                }
+            })
+
+        const { container, rerender } = render(<LemonTree ref={treeRef} data={data} expandedItemIds={[]} />)
+        const viewport = setViewportHeight(container, 300)
+        const scrollTo = jest.fn()
+        Object.defineProperty(viewport, 'scrollTo', { value: scrollTo, configurable: true })
+
+        act(() => {
+            treeRef.current?.focusItem('target', { scrollPosition: 'top-third', behavior: 'smooth' })
+        })
+        rerender(<LemonTree ref={treeRef} data={data} expandedItemIds={['root']} />)
+
+        await waitFor(() => {
+            expect(scrollTo).toHaveBeenCalledWith({ top: 160, behavior: 'smooth' })
+        })
+        expect(document.activeElement).toBe(screen.getByLabelText('tree item: target'))
+
+        boundsSpy.mockRestore()
     })
 
     it('virtualizes against an outer scroll container when provided', async () => {

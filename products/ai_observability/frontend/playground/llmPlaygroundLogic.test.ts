@@ -864,18 +864,46 @@ describe('llmPlaygroundLogic', () => {
             expect(llmPlaygroundPromptsLogic.values.messages[0].content).toContain('123')
         })
 
-        it('should handle tools parameter', () => {
-            const tools = [
+        it.each([
+            [
+                'an array',
+                [
+                    { type: 'function', function: { name: 'search', description: 'Search tool' } },
+                    { type: 'function', function: { name: 'calculator', description: 'Math tool' } },
+                ],
+                [
+                    { type: 'function', function: { name: 'search', description: 'Search tool' } },
+                    { type: 'function', function: { name: 'calculator', description: 'Math tool' } },
+                ],
+            ],
+            [
+                'a dictionary',
+                {
+                    search: { type: 'function', function: { name: 'search', description: 'Search tool' } },
+                    calculator: { type: 'function', function: { name: 'calculator', description: 'Math tool' } },
+                },
+                [
+                    { type: 'function', function: { name: 'search', description: 'Search tool' } },
+                    { type: 'function', function: { name: 'calculator', description: 'Math tool' } },
+                ],
+            ],
+            [
+                'a single tool object',
                 { type: 'function', function: { name: 'search', description: 'Search tool' } },
-                { type: 'function', function: { name: 'calculator', description: 'Math tool' } },
-            ]
-
+                [{ type: 'function', function: { name: 'search', description: 'Search tool' } }],
+            ],
+            [
+                'a provider container',
+                { functionDeclarations: [{ name: 'search', description: 'Search tool' }] },
+                [{ functionDeclarations: [{ name: 'search', description: 'Search tool' }] }],
+            ],
+        ])('should handle tools parameter as %s', (_, tools, expectedTools) => {
             llmPlaygroundPromptsLogic.actions.setupPlaygroundFromEvent({
                 input: 'Test',
                 tools,
             })
 
-            expect(llmPlaygroundPromptsLogic.values.tools).toEqual(tools)
+            expect(llmPlaygroundPromptsLogic.values.tools).toEqual(expectedTools)
         })
 
         it('should default messages with unknown roles to user', () => {
@@ -1574,7 +1602,7 @@ describe('llmPlaygroundLogic', () => {
         it('should reflect source after setupPlaygroundFromEvent with sourcePromptName', async () => {
             useMocks({
                 get: {
-                    '/api/environments/:team_id/llm_prompts/name/:name/': {
+                    '/api/projects/:team_id/llm_prompts/name/:name/': {
                         id: 'prompt-123',
                         name: 'my-prompt',
                         prompt: 'You are helpful.',
@@ -1622,7 +1650,7 @@ describe('llmPlaygroundLogic', () => {
         it('should clear linked source', async () => {
             useMocks({
                 get: {
-                    '/api/environments/:team_id/llm_prompts/name/:name/': {
+                    '/api/projects/:team_id/llm_prompts/name/:name/': {
                         id: 'prompt-123',
                         name: 'my-prompt',
                         prompt: 'You are helpful.',
@@ -1649,7 +1677,7 @@ describe('llmPlaygroundLogic', () => {
         it('should set system prompt from fetched prompt', async () => {
             useMocks({
                 get: {
-                    '/api/environments/:team_id/llm_prompts/name/:name/': {
+                    '/api/projects/:team_id/llm_prompts/name/:name/': {
                         id: 'prompt-1',
                         name: 'test-prompt',
                         prompt: 'Be concise.',
@@ -1694,7 +1722,7 @@ describe('llmPlaygroundLogic', () => {
         it('should show error toast when prompt fetch fails', async () => {
             useMocks({
                 get: {
-                    '/api/environments/:team_id/llm_prompts/name/:name/': () => [404, { detail: 'Not found' }],
+                    '/api/projects/:team_id/llm_prompts/name/:name/': () => [404, { detail: 'Not found' }],
                 },
             })
 
@@ -1789,7 +1817,7 @@ describe('llmPlaygroundLogic', () => {
             let createCalled = false
             useMocks({
                 post: {
-                    '/api/environments/:team_id/llm_prompts/': () => {
+                    '/api/projects/:team_id/llm_prompts/': () => {
                         createCalled = true
                         return [201, { id: 'new-1', name: 'saved-prompt', prompt: 'test' }]
                     },
@@ -1837,7 +1865,7 @@ describe('llmPlaygroundLogic', () => {
             let updatedPrompt: string | undefined
             useMocks({
                 get: {
-                    '/api/environments/:team_id/llm_prompts/name/:name/': {
+                    '/api/projects/:team_id/llm_prompts/name/:name/': {
                         id: 'prompt-linked',
                         name: 'linked',
                         prompt: 'Old prompt.',
@@ -1845,7 +1873,7 @@ describe('llmPlaygroundLogic', () => {
                     },
                 },
                 patch: {
-                    '/api/environments/:team_id/llm_prompts/name/:name/': async ({ request }) => {
+                    '/api/projects/:team_id/llm_prompts/name/:name/': async ({ request }) => {
                         const body = (await request.json()) as Record<string, any>
                         updatedPrompt = body.prompt
                         return [200, { id: 'prompt-linked', name: 'linked', prompt: body.prompt }]

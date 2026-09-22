@@ -1,18 +1,12 @@
 from datetime import date
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import (
     FieldType,
@@ -25,6 +19,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.klaviyo import (
     KlaviyoSourceConfig,
 )
@@ -62,7 +57,7 @@ class KlaviyoSource(ResumableSource[KlaviyoSourceConfig, KlaviyoResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.KLAVIYO,
+            name=ExternalDataSourceType.KLAVIYO,
             category=DataWarehouseSourceCategory.MARKETING___EMAIL,
             label="Klaviyo",
             releaseStatus=ReleaseStatus.GA,
@@ -70,14 +65,29 @@ class KlaviyoSource(ResumableSource[KlaviyoSourceConfig, KlaviyoResumeConfig]):
 
 You can create a private API key in your [Klaviyo account settings](https://www.klaviyo.com/settings/account/api-keys).
 
-Make sure to grant the following read permissions:
+Grant read permissions for the data you want to sync. Tables you have not granted access to are skipped:
 - Accounts
 - Campaigns
+- Catalogs
+- Coupon codes
+- Coupons
+- Custom objects
 - Events
 - Flows
+- Forms
+- Images
 - Lists
 - Metrics
 - Profiles
+- Push tokens
+- Reviews
+- Segments
+- Tags
+- Templates
+- Web feeds
+- Webhooks (requires Klaviyo's Advanced KDP add-on)
+
+The campaign and flow performance tables (campaign_values_reports, flow_values_reports, flow_series_reports) need a value-tracking conversion metric, such as Placed Order. Leave the conversion metric ID blank to select one automatically: your Placed Order metric, or Ordered Product if Placed Order is absent, and otherwise the first metric in your account. That last fallback may not be the metric you expect, so paste the ID of a specific value-tracking metric from [your Klaviyo metrics](https://www.klaviyo.com/analytics/metrics) to control the choice. If your account has no eligible metric, these tables pause with an error until you set one.
 """,
             iconPath="/static/services/klaviyo.png",
             docsUrl="https://posthog.com/docs/cdp/sources/klaviyo",
@@ -92,6 +102,15 @@ Make sure to grant the following read permissions:
                         placeholder="pk_...",
                         secret=True,
                     ),
+                    SourceFieldInputConfig(
+                        name="conversion_metric_id",
+                        label="Conversion metric ID (optional)",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=False,
+                        placeholder="RESQ6t",
+                        secret=False,
+                        caption="Paste the ID of a value-tracking metric such as Placed Order from [your Klaviyo metrics](https://www.klaviyo.com/analytics/metrics). Engagement metrics such as opens and clicks are not eligible. Leave blank to auto-select one. Only the campaign and flow performance tables use it.",
+                    ),
                 ],
             ),
         )
@@ -104,7 +123,20 @@ Make sure to grant the following read permissions:
         return CANONICAL_DESCRIPTIONS
 
     def get_non_retryable_errors(self) -> dict[str, str | None]:
+        # Ordered most-specific first: the first matching entry supplies the user-facing message
+        # (see `update_external_data_job_model`), so plan gating must precede the blanket 403 entry.
         return {
+            # The campaign and flow values reports need a value-tracking conversion metric. When the
+            # account has none, or the resolved metric isn't eligible, the same result repeats on
+            # every retry (see KlaviyoConversionMetricError), so classify it non-retryable and hand
+            # the user the one action that fixes it rather than retrying into the same failure.
+            "needs a conversion metric to sync": "This Klaviyo table needs a conversion metric, but your account has none that works. Set a conversion metric ID on the source (the ID of a value-tracking metric such as Placed Order), then re-enable this table.",
+            "isn't eligible for values reporting": "The conversion metric used for this Klaviyo table isn't eligible for values reporting. Set the ID of a value-tracking metric (such as Placed Order) as the conversion metric ID on the source, then re-enable this table.",
+            # Klaviyo gates some endpoints (webhooks today) behind its paid Advanced KDP add-on and
+            # 403s with this body detail even when the key's read scope is granted. `_fetch_page`
+            # appends the detail to the HTTPError message so it's matchable here; without this entry
+            # the blanket 403 mapping below blames the key's scopes, which the user can never fix.
+            "You must have Advanced KDP enabled": "Your Klaviyo plan does not include API access to this table. Klaviyo limits this endpoint to accounts with the Advanced KDP add-on, even when the API key has the required read scope. Syncing is paused for this table; re-enable it if you add Advanced KDP to your Klaviyo account.",
             # An invalid, revoked, or insufficiently-scoped Klaviyo API key surfaces as a requests
             # HTTPError when `fetch_page` calls `raise_for_status()`. Retrying can never satisfy a
             # credential problem, so stop the sync. Match the stable status text and base host, not
@@ -124,22 +156,14 @@ Make sure to grant the following read permissions:
     ) -> list[SourceSchema]:
         # Events are immutable - append-only is the only sync mode
         append_only_endpoints = {"events"}
-        # The fan-out's incremental lookback intentionally re-pulls a window of rows each run; only
-        # merge dedupes those on the primary key, append would materialize them as duplicates.
-        merge_only_endpoints = {"list_profiles"}
-
-        def _description(endpoint: str) -> str | None:
-            if endpoint == "events":
-                return "Only syncs the last 365 days on initial sync"
-            if KLAVIYO_ENDPOINTS[endpoint].fan_out_over_lists:
-                return (
-                    "Maps which profiles belong to which list as {list_id, profile_id, joined_group_at} rows. "
-                    "Incremental syncs pick up new joins and re-joins; profiles removed from a list are only "
-                    "reflected on a full refresh. List membership is not the same as subscription: check the "
-                    "$consent array in the profiles table's properties column to see which channels (sms, "
-                    "email, push) a profile is currently subscribed to"
-                )
-            return None
+        # An endpoint's incremental lookback intentionally re-pulls a window of rows each run, and a
+        # report re-posts its whole window every run; only merge dedupes those on the primary key,
+        # append would materialize them as duplicates.
+        merge_only_endpoints = {
+            name
+            for name, endpoint_config in KLAVIYO_ENDPOINTS.items()
+            if endpoint_config.incremental_lookback or endpoint_config.values_report is not None
+        }
 
         def _build_schema(endpoint: str) -> SourceSchema:
             endpoint_config = KLAVIYO_ENDPOINTS[endpoint]
@@ -150,7 +174,7 @@ Make sure to grant the following read permissions:
                 supports_append=has_incremental and endpoint not in merge_only_endpoints,
                 incremental_fields=INCREMENTAL_FIELDS.get(endpoint, []),
                 should_sync_default=endpoint_config.should_sync_default,
-                description=_description(endpoint),
+                description=endpoint_config.description,
             )
 
         schemas = [_build_schema(endpoint) for endpoint in ENDPOINTS]
@@ -191,4 +215,5 @@ Make sure to grant the following read permissions:
             if inputs.should_use_incremental_field
             else None,
             incremental_field=inputs.incremental_field,
+            conversion_metric_id=config.conversion_metric_id,
         )

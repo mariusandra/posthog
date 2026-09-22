@@ -1,19 +1,13 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
     SourceFieldSelectConfig,
     SourceFieldSelectConfigOption,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -25,6 +19,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.ortto import OrttoSourceConfig
 from products.warehouse_sources.backend.temporal.data_imports.sources.ortto.ortto import (
     OrttoResumeConfig,
@@ -64,7 +59,7 @@ class OrttoSource(ResumableSource[OrttoSourceConfig, OrttoResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.ORTTO,
+            name=ExternalDataSourceType.ORTTO,
             category=DataWarehouseSourceCategory.MARKETING___EMAIL,
             label="Ortto",
             caption="""Connect your Ortto account to pull your marketing data into the PostHog Data warehouse.

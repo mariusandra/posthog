@@ -1,31 +1,31 @@
-import { lemonToast } from 'lib/lemon-ui/LemonToast'
+import { ApiConfig } from 'lib/api'
 
 import { ExportedAssetType } from '~/types'
 
-import { downloadExportedAsset } from './exporter'
+import { downloadExportedAsset, exportedAssetBlob } from './exporter'
 
 const getResponse = jest.fn()
 
-jest.mock('lib/api', () => ({
-    __esModule: true,
-    default: {
-        getResponse: (...args: any[]) => getResponse(...args),
-        exports: {
-            determineExportUrl: jest.fn((id: number) => `/api/environments/1/exports/${id}/content?download=true`),
+jest.mock('lib/api', () => {
+    const actual = jest.requireActual('lib/api')
+    return {
+        ...actual,
+        __esModule: true,
+        default: {
+            ...actual.default,
+            getResponse: (...args: any[]) => getResponse(...args),
         },
-    },
-}))
+    }
+})
 
-jest.mock('lib/lemon-ui/LemonToast', () => ({
-    lemonToast: { error: jest.fn() },
-}))
-
-describe('downloadExportedAsset', () => {
+describe('exporter', () => {
     let fakeAnchor: HTMLAnchorElement
     let appendSpy: jest.SpyInstance
     let removeSpy: jest.SpyInstance
 
     beforeEach(() => {
+        ApiConfig.setCurrentTeamId(1)
+        jest.useFakeTimers()
         fakeAnchor = { style: {}, click: jest.fn() } as unknown as HTMLAnchorElement
         // Cast keeps this compiling when Electron's ambient types (via optional deps)
         // add extra createElement overloads with non-HTMLElement return types
@@ -37,36 +37,33 @@ describe('downloadExportedAsset', () => {
     })
 
     afterEach(() => {
+        jest.runOnlyPendingTimers()
+        jest.useRealTimers()
         jest.restoreAllMocks()
         getResponse.mockReset()
-        ;(lemonToast.error as jest.Mock).mockReset()
     })
 
-    it('navigates via anchor once the content endpoint responds successfully', async () => {
-        // Cancelable body so we don't buffer large files in memory before the streaming download.
-        const cancel = jest.fn().mockResolvedValue(undefined)
-        getResponse.mockResolvedValue({ body: { cancel } })
+    it('navigates via a synchronous anchor click with no preflight fetch', () => {
+        downloadExportedAsset({ id: 123 } as ExportedAssetType)
 
-        const result = await downloadExportedAsset({ id: 123 } as ExportedAssetType)
-
-        expect(result).toBe(true)
-        expect(getResponse).toHaveBeenCalledWith('/api/environments/1/exports/123/content?download=true')
-        expect(cancel).toHaveBeenCalled()
-        expect((fakeAnchor as any).href).toBe('/api/environments/1/exports/123/content?download=true')
+        // The click must fire synchronously with no await before it (no preflight fetch), or Safari
+        // drops the download once the user gesture expires.
+        expect(getResponse).not.toHaveBeenCalled()
+        expect((fakeAnchor as any).href).toBe('/api/projects/1/exports/123/content?download=true')
         expect((fakeAnchor as any).click).toHaveBeenCalled()
         expect(appendSpy).toHaveBeenCalledWith(fakeAnchor)
+
+        // Removal is deferred — removing the anchor synchronously can cancel the download in Firefox.
+        expect(removeSpy).not.toHaveBeenCalled()
+        jest.runOnlyPendingTimers()
         expect(removeSpy).toHaveBeenCalledWith(fakeAnchor)
     })
 
-    it('shows an error toast and does not navigate when retrieval fails', async () => {
-        // A failed content retrieval (e.g. an access-control 404) must not navigate the tab to the raw
-        // JSON error — that renders as a blank/black page. It should surface a toast instead.
-        getResponse.mockRejectedValue(new Error('Not found.'))
+    it('fetches the bytes for the editor without following the object storage redirect', async () => {
+        getResponse.mockResolvedValue({ blob: async () => new Blob(['png']) })
 
-        const result = await downloadExportedAsset({ id: 123 } as ExportedAssetType)
+        await exportedAssetBlob({ id: 123 } as ExportedAssetType)
 
-        expect(result).toBe(false)
-        expect((fakeAnchor as any).click).not.toHaveBeenCalled()
-        expect(lemonToast.error).toHaveBeenCalledWith('Export download failed: Not found.')
+        expect(getResponse).toHaveBeenCalledWith('/api/projects/1/exports/123/content?direct=true')
     })
 })

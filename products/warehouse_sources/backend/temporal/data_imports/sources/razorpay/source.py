@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -23,6 +17,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.razorpay import (
     RazorpaySourceConfig,
 )
@@ -126,7 +121,7 @@ class RazorpaySource(ResumableSource[RazorpaySourceConfig, RazorpayResumeConfig]
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.RAZORPAY,
+            name=ExternalDataSourceType.RAZORPAY,
             category=DataWarehouseSourceCategory.PAYMENTS___BILLING,
             label="Razorpay",
             caption="Enter your Razorpay API key pair to pull payments, orders, refunds, settlements, and subscription data into the PostHog Data warehouse. Generate a key ID and key secret in the Razorpay Dashboard under Account & Settings → API keys. Use a `rzp_live_` key for live-mode data or a `rzp_test_` key for test-mode data.",

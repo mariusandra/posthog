@@ -1,14 +1,47 @@
 from datetime import UTC, datetime, timedelta
+from tempfile import NamedTemporaryFile
 
-from freezegun import freeze_time
+import time_machine
 from posthog.test.base import APIBaseTest
+from unittest.mock import patch
 
 from parameterized import parameterized
 
-from products.exports.backend.models.exported_asset import SEVEN_DAYS, SIX_MONTHS, TWELVE_MONTHS, ExportedAsset
+from posthog.storage.object_storage import ObjectStorageError
+
+from products.exports.backend.models.exported_asset import (
+    SEVEN_DAYS,
+    SIX_MONTHS,
+    THIRTY_DAYS,
+    ExportedAsset,
+    get_content_response,
+    save_content_from_file,
+)
 
 
 class TestExportedAssetModel(APIBaseTest):
+    def test_large_content_preserves_object_storage_failure(self) -> None:
+        asset = ExportedAsset.objects.create(
+            team=self.team,
+            created_by=self.user,
+            export_format=ExportedAsset.ExportFormat.JSONL,
+        )
+        with NamedTemporaryFile() as content_file:
+            content_file.write(b"large")
+            content_file.flush()
+            storage_error = ObjectStorageError("storage unavailable")
+            with (
+                self.settings(OBJECT_STORAGE_ENABLED=True, OBJECT_STORAGE_EXPORTS_FOLDER="Test-Exports"),
+                patch(
+                    "products.exports.backend.models.exported_asset.object_storage.write_from_file",
+                    side_effect=storage_error,
+                ),
+                self.assertRaises(ObjectStorageError) as error,
+            ):
+                save_content_from_file(asset, content_file.name, max_database_bytes=1)
+
+        self.assertIs(error.exception, storage_error)
+
     def test_exported_asset_inside_ttl_is_visible_to_both_managers(self) -> None:
         asset = ExportedAsset.objects.create(
             team=self.team,
@@ -29,17 +62,103 @@ class TestExportedAssetModel(APIBaseTest):
         assert list(ExportedAsset.objects_including_ttl_deleted.filter(id=asset.id)) == [asset]
 
     def test_exported_asset_outside_ttl_is_not_visible_to_both_managers(self) -> None:
-        with freeze_time("2021-01-01T12:00:00Z") as frozen_time:
+        with time_machine.travel("2021-01-01T12:00:00Z", tick=False) as frozen_time:
             asset = ExportedAsset.objects.create(
                 team=self.team,
                 created_by=self.user,
                 expires_after=datetime.now() + timedelta(seconds=100),
             )
 
-            frozen_time.tick(delta=timedelta(seconds=101))
+            frozen_time.shift(timedelta(seconds=101))
 
             assert list(ExportedAsset.objects.filter(id=asset.id)) == []
             assert list(ExportedAsset.objects_including_ttl_deleted.filter(id=asset.id)) == [asset]
+
+    def test_delete_expired_assets_removes_the_stored_object_first(self) -> None:
+        # A row deleted without its file strands the file in the bucket permanently.
+        expired = ExportedAsset.objects_including_ttl_deleted.create(
+            team=self.team,
+            created_by=self.user,
+            content_location="exports/mp4/team-1/task-1.mp4",
+            expires_after=datetime.now() - timedelta(days=1),
+        )
+        ExportedAsset.objects.create(
+            team=self.team,
+            created_by=self.user,
+            content_location="exports/mp4/team-1/task-2.mp4",
+            expires_after=datetime.now() + timedelta(days=1),
+        )
+
+        with patch("posthog.storage.object_storage.delete_objects", return_value=[]) as mock_delete:
+            ExportedAsset.delete_expired_assets()
+
+        mock_delete.assert_called_once_with(["exports/mp4/team-1/task-1.mp4"])
+        assert not ExportedAsset.objects_including_ttl_deleted.filter(id=expired.id).exists()
+
+    def test_delete_expired_assets_skips_past_a_failing_object(self) -> None:
+        # One unreachable key must not stall the rest of the sweep behind it.
+        stuck = ExportedAsset.objects_including_ttl_deleted.create(
+            team=self.team,
+            created_by=self.user,
+            content_location="exports/mp4/team-1/stuck.mp4",
+            expires_after=datetime.now() - timedelta(days=1),
+        )
+        following = ExportedAsset.objects_including_ttl_deleted.create(
+            team=self.team,
+            created_by=self.user,
+            content_location="exports/mp4/team-1/following.mp4",
+            expires_after=datetime.now() - timedelta(days=1),
+        )
+
+        with (
+            patch("products.exports.backend.models.exported_asset._EXPIRY_DELETE_BATCH", 1),
+            patch(
+                "posthog.storage.object_storage.delete_objects",
+                side_effect=lambda keys: [k for k in keys if k.endswith("stuck.mp4")],
+            ),
+        ):
+            ExportedAsset.delete_expired_assets()
+
+        assert ExportedAsset.objects_including_ttl_deleted.filter(id=stuck.id).exists()
+        assert not ExportedAsset.objects_including_ttl_deleted.filter(id=following.id).exists()
+
+    def test_delete_expired_assets_keeps_a_row_repointed_after_the_snapshot(self) -> None:
+        # A render finishing mid-sweep repoints the row at a new object; dropping the row here would
+        # strand it.
+        expired = ExportedAsset.objects_including_ttl_deleted.create(
+            team=self.team,
+            created_by=self.user,
+            content_location="exports/mp4/team-1/old.mp4",
+            expires_after=datetime.now() - timedelta(days=1),
+        )
+
+        def repoint(keys: list[str]) -> list[str]:
+            ExportedAsset.objects_including_ttl_deleted.filter(id=expired.id).update(
+                content_location="exports/mp4/team-1/new.mp4"
+            )
+            return []
+
+        with patch("posthog.storage.object_storage.delete_objects", side_effect=repoint):
+            ExportedAsset.delete_expired_assets()
+
+        assert ExportedAsset.objects_including_ttl_deleted.filter(id=expired.id).exists()
+
+    def test_delete_expired_assets_keeps_the_row_when_the_object_delete_fails(self) -> None:
+        # Losing the row here would leave the file unreachable, so the row waits for the next run.
+        expired = ExportedAsset.objects_including_ttl_deleted.create(
+            team=self.team,
+            created_by=self.user,
+            content_location="exports/mp4/team-1/task-3.mp4",
+            expires_after=datetime.now() - timedelta(days=1),
+        )
+
+        with patch(
+            "posthog.storage.object_storage.delete_objects",
+            return_value=["exports/mp4/team-1/task-3.mp4"],
+        ):
+            ExportedAsset.delete_expired_assets()
+
+        assert ExportedAsset.objects_including_ttl_deleted.filter(id=expired.id).exists()
 
     def test_delete_expired_assets(self) -> None:
         assert ExportedAsset.objects.count() == 0
@@ -84,25 +203,26 @@ class TestExportedAssetExpiresAfter(APIBaseTest):
             (ExportedAsset.ExportFormat.PDF, SIX_MONTHS),
             (ExportedAsset.ExportFormat.CSV, SEVEN_DAYS),
             (ExportedAsset.ExportFormat.XLSX, SEVEN_DAYS),
-            (ExportedAsset.ExportFormat.MP4, TWELVE_MONTHS),
-            (ExportedAsset.ExportFormat.WEBM, TWELVE_MONTHS),
-            (ExportedAsset.ExportFormat.GIF, TWELVE_MONTHS),
+            (ExportedAsset.ExportFormat.MP4, THIRTY_DAYS),
+            (ExportedAsset.ExportFormat.WEBM, THIRTY_DAYS),
+            (ExportedAsset.ExportFormat.GIF, THIRTY_DAYS),
             (ExportedAsset.ExportFormat.JSON, SIX_MONTHS),
+            (ExportedAsset.ExportFormat.JSONL, SEVEN_DAYS),
         ]
     )
-    @freeze_time("2024-06-15T10:30:00Z")
+    @time_machine.travel("2024-06-15T10:30:00Z", tick=False)
     def test_auto_sets_expires_after_based_on_format(self, export_format: str, expected_delta: timedelta) -> None:
         asset = ExportedAsset.objects.create(
             team=self.team,
             export_format=export_format,
         )
 
-        expected_expiry = (datetime(2024, 6, 15, tzinfo=UTC) + expected_delta).replace(
+        expected_expiry = (datetime(2024, 6, 15, tzinfo=UTC) + expected_delta + timedelta(days=1)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
         assert asset.expires_after == expected_expiry
 
-    @freeze_time("2024-06-15T10:30:00Z")
+    @time_machine.travel("2024-06-15T10:30:00Z", tick=False)
     def test_respects_explicit_expires_after(self) -> None:
         custom_expiry = datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC)
         asset = ExportedAsset.objects.create(
@@ -113,7 +233,7 @@ class TestExportedAssetExpiresAfter(APIBaseTest):
 
         assert asset.expires_after == custom_expiry
 
-    @freeze_time("2024-06-15T10:30:00Z")
+    @time_machine.travel("2024-06-15T10:30:00Z", tick=False)
     def test_partial_save_does_not_overwrite_existing_expires_after(self) -> None:
         custom_expiry = datetime(2025, 12, 22, 0, 0, 0, tzinfo=UTC)
         asset = ExportedAsset.objects.create(
@@ -128,7 +248,7 @@ class TestExportedAssetExpiresAfter(APIBaseTest):
         asset.refresh_from_db()
         assert asset.expires_after == custom_expiry
 
-    @freeze_time("2024-06-15T10:30:00Z")
+    @time_machine.travel("2024-06-15T10:30:00Z", tick=False)
     def test_explicitly_updating_expires_after_field(self) -> None:
         custom_expiry = datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC)
         asset = ExportedAsset.objects.create(
@@ -146,7 +266,7 @@ class TestExportedAssetExpiresAfter(APIBaseTest):
 
 
 class TestExportedAssetFilename(APIBaseTest):
-    @freeze_time("2024-06-15T10:30:00Z")
+    @time_machine.travel("2024-06-15T10:30:00Z", tick=False)
     def test_filename_includes_timestamp(self) -> None:
         asset = ExportedAsset.objects.create(
             team=self.team,
@@ -154,7 +274,7 @@ class TestExportedAssetFilename(APIBaseTest):
         )
         assert asset.filename == "export-2024-06-15-103000.csv"
 
-    @freeze_time("2024-06-15T10:30:00Z")
+    @time_machine.travel("2024-06-15T10:30:00Z", tick=False)
     def test_filename_uses_custom_name_with_timestamp(self) -> None:
         asset = ExportedAsset.objects.create(
             team=self.team,
@@ -163,7 +283,7 @@ class TestExportedAssetFilename(APIBaseTest):
         )
         assert asset.filename == "my-cohort-name-2024-06-15-103000.csv"
 
-    @freeze_time("2024-06-15T10:30:00Z")
+    @time_machine.travel("2024-06-15T10:30:00Z", tick=False)
     def test_filename_slugifies_special_characters(self) -> None:
         asset = ExportedAsset.objects.create(
             team=self.team,
@@ -172,11 +292,58 @@ class TestExportedAssetFilename(APIBaseTest):
         )
         assert asset.filename == "power-users-50-rollout-2024-06-15-103000.csv"
 
-    @freeze_time("2024-06-15T10:30:00Z")
-    def test_xlsx_format_extension(self) -> None:
+    @parameterized.expand(
+        [
+            (ExportedAsset.ExportFormat.XLSX, "xlsx"),
+            (ExportedAsset.ExportFormat.JSONL, "jsonl"),
+        ]
+    )
+    @time_machine.travel("2024-06-15T10:30:00Z", tick=False)
+    def test_tabular_format_extension(self, export_format: str, expected_extension: str) -> None:
         asset = ExportedAsset.objects.create(
             team=self.team,
-            export_format=ExportedAsset.ExportFormat.XLSX,
+            export_format=export_format,
             export_context={"filename": "cohort-test"},
         )
-        assert asset.filename == "cohort-test-2024-06-15-103000.xlsx"
+        assert asset.filename == f"cohort-test-2024-06-15-103000.{expected_extension}"
+
+
+class TestDirectContentResponse(APIBaseTest):
+    def test_serves_empty_content(self) -> None:
+        asset = ExportedAsset.objects.create(
+            team=self.team,
+            export_format=ExportedAsset.ExportFormat.JSONL,
+            content=b"",
+        )
+
+        response = get_content_response(asset)
+
+        assert response.status_code == 200
+        assert response.content == b""
+
+    @parameterized.expand(
+        [
+            ("bounded_png_serves_bytes", ExportedAsset.ExportFormat.PNG, 200),
+            ("unbounded_video_redirects", ExportedAsset.ExportFormat.MP4, 302),
+        ]
+    )
+    def test_direct_mode_only_buffers_bounded_formats(
+        self, _name: str, export_format: str, expected_status: int
+    ) -> None:
+        asset = ExportedAsset.objects.create(
+            team=self.team,
+            export_format=export_format,
+            content_location="exports/some/key",
+        )
+        with (
+            patch(
+                "products.exports.backend.models.exported_asset.object_storage.get_presigned_url",
+                return_value="https://storage.example.com/presigned",
+            ),
+            patch(
+                "products.exports.backend.models.exported_asset.object_storage.read_bytes",
+                return_value=b"bytes",
+            ),
+        ):
+            response = get_content_response(asset, direct=True)
+        assert response.status_code == expected_status

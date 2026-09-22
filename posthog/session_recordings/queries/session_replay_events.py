@@ -2,7 +2,7 @@ import re
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from django.core.cache import cache
 
@@ -10,10 +10,24 @@ import pytz
 
 from posthog.schema import HogQLQuery
 
+from posthog.hogql.escape_sql import escape_clickhouse_identifier
+
 from posthog.clickhouse.client import sync_execute
+from posthog.clickhouse.client.connection import ClickHouseUser
+from posthog.clickhouse.events_json import DISTRIBUTED_EVENTS_JSON_TABLE
 from posthog.clickhouse.query_tagging import Feature, Product, tag_queries
+from posthog.models.event.new_events_schema import use_new_events_schema
 from posthog.models.team import Team
-from posthog.session_recordings.models.metadata import RecordingMetadata
+from posthog.session_recordings.models.metadata import ONGOING_SESSION_WINDOW_MINUTES, RecordingMetadata
+
+from products.access_control.backend.property_access_control import (
+    get_restricted_property_names,
+    strip_restricted_properties,
+)
+from products.event_definitions.backend.models.property_definition import PropertyDefinition
+
+if TYPE_CHECKING:
+    from posthog.models import User
 
 DEFAULT_EVENT_FIELDS = [
     "event",
@@ -119,7 +133,7 @@ def _filter_to_diagnostic_properties(properties: dict) -> dict:
     }
 
 
-def get_latest_session_event_properties(session_id: str, team: Team) -> Optional[dict]:
+def get_latest_session_event_properties(session_id: str, team: Team, user: Optional["User"] = None) -> Optional[dict]:
     """The most recent event's recording-diagnostic properties for a session, for the capture diagnostics panel.
 
     Bounded by a window derived from the UUIDv7 session id so the events sort key
@@ -134,21 +148,56 @@ def get_latest_session_event_properties(session_id: str, team: Team) -> Optional
         # lower_bound is embedded_start - slack; sessions last at most a day,
         # so embedded_start + 1d + slack closes the window symmetrically.
         upper_bound = lower_bound + 2 * SESSION_ID_CLOCK_SKEW_SLACK + timedelta(days=1)
-        properties = _latest_session_event_properties_between(session_id, team, lower_bound, upper_bound)
+        properties = _latest_session_event_properties_between(session_id, team, user, lower_bound, upper_bound)
         if properties is not None:
             return properties
     now = datetime.now(pytz.UTC)
     return _latest_session_event_properties_between(
-        session_id, team, now - CAPTURE_DIAGNOSTICS_FALLBACK_LOOKBACK, now + timedelta(days=1)
+        session_id, team, user, now - CAPTURE_DIAGNOSTICS_FALLBACK_LOOKBACK, now + timedelta(days=1)
     )
 
 
 def _latest_session_event_properties_between(
-    session_id: str, team: Team, date_from: datetime, date_to: datetime
+    session_id: str, team: Team, user: Optional["User"], date_from: datetime, date_to: datetime
 ) -> Optional[dict]:
     from posthog.hogql_queries.hogql_query_runner import (
         HogQLQueryRunner,  # noqa: PLC0415 — breaks a circular import, matching this file's other HogQLQueryRunner imports
     )
+
+    tag_queries(product=Product.REPLAY, feature=Feature.QUERY, team_id=team.pk)
+    restricted_properties = get_restricted_property_names(
+        team_id=team.pk, user=user, property_type=PropertyDefinition.Type.EVENT
+    )
+    if use_new_events_schema(team.pk):
+        property_names = sorted(_DIAGNOSTIC_PROPERTIES - {"$session_recording_remote_config"} - restricted_properties)
+        fields = ", ".join(f"toJSONString(properties.{escape_clickhouse_identifier(key)})" for key in property_names)
+        # The open-ended SDK debug prefix requires the temporary bag, limited to one event.
+        native_query = f"""
+            SELECT {fields}, toJSONString(temporary_properties)
+            FROM {DISTRIBUTED_EVENTS_JSON_TABLE}
+            WHERE team_id = %(team_id)s
+                AND properties.`$session_id` = %(session_id)s
+                AND timestamp >= %(date_from)s
+                AND timestamp <= %(date_to)s
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """
+        rows = sync_execute(
+            native_query,
+            {"team_id": team.pk, "session_id": session_id, "date_from": date_from, "date_to": date_to},
+            team_id=team.pk,
+            ch_user=ClickHouseUser.APP,
+        )
+        if not rows:
+            return None
+        properties = {key: json.loads(value) for key, value in zip(property_names, rows[0][:-1]) if value is not None}
+        properties = {key: value for key, value in properties.items() if value is not None and value != ""}
+        properties.update(
+            strip_restricted_properties(
+                _filter_to_diagnostic_properties(json.loads(rows[0][-1])), restricted_properties
+            )
+        )
+        return properties
 
     query = HogQLQuery(
         query="""
@@ -162,8 +211,7 @@ def _latest_session_event_properties_between(
         """,
         values={"session_id": session_id, "date_from": date_from, "date_to": date_to},
     )
-    tag_queries(product=Product.REPLAY, feature=Feature.QUERY, team_id=team.pk)
-    result = HogQLQueryRunner(team=team, query=query).calculate()
+    result = HogQLQueryRunner(team=team, user=user, query=query).calculate()
     if not result.results:
         return None
     row = result.results[0][0]
@@ -442,7 +490,10 @@ class SessionReplayEvents:
                 groupArrayArray(block_urls) as block_urls,
                 max(retention_period_days) as retention_period_days,
                 dateTrunc('DAY', start_time) + toIntervalDay(coalesce(retention_period_days, 30)) as expiry_time,
-                dateDiff('DAY', toDateTime(%(python_now)s), expiry_time) as recording_ttl
+                dateDiff('DAY', toDateTime(%(python_now)s), expiry_time) as recording_ttl,
+                max(_timestamp) >= toDateTime(%(python_now)s) - INTERVAL {ongoing_window_minutes} MINUTE as ongoing,
+                sum(size) as total_size,
+                sum(event_count) as event_count
             FROM
                 session_replay_events
             PREWHERE
@@ -462,6 +513,7 @@ class SessionReplayEvents:
                 "AND min_first_timestamp >= %(recording_start_time)s" if recording_start_time else ""
             ),
             optional_format_clause=(f"FORMAT {format}" if format else ""),
+            ongoing_window_minutes=ONGOING_SESSION_WINDOW_MINUTES,
         )
         return query
 
@@ -493,6 +545,9 @@ class SessionReplayEvents:
             retention_period_days=replay[18],
             expiry_time=replay[19],
             recording_ttl=replay[20],
+            ongoing=bool(replay[21]),
+            total_size=replay[22],
+            event_count=replay[23],
         )
 
     def get_metadata(
@@ -500,18 +555,19 @@ class SessionReplayEvents:
         session_id: str,
         team: Team,
         recording_start_time: Optional[datetime] = None,
+        ch_user: ClickHouseUser = ClickHouseUser.DEFAULT,
     ) -> Optional[RecordingMetadata]:
         if recording_start_time is not None:
-            return self._get_metadata_from(session_id, team, recording_start_time)
+            return self._get_metadata_from(session_id, team, recording_start_time, ch_user=ch_user)
 
         # Most callers don't know the recording's start time (it is only persisted
         # for pinned recordings); derive a lower bound from the session id instead.
         # Unlike a real start time it carries clock-skew slack, so on a miss fall
         # back to the unbounded scan rather than reporting not-found.
         derived_lower_bound = uuidv7_session_lower_bound(session_id)
-        metadata = self._get_metadata_from(session_id, team, derived_lower_bound)
+        metadata = self._get_metadata_from(session_id, team, derived_lower_bound, ch_user=ch_user)
         if metadata is None and derived_lower_bound is not None:
-            metadata = self._get_metadata_from(session_id, team, None)
+            metadata = self._get_metadata_from(session_id, team, None, ch_user=ch_user)
         return metadata
 
     def _get_metadata_from(
@@ -519,6 +575,7 @@ class SessionReplayEvents:
         session_id: str,
         team: Team,
         lower_bound: Optional[datetime],
+        ch_user: ClickHouseUser = ClickHouseUser.DEFAULT,
     ) -> Optional[RecordingMetadata]:
         query = self.get_metadata_query(lower_bound)
         tag_queries(product=Product.REPLAY, feature=Feature.QUERY, team_id=team.pk)
@@ -530,6 +587,7 @@ class SessionReplayEvents:
                 "recording_start_time": lower_bound,
                 "python_now": datetime.now(pytz.timezone("UTC")),
             },
+            ch_user=ch_user,
         )
         recording_metadata = self.build_recording_metadata(session_id, replay_response)
         return recording_metadata
@@ -578,7 +636,10 @@ class SessionReplayEvents:
                 groupArrayArray(block_urls) as block_urls,
                 max(retention_period_days) as retention_period_days,
                 dateTrunc('DAY', start_time) + toIntervalDay(coalesce(retention_period_days, 30)) as expiry_time,
-                dateDiff('DAY', toDateTime(%(python_now)s), expiry_time) as recording_ttl
+                dateDiff('DAY', toDateTime(%(python_now)s), expiry_time) as recording_ttl,
+                max(_timestamp) >= toDateTime(%(python_now)s) - INTERVAL {ONGOING_SESSION_WINDOW_MINUTES} MINUTE as ongoing,
+                sum(size) as total_size,
+                sum(event_count) as event_count
             FROM
                 session_replay_events
             PREWHERE
@@ -674,6 +735,7 @@ class SessionReplayEvents:
         extra_fields: list[str] | None = None,
         limit: int | None = None,
         page: int = 0,
+        ch_user: ClickHouseUser = ClickHouseUser.DEFAULT,
     ) -> SessionEventsPage:
         """Return one page of events. When `limit` is set, fetches one extra row internally to detect whether more pages exist."""
         from posthog.schema import HogQLQueryResponse
@@ -692,6 +754,7 @@ class SessionReplayEvents:
         result: HogQLQueryResponse = HogQLQueryRunner(
             team=team,
             query=hq,
+            ch_user=ch_user,
         ).calculate()
         columns, rows = result.columns, result.results
         if limit is not None and limit > 0 and rows is not None and len(rows) > limit:

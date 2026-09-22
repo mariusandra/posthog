@@ -2,22 +2,16 @@ from typing import Optional, cast
 
 import requests
 
-from posthog.schema import (
+from posthog.exceptions_capture import capture_exception
+from posthog.models.integration import ERROR_TOKEN_REFRESH_FAILED, OauthIntegration
+
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldOauthAccountSelectConfig,
     SourceFieldOauthConfig,
     SuggestedTable,
-)
-
-from posthog.exceptions_capture import capture_exception
-from posthog.models.integration import ERROR_TOKEN_REFRESH_FAILED, OauthIntegration
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import (
     MARKETING_ANALYTICS_SUGGESTED_TABLE_TOOLTIP,
@@ -35,6 +29,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.mix
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.snapchatads import (
     SnapchatAdsSourceConfig,
 )
@@ -79,7 +74,7 @@ class SnapchatAdsSource(ResumableSource[SnapchatAdsSourceConfig, SnapchatResumeC
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.SNAPCHAT_ADS,
+            name=ExternalDataSourceType.SNAPCHATADS,
             category=DataWarehouseSourceCategory.ADVERTISING,
             label="Snapchat Ads",
             caption="Collect campaign data, ad performance, and advertising metrics from Snapchat Ads. Ensure you have granted PostHog access to your Snapchat Ads account, learn how to do this in [the documentation](https://posthog.com/docs/cdp/sources/snapchat-ads).",
@@ -172,6 +167,11 @@ class SnapchatAdsSource(ResumableSource[SnapchatAdsSourceConfig, SnapchatResumeC
             self.get_oauth_integration(config.snapchat_integration_id, team_id)
             return True, None
         except Exception as e:
+            if isinstance(e, ValueError) and "Integration not found" in str(e):
+                # The integration was deleted/disconnected while the source still references it —
+                # an expected user state, not an error worth reporting (get_oauth_integration raises
+                # ValueError("Integration not found: <id>")).
+                return False, "Snapchat Ads integration not found. Please reconnect your Snapchat Ads integration."
             capture_exception(e)
             return False, f"Failed to validate Snapchat Ads credentials: {str(e)}"
 
@@ -190,6 +190,7 @@ class SnapchatAdsSource(ResumableSource[SnapchatAdsSourceConfig, SnapchatResumeC
                 supports_incremental=endpoint_config.incremental_fields is not None,
                 supports_append=False,
                 incremental_fields=endpoint_config.incremental_fields or [],
+                should_sync_default=endpoint_config.should_sync_default,
             )
             for endpoint_config in SNAPCHAT_ADS_CONFIG.values()
         ]

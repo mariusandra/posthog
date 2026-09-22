@@ -1,15 +1,17 @@
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
 import pytest
 from posthog.test.base import BaseTest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from django.test import override_settings
 from django.utils import timezone
 
 from parameterized import parameterized
 
+from posthog.models.integration import Integration
 from posthog.models.project import Project
 from posthog.models.remote_config import REMOTE_CONFIG_CACHE_EXPIRY_SORTED_SET, RemoteConfig
 
@@ -131,6 +133,116 @@ class TestRemoteConfig(_RemoteConfigBase):
         self.team.save()
         self.sync_remote_config()
         assert self.remote_config.config["autocaptureExceptions"]
+
+    def test_heatmaps_disabled_returns_false(self):
+        self.team.heatmaps_opt_in = False
+        self.team.save()
+        self.sync_remote_config()
+        assert self.remote_config.config["heatmaps"] is False
+
+    def test_heatmaps_enabled_paid_org_defaults_to_all(self):
+        self.team.organization.has_active_subscription = True
+        self.team.organization.save()
+        self.team.heatmaps_opt_in = True
+        self.team.save()
+        self.sync_remote_config()
+        assert self.remote_config.config["heatmaps"] == {
+            "captureMode": "all",
+            "urlAllowlist": [],
+            "urlAllowlistEnforced": False,
+        }
+
+    def test_heatmaps_enabled_free_org_defaults_to_allowlist(self):
+        self.team.organization.has_active_subscription = False
+        self.team.organization.save()
+        self.team.heatmaps_opt_in = True
+        self.team.save()
+        self.sync_remote_config()
+        assert self.remote_config.config["heatmaps"] == {
+            "captureMode": "url_allowlist",
+            "urlAllowlist": [],
+            "urlAllowlistEnforced": False,
+        }
+
+    @override_settings(HEATMAP_URL_ALLOWLIST_ENFORCEMENT_ENABLED=True)
+    def test_heatmaps_config_reflects_enforcement_and_allowlist(self):
+        from posthog.models.team.team_heatmap_config import TeamHeatmapConfig
+
+        self.team.heatmaps_opt_in = True
+        self.team.save()
+        TeamHeatmapConfig.objects.update_or_create(
+            team=self.team, defaults={"capture_url_allowlist": ["https://example.com/pricing"]}
+        )
+        self.sync_remote_config()
+        assert self.remote_config.config["heatmaps"] == {
+            "captureMode": "url_allowlist",
+            "urlAllowlist": ["https://example.com/pricing"],
+            "urlAllowlistEnforced": True,
+        }
+
+    def test_heatmaps_config_clamps_downgraded_org_to_allowlist(self):
+        from posthog.models.team.team_heatmap_config import TeamHeatmapConfig
+
+        self.team.heatmaps_opt_in = True
+        self.team.save()
+        TeamHeatmapConfig.objects.update_or_create(
+            team=self.team,
+            defaults={"capture_mode": "all", "capture_url_allowlist": [f"https://example.com/{i}" for i in range(4)]},
+        )
+        self.team.organization.has_active_subscription = False
+        self.team.organization.save()
+        self.sync_remote_config()
+        assert self.remote_config.config["heatmaps"] == {
+            "captureMode": "url_allowlist",
+            "urlAllowlist": [],
+            "urlAllowlistEnforced": False,
+        }
+
+    def test_subscription_change_rebuilds_heatmaps_enabled_teams(self):
+        self.team.heatmaps_opt_in = True
+        self.team.save()
+        with patch("posthog.models.remote_config._update_team_remote_config") as mock_rebuild:
+            with self.captureOnCommitCallbacks(execute=True):
+                self.organization.has_active_subscription = False
+                self.organization.save()
+            assert mock_rebuild.call_args_list == [call(self.team.id)]
+
+            mock_rebuild.reset_mock()
+            with self.captureOnCommitCallbacks(execute=True):
+                self.organization.name = "Renamed"
+                self.organization.save()
+            assert not mock_rebuild.called
+
+    @parameterized.expand([("firebase", True), ("apns", True), ("slack", False)])
+    def test_only_push_integrations_schedule_a_config_rebuild(self, kind, expects_rebuild):
+        # Configuring push is the moment the payload has to change, and nothing else on the team is
+        # touched when it happens. Guard both directions: without the receiver a project that
+        # configures push keeps serving the old empty appIds, and without the kind check every OAuth
+        # token refresh on an unrelated integration would enqueue a rebuild.
+        with patch("posthog.models.remote_config._update_team_remote_config") as mock_rebuild:
+            with self.captureOnCommitCallbacks(execute=True):
+                integration = Integration.objects.create(team=self.team, kind=kind, config={})
+            assert mock_rebuild.called is expects_rebuild
+
+            mock_rebuild.reset_mock()
+            with self.captureOnCommitCallbacks(execute=True):
+                integration.delete()
+            assert mock_rebuild.called is expects_rebuild
+
+    def test_push_integration_save_that_cannot_change_app_ids_skips_the_rebuild(self):
+        # Integration code saves errors and created_by on their own — apns_integration does three
+        # saves per creation. Without the update_fields guard each one enqueues a rebuild and a CDN
+        # purge for a payload that cannot have changed.
+        integration = Integration.objects.create(team=self.team, kind="apns", config={"bundle_id": "com.example.app"})
+
+        with patch("posthog.models.remote_config._update_team_remote_config") as mock_rebuild:
+            with self.captureOnCommitCallbacks(execute=True):
+                integration.save(update_fields=["errors"])
+            assert not mock_rebuild.called
+
+            with self.captureOnCommitCallbacks(execute=True):
+                integration.save(update_fields=["config"])
+            assert mock_rebuild.called
 
     def test_conversations_disabled_by_default(self):
         self.sync_remote_config()
@@ -282,6 +394,15 @@ class TestRemoteConfig(_RemoteConfigBase):
 
         list_limited_team_attributes.clear_cache()
 
+    def test_site_functions_query_failure_degrades_to_empty_list(self):
+        with patch(
+            "products.cdp.backend.models.hog_functions.hog_function.HogFunction.objects.select_related",
+            side_effect=Exception("column posthog_hogfunction.version does not exist"),
+        ):
+            result = self.remote_config._build_site_apps_js()
+
+        assert result == []
+
 
 class TestRemoteConfigSurveys(_RemoteConfigBase):
     # Largely copied from TestSurveysAPIList
@@ -290,7 +411,7 @@ class TestRemoteConfigSurveys(_RemoteConfigBase):
 
         self.team.save()
 
-    def test_includes_survey_config(self):
+    def test_excludes_survey_config(self):
         survey_appearance = {
             "thankYouMessageHeader": "Thanks for your feedback!",
             "thankYouMessageDescription": "We'll use it to make notebooks better",
@@ -309,12 +430,28 @@ class TestRemoteConfigSurveys(_RemoteConfigBase):
         self.team.save()
 
         self.sync_remote_config()
-        assert self.remote_config.config["survey_config"] == {
-            "appearance": {
-                "thankYouMessageHeader": "Thanks for your feedback!",
-                "thankYouMessageDescription": "We'll use it to make notebooks better",
-            }
-        }
+        assert "survey_config" not in self.remote_config.config
+
+    def test_surveys_disabled_when_only_draft_and_stopped_surveys_exist(self):
+        Survey.objects.create(
+            team=self.team,
+            created_by=self.user,
+            name="Draft survey",
+            type="popover",
+            questions=[{"type": "open", "question": "What's a survey?"}],
+        )
+        Survey.objects.create(
+            team=self.team,
+            created_by=self.user,
+            name="Stopped survey",
+            type="popover",
+            questions=[{"type": "open", "question": "What's a hedgehog?"}],
+            start_date=timezone.now() - timedelta(days=2),
+            end_date=timezone.now() - timedelta(days=1),
+        )
+
+        self.sync_remote_config()
+        assert self.remote_config.config["surveys"] is False
 
     def test_includes_range_of_survey_types(self):
         survey_basic = Survey.objects.create(
@@ -390,7 +527,6 @@ class TestRemoteConfigSurveys(_RemoteConfigBase):
                     "current_iteration_start_date": None,
                     "schedule": "once",
                     "enable_partial_responses": False,
-                    "base_language": "en",
                 },
                 {
                     "id": str(survey_with_flags.id),
@@ -418,7 +554,6 @@ class TestRemoteConfigSurveys(_RemoteConfigBase):
                     "current_iteration_start_date": None,
                     "schedule": "once",
                     "enable_partial_responses": False,
-                    "base_language": "en",
                 },
                 {
                     "id": str(survey_with_actions.id),
@@ -467,7 +602,6 @@ class TestRemoteConfigSurveys(_RemoteConfigBase):
                     "current_iteration_start_date": None,
                     "schedule": "once",
                     "enable_partial_responses": False,
-                    "base_language": "en",
                 },
             ],
             key=lambda s: str(s["id"]),  # type: ignore
@@ -516,7 +650,7 @@ class TestRemoteConfigCaching(_RemoteConfigBase):
         mock_get_client.return_value = mock_redis
 
         # Force a content change so sync() takes the change path.
-        self.remote_config.config["token"] = "FORCE_CHANGE"
+        self.remote_config.config["surveys"] = True
 
         with (
             patch("posthog.storage.object_storage.write") as mock_s3_write,
@@ -594,7 +728,7 @@ class TestRemoteConfigCaching(_RemoteConfigBase):
             REMOTE_CONFIG_CDN_PURGE_DOMAINS=["cdn.posthog.com", "https://cdn2.posthog.com"],
         ):
             # Force a change to the config
-            self.remote_config.config["token"] = "NOT"
+            self.remote_config.config["surveys"] = True
             self.remote_config.sync()
             mock_post.assert_called_once_with(
                 "https://api.cloudflare.com/client/v4/zones/MY_ZONE_ID/purge_cache",

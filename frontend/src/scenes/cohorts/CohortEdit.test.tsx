@@ -1,16 +1,20 @@
 import '@testing-library/jest-dom'
 
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { expectLogic, partial } from 'kea-test-utils'
 
 import { cohortEditLogic } from 'scenes/cohorts/cohortEditLogic'
 import { NEW_COHORT } from 'scenes/cohorts/CohortFilters/constants'
+import { BehavioralFilterKey } from 'scenes/cohorts/CohortFilters/types'
+import { urls } from 'scenes/urls'
 
+import { sceneLayoutLogic } from '~/layout/scenes/sceneLayoutLogic'
 import { toPaginatedResponse } from '~/mocks/handlers'
 import { useMocks } from '~/mocks/jest'
 import { initKeaTests } from '~/test/init'
 import { mockCohort } from '~/test/mocks'
+import { AnyCohortCriteriaType, BehavioralEventType, FilterLogicalOperator, InsightShortId } from '~/types'
 
 import { CohortEdit } from './CohortEdit'
 
@@ -421,6 +425,38 @@ describe('cohortEditLogic', () => {
             expect(screen.queryByText(/Calculation failed:/)).not.toBeInTheDocument()
         })
 
+        it('shows the failure banner without a retry for a static cohort whose population failed', async () => {
+            const cohortId = 7
+
+            useMocks({
+                get: {
+                    [`/api/projects/:team_id/cohorts/${cohortId}/`]: {
+                        id: cohortId,
+                        name: 'Test Cohort',
+                        // A static cohort that never populated reports count 0, so the only signal
+                        // that the population failed is this banner.
+                        is_static: true,
+                        filters: { properties: {} },
+                        query: { kind: 'HogQLQuery', query: 'SELECT person_id FROM events' },
+                        version: null,
+                        pending_version: null,
+                        is_calculating: false,
+                        errors_calculating: 1,
+                        last_calculation: null,
+                        last_error_message: 'Cohort calculation was terminated for reading too much data.',
+                    },
+                },
+            })
+
+            render(<CohortEdit tabId="test-tab" id={cohortId} />)
+
+            await screen.findByText(/Calculation failed:/)
+            expect(screen.getByText(/reading too much data/)).toBeInTheDocument()
+            expect(screen.getByText('contact support')).toBeInTheDocument()
+            // The edit form does not resend the source query, so a Retry would not repopulate.
+            expect(screen.queryByText('Retry')).not.toBeInTheDocument()
+        })
+
         // Pins the selector contract the fix changed, including the errors_calculating=0 and
         // version=null boundaries the DOM tests above don't exercise.
         it.each([
@@ -492,6 +528,253 @@ describe('cohortEditLogic', () => {
         )
     })
 
+    describe('calculation history action', () => {
+        afterEach(() => {
+            cleanup()
+        })
+
+        // ScenePanel portals its actions into the host element the app layout registers. A
+        // standalone render never creates one, so the panel stays empty without this.
+        function renderWithScenePanel(cohortId: number): void {
+            const panelHost = document.createElement('div')
+            document.body.appendChild(panelHost)
+            const layoutLogic = sceneLayoutLogic()
+            layoutLogic.mount()
+            layoutLogic.actions.registerScenePanelElement(panelHost)
+            render(<CohortEdit tabId="test-tab" id={cohortId} />)
+        }
+
+        it.each([
+            { type: 'static', isStatic: true },
+            { type: 'dynamic', isStatic: false },
+        ])('offers calculation history for a saved $type cohort', async ({ isStatic }) => {
+            const cohortId = 8
+
+            useMocks({
+                get: {
+                    [`/api/projects/:team_id/cohorts/${cohortId}/`]: {
+                        id: cohortId,
+                        name: 'Test Cohort',
+                        is_static: isStatic,
+                        filters: { properties: { type: 'AND', values: [] } },
+                        version: null,
+                        pending_version: null,
+                        is_calculating: false,
+                        errors_calculating: 0,
+                        last_calculation: null,
+                    },
+                },
+            })
+
+            renderWithScenePanel(cohortId)
+
+            // The panel fills in behind a one second timer, so the default one second find budget
+            // has almost no margin. Waiting on a sibling action also separates a panel that never
+            // rendered from one that rendered without this entry.
+            await screen.findByText('Message this cohort', {}, { timeout: 5000 })
+
+            // An unloaded cohort has a falsy is_static, which satisfies the gate this test exists
+            // to catch, so pin that the fixture reached the scene before asserting on it.
+            expect(screen.getByText(isStatic ? 'Static' : 'Dynamic')).toBeInTheDocument()
+
+            // Both cohort types record calculation history, so neither may have the tab that lists
+            // it gated away.
+            expect(screen.getByText('Calculation history')).toBeInTheDocument()
+        })
+    })
+
+    describe('import warning', () => {
+        afterEach(() => {
+            cleanup()
+        })
+
+        it('stays hidden after an import that matched every ID', async () => {
+            const cohortId = 5
+            const cohortName = 'Clean import cohort'
+            useMocks({
+                get: {
+                    [`/api/projects/:team_id/cohorts/${cohortId}/`]: {
+                        ...mockCohort,
+                        id: cohortId,
+                        name: cohortName,
+                        is_static: true,
+                        last_import_total_count: 5,
+                        last_import_unmatched_count: 0,
+                    },
+                },
+            })
+
+            render(<CohortEdit tabId="test-tab" id={cohortId} />)
+
+            await screen.findAllByText(cohortName)
+            expect(screen.queryByText("Some IDs in the last import didn't match a person")).not.toBeInTheDocument()
+        })
+
+        it('shows the unmatched and total ID counts after a partial import', async () => {
+            const cohortId = 6
+            const cohortName = 'Partial import cohort'
+            useMocks({
+                get: {
+                    [`/api/projects/:team_id/cohorts/${cohortId}/`]: {
+                        ...mockCohort,
+                        id: cohortId,
+                        name: cohortName,
+                        is_static: true,
+                        last_import_total_count: 7,
+                        last_import_unmatched_count: 2,
+                    },
+                },
+            })
+
+            render(<CohortEdit tabId="test-tab" id={cohortId} />)
+
+            await screen.findAllByText(cohortName)
+            const heading = screen.getByText("Some IDs in the last import didn't match a person")
+            expect(heading).toBeInTheDocument()
+            expect(heading.closest('[aria-live="polite"]')).toBeInTheDocument()
+            expect(screen.getByText(/2 of 7 IDs weren't added to this cohort/)).toBeInTheDocument()
+        })
+    })
+
+    describe('used-in summary', () => {
+        afterEach(() => {
+            cleanup()
+        })
+
+        const cohortId = 8
+        const cohortName = 'Referenced cohort'
+        // 42 insights behind a 2-item page, and a cohorts block nothing references.
+        const usedInMocks = {
+            get: {
+                [`/api/projects/:team_id/cohorts/${cohortId}/`]: {
+                    ...mockCohort,
+                    id: cohortId,
+                    name: cohortName,
+                },
+                [`/api/projects/:team_id/cohorts/${cohortId}/used_in/`]: {
+                    feature_flags: {
+                        results: [{ id: 7, key: 'my-flag', name: 'My flag' }],
+                        total: 1,
+                        has_more: false,
+                    },
+                    insights: {
+                        results: [
+                            { id: 1, short_id: 'abc123', name: 'Weekly signups' },
+                            { id: 2, short_id: 'def456', name: 'Activation funnel' },
+                        ],
+                        total: 42,
+                        has_more: true,
+                    },
+                    cohorts: { results: [], total: 0, has_more: false },
+                },
+            },
+        }
+
+        it('counts every use from the total and leaves the list collapsed', async () => {
+            useMocks(usedInMocks)
+
+            render(<CohortEdit tabId="test-tab" id={cohortId} />)
+
+            // Anchored: 42 rather than the 2 results the page carried, and no trailing mention of
+            // the cohorts block, which nothing references.
+            expect(await screen.findByTestId('cohort-used-in-toggle')).toHaveTextContent(
+                /^Used in 1 feature flag and 42 insights$/
+            )
+            expect(screen.queryByText('Weekly signups')).not.toBeInTheDocument()
+        })
+
+        it('reveals the grouped links and the truncation note once expanded', async () => {
+            useMocks(usedInMocks)
+
+            render(<CohortEdit tabId="test-tab" id={cohortId} />)
+
+            await userEvent.click(await screen.findByTestId('cohort-used-in-toggle'))
+
+            // The rendered href carries the project prefix these helpers leave off.
+            expect(screen.getByText('My flag').closest('a')).toHaveAttribute(
+                'href',
+                expect.stringContaining(urls.featureFlag(7))
+            )
+            expect(screen.getByText('Weekly signups').closest('a')).toHaveAttribute(
+                'href',
+                expect.stringContaining(urls.insightView('abc123' as InsightShortId))
+            )
+            expect(screen.getByText(/2 of 42 shown/)).toBeInTheDocument()
+        })
+    })
+
+    describe('criteria row type switching', () => {
+        afterEach(() => {
+            cleanup()
+        })
+
+        const q = (selector: string): HTMLElement => {
+            const el = document.querySelector(selector)
+            if (!el) {
+                throw new Error(`not found: ${selector}`)
+            }
+            return el as HTMLElement
+        }
+
+        // mockCohort's single criterion is negated ("Did not complete event", stored as
+        // {value: performed_event, negation: true}). Negated criteria store the positive enum
+        // plus a negation flag, so a type pick that doesn't reset negation used to leave rows
+        // permanently stuck on the negated variant (e.g. "Do not have the property").
+        test.each([
+            {
+                pick: 'cohort-personPropertyBehavioral-have_property-type',
+                expectedLabel: 'Have the property',
+                expectedCriteria: {
+                    type: BehavioralFilterKey.Person,
+                    value: BehavioralEventType.HaveProperty,
+                    negation: false,
+                },
+            },
+            {
+                pick: 'cohort-eventBehavioral-performed_event-type',
+                expectedLabel: 'Completed event',
+                expectedCriteria: {
+                    type: BehavioralFilterKey.Behavioral,
+                    value: BehavioralEventType.PerformEvent,
+                    negation: false,
+                },
+            },
+            {
+                pick: 'cohort-personPropertyBehavioral-not_have_property-type',
+                expectedLabel: 'Do not have the property',
+                expectedCriteria: {
+                    type: BehavioralFilterKey.Person,
+                    value: BehavioralEventType.HaveProperty,
+                    negation: true,
+                },
+            },
+        ])(
+            'switching a negated row via $pick lands on $expectedLabel',
+            async ({ pick, expectedLabel, expectedCriteria }) => {
+                render(<CohortEdit tabId="test-tab" id={1} />)
+
+                await waitFor(() => {
+                    expect(q('[data-attr="cohort-selector-field-value"]')).toHaveTextContent('Did not complete event')
+                })
+
+                await userEvent.click(q('[data-attr="cohort-selector-field-value"]'))
+                await waitFor(() => {
+                    expect(q(`[data-attr="${pick}"]`)).toBeInTheDocument()
+                })
+                await userEvent.click(q(`[data-attr="${pick}"]`))
+
+                logic = cohortEditLogic({ id: 1 })
+                await waitFor(() => {
+                    const group = logic.values.cohort.filters.properties.values[0] as {
+                        values: AnyCohortCriteriaType[]
+                    }
+                    expect(group.values[0]).toEqual(expect.objectContaining(expectedCriteria))
+                })
+                expect(q('[data-attr="cohort-selector-field-value"]')).toHaveTextContent(expectedLabel)
+            }
+        )
+    })
+
     describe('locked type and populate-from controls on existing cohorts', () => {
         afterEach(() => {
             cleanup()
@@ -532,6 +815,66 @@ describe('cohortEditLogic', () => {
             // a LemonSelect would render the data-attr onto a <button>
             expect(typeContainer?.tagName).not.toBe('BUTTON')
             expect(populateFromContainer?.tagName).not.toBe('BUTTON')
+        })
+    })
+
+    describe('criteria with unmapped behavioral value', () => {
+        afterEach(() => {
+            cleanup()
+        })
+
+        // Stored criteria can carry a behavioral value with no ROWS entry. Values that instead
+        // resolve to an Object.prototype member are covered against getRowShape in cohortUtils.test,
+        // since this scene render is the most expensive place to assert the same lookup.
+        it('renders an empty, recoverable criteria row for an unmapped value', async () => {
+            const cohortId = 11
+
+            useMocks({
+                get: {
+                    [`/api/projects/:team_id/cohorts/${cohortId}/`]: {
+                        id: cohortId,
+                        name: 'Unmapped Criteria Cohort',
+                        is_static: false,
+                        filters: {
+                            properties: {
+                                id: '1',
+                                type: FilterLogicalOperator.Or,
+                                values: [
+                                    {
+                                        id: '2',
+                                        type: FilterLogicalOperator.Or,
+                                        values: [
+                                            {
+                                                type: BehavioralFilterKey.Behavioral,
+                                                value: 'legacy_unknown_value',
+                                                key: '$pageview',
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
+                        },
+                        version: 1,
+                        pending_version: 1,
+                        is_calculating: false,
+                        last_calculation: '2024-01-01T00:00:00Z',
+                    },
+                },
+            })
+
+            render(<CohortEdit tabId="test-tab" id={cohortId} />)
+
+            // The name only gates on the cohort having loaded; a throw in the row builder has no
+            // error boundary between here and the test, so it fails the render outright.
+            expect(await screen.findByText('Unmapped Criteria Cohort')).toBeInTheDocument()
+            expect(document.querySelector('.CohortCriteriaRow')).toBeInTheDocument()
+            expect(screen.getByText('Choose criterion')).toBeInTheDocument()
+            // Counting fields is what catches a revert to the PerformEvent fallback: the stored
+            // key would label the event picker rather than leave its placeholder visible, so the
+            // placeholder assertion above would still pass.
+            expect(document.querySelectorAll('.CohortCriteriaRow__Criteria__Field')).toHaveLength(1)
+            expect(document.querySelector('.CohortCriteriaRow__Criteria__arrow')).not.toBeInTheDocument()
+            expect(screen.getByText("This criterion isn't valid. Choose a new one to replace it.")).toBeInTheDocument()
         })
     })
 })

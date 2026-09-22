@@ -1,3 +1,5 @@
+import time
+from datetime import timedelta
 from typing import Optional
 
 from posthog.hogql import ast
@@ -5,11 +7,34 @@ from posthog.hogql.errors import QueryError
 from posthog.hogql.utils import deserialize_hx_ast, is_simple_value
 from posthog.hogql.visitor import CloningVisitor, TraversingVisitor
 
+from common.hogvm.python.stl import BLOCKING_FUNCTIONS
+from common.hogvm.python.utils import MAX_MEMORY
+
+# Placeholder expressions run through the Hog VM on the request thread. Bound the work per query,
+# not per expression: one deadline shared across all placeholders, and a cap on how many a single
+# query may expand.
+MAX_PLACEHOLDER_EXPANSIONS = 1000
+PLACEHOLDER_EXPANSION_BUDGET = timedelta(seconds=5)
+
+
+class FindBlockingCalls(TraversingVisitor):
+    def __init__(self):
+        super().__init__()
+        self.names: set[str] = set()
+
+    def visit_call(self, node: ast.Call):
+        if node.name in BLOCKING_FUNCTIONS:
+            self.names.add(node.name)
+        super().visit_call(node)
+
 
 class FindPlaceholders(TraversingVisitor):
     def __init__(self):
         super().__init__()
         self.has_filters = False  # Legacy fallback: treat filters as before
+        # The filters forms that expand into a predicate, so a date range can bound the query
+        # through them. The dotted call forms substitute a value and cannot add one.
+        self.has_date_filters = False
         self.placeholder_fields: list[list[str | int]] = []  # Did we find simple fields
         self.placeholder_expressions: list[ast.Expr] = []  # Did we find complex expressions
 
@@ -20,8 +45,23 @@ class FindPlaceholders(TraversingVisitor):
         if chain := node.chain:
             if chain[0] == "filters":
                 self.has_filters = True
+                self.has_date_filters = True
             else:
                 self.placeholder_fields.append(chain)
+        elif isinstance(node.expr, ast.Call) and node.expr.name == "filters":
+            # The column-bound form {filters(expr AS key, ...)} is resolved by replace_filters;
+            # classifying it as a generic expression placeholder would send it to the Hog VM instead.
+            self.has_filters = True
+            self.has_date_filters = True
+        elif (
+            isinstance(node.expr, ast.ExprCall)
+            and isinstance(node.expr.expr, ast.Field)
+            and node.expr.expr.chain
+            and node.expr.expr.chain[0] == "filters"
+        ):
+            # Dotted call forms like {filters.interval('week')} and {filters.breakdown(...)} are
+            # resolved by replace_filters too.
+            self.has_filters = True
         else:
             self.placeholder_expressions.append(node.expr)
 
@@ -36,6 +76,9 @@ class ReplacePlaceholders(CloningVisitor):
     def __init__(self, placeholders: Optional[dict[str, ast.Expr]]):
         super().__init__()
         self.placeholders = placeholders
+        self._expansions = 0
+        self._deadline: Optional[float] = None
+        self._remaining_memory = MAX_MEMORY
 
     def visit_placeholder(self, node):
         # avoid circular imports
@@ -43,11 +86,45 @@ class ReplacePlaceholders(CloningVisitor):
 
         from common.hogvm.python.execute import execute_bytecode
 
+        if self._deadline is None:
+            self._deadline = time.monotonic() + PLACEHOLDER_EXPANSION_BUDGET.total_seconds()
+
+        self._expansions += 1
+        if self._expansions > MAX_PLACEHOLDER_EXPANSIONS:
+            raise QueryError("This query has too many placeholder expressions to expand. Simplify it and try again.")
+
+        # This bytecode runs on the request thread before access control, so refuse blocking calls.
+        # The static check gives a clear early error for the common `fn(...)` form; passing
+        # disallowed_functions to the VM is the real guard, catching every indirect call path too.
+        finder = FindBlockingCalls()
+        finder.visit(node.expr)
+        if finder.names:
+            disallowed = ", ".join(sorted(finder.names))
+            raise QueryError(f"Query placeholders can't use {disallowed}. Remove it and try again.")
+
         bytecode = create_bytecode(node.expr)
-        response = execute_bytecode(bytecode.bytecode, self.placeholders)
+
+        # Measure after compiling: the traversal and compilation above run on the request thread
+        # too, and the VM starts its own clock when called, so a stale value adds their cost on top.
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise QueryError("Expanding this query's placeholders took too long. Simplify it and try again.")
+
+        response = execute_bytecode(
+            bytecode.bytecode,
+            self.placeholders,
+            timeout=timedelta(seconds=remaining),
+            disallowed_functions=BLOCKING_FUNCTIONS,
+            memory_limit=self._remaining_memory,
+        )
+        # Charge temporary values too, even when the placeholder returns only a scalar.
+        self._remaining_memory -= response.max_memory_used
 
         if isinstance(response.result, dict) and ("__hx_ast" in response.result or "__hx_tag" in response.result):
             response.result = deserialize_hx_ast(response.result)
+
+        if time.monotonic() >= self._deadline:
+            raise QueryError("Expanding this query's placeholders took too long. Simplify it and try again.")
 
         if (
             isinstance(response.result, ast.Expr)

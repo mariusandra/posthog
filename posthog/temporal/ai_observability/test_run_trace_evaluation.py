@@ -1,16 +1,20 @@
 import json
 import uuid
+import tracemalloc
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import pytest
-from freezegun import freeze_time
+import time_machine
 from unittest.mock import MagicMock, patch
+
+from asgiref.sync import async_to_sync
 
 from posthog.schema import LLMTrace, LLMTraceEvent
 
 from posthog.hogql import ast
 
+from posthog.api.capture import CaptureInternalError
 from posthog.cdp.validation import compile_hog
 from posthog.models import Organization, Team
 
@@ -21,6 +25,7 @@ from products.ai_observability.backend.models.provider_keys import LLMProviderKe
 from .evaluation_hog import execute_hog_eval_bytecode
 from .evaluation_llm_judge import BooleanEvalResult
 from .evaluation_types import EvaluationActivityResult
+from .evaluation_workflow_activities import backfill_verdict_timestamp
 from .run_trace_evaluation import (
     JUDGE_TRACE_MAX_CHARS,
     MAX_TRACE_EVAL_EVENTS,
@@ -154,12 +159,45 @@ class TestFormatTraceForJudge:
 
         assert "search_docs" in transcript
 
-    def test_truncates_long_event_io(self):
-        trace = create_trace([create_trace_event("$ai_generation", **{"$ai_input": "x" * 50_000})])
+    @pytest.mark.parametrize("output_property", ["$ai_output", "$ai_output_choices"])
+    @pytest.mark.parametrize(
+        "content_length,output_length,should_truncate,should_truncate_output",
+        [(50_000, 4_000, False, False), (200_000, 4_000, True, False), (200_000, 200_000, True, True)],
+    )
+    def test_truncates_long_event_io_only_when_the_trace_exceeds_budget(
+        self,
+        output_property: str,
+        content_length: int,
+        output_length: int,
+        should_truncate: bool,
+        should_truncate_output: bool,
+    ) -> None:
+        content = "start " + "x" * (content_length // 2) + " critical evidence " + "y" * (content_length // 2) + " end"
+        output = "a" * (output_length // 2) + "\n- Required output evidence.\n" + "b" * (output_length // 2)
+        output_value = (
+            output
+            if output_property == "$ai_output"
+            else [{"role": "assistant", "content": [{"type": "text", "text": output}]}]
+        )
+        trace = create_trace(
+            [
+                create_trace_event(
+                    "$ai_generation",
+                    **{"$ai_input": [{"role": "user", "content": content}], output_property: output_value},
+                )
+            ]
+        )
 
         transcript = format_trace_for_judge(trace)
 
-        assert "chars truncated" in transcript
+        assert ("chars truncated" in transcript) == should_truncate
+        assert ("critical evidence" in transcript) == (not should_truncate)
+        assert ("- Required output evidence." in transcript) == (not should_truncate_output)
+        if not should_truncate_output:
+            assert all(line in transcript for line in output.splitlines())
+        assert "start " in transcript
+        assert " end" in transcript
+        assert len(transcript) <= JUDGE_TRACE_MAX_CHARS
 
     def test_bounds_output_to_max_chars(self):
         # 200 large generations would blow well past the cap without sampling.
@@ -170,6 +208,29 @@ class TestFormatTraceForJudge:
         transcript = format_trace_for_judge(create_trace(events))
 
         assert len(transcript) <= JUDGE_TRACE_MAX_CHARS
+        assert "SAMPLED VIEW" in transcript
+
+    @pytest.mark.parametrize("message_property", ["$ai_input", "$ai_output_choices"])
+    @pytest.mark.parametrize("event_count,message_count", [(50, 1), (1, 50)])
+    def test_oversized_messages_do_not_allocate_the_full_transcript(
+        self, message_property: str, event_count: int, message_count: int
+    ) -> None:
+        content = "start " + "x" * 500_000 + " end"
+        messages = [{"role": "user", "content": content} for _ in range(message_count)]
+        trace = create_trace(
+            [create_trace_event("$ai_generation", **{message_property: messages}) for _ in range(event_count)]
+        )
+
+        tracemalloc.start()
+        try:
+            transcript = format_trace_for_judge(trace)
+            _, peak_bytes = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert "chars truncated" in transcript
+        assert len(transcript) <= JUDGE_TRACE_MAX_CHARS
+        assert peak_bytes < 10_000_000
 
     def test_marks_errored_events(self):
         trace = create_trace(
@@ -282,6 +343,26 @@ class TestFetchTraceForEvaluation:
         mock_runner.assert_not_called()
 
     @pytest.mark.django_db(transaction=True)
+    @pytest.mark.parametrize("window_end", [None, FROZEN_NOW + timedelta(minutes=30)])
+    def test_upper_bound_is_the_given_window_end_or_now(self, setup_data, window_end):
+        team = setup_data["team"]
+        trace = create_trace([create_trace_event("$ai_generation", **{"$ai_input": "q", "$ai_output": "a"})])
+
+        with (
+            time_machine.travel(FROZEN_NOW, tick=False),
+            patch("posthog.temporal.ai_observability.run_trace_evaluation._count_trace_events", return_value=1),
+            patch("posthog.temporal.ai_observability.run_trace_evaluation.TraceQueryRunner") as mock_runner,
+        ):
+            mock_runner.return_value.calculate.return_value = MagicMock(results=[trace])
+            fetch_trace_for_evaluation(team.id, "trace-123", FROZEN_NOW, window_end)
+
+        date_range = mock_runner.call_args.kwargs["query"].dateRange
+        assert date_range.date_to == (window_end or FROZEN_NOW).isoformat()
+        # The runner ignores dateRange on the ai_events path unless it is asked to honor it, and
+        # only a backfilled run asks: a live run grades the whole trace, as it always has.
+        assert mock_runner.call_args.kwargs["bound_events_to_date_range"] is (window_end is not None)
+
+    @pytest.mark.django_db(transaction=True)
     def test_returns_trace_when_found(self, setup_data):
         team = setup_data["team"]
         trace = create_trace([create_trace_event("$ai_generation", **{"$ai_input": "q", "$ai_output": "a"})])
@@ -293,6 +374,29 @@ class TestFetchTraceForEvaluation:
 
         assert outcome.skip_reason is None
         assert outcome.trace is trace
+
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.parametrize(
+        "window_end,expected_skip",
+        [(FROZEN_NOW + timedelta(minutes=30), "trace_not_found"), (None, None)],
+    )
+    def test_a_backfilled_trace_left_with_no_events_is_skipped(self, setup_data, window_end, expected_skip):
+        team = setup_data["team"]
+        empty_trace = create_trace([])
+
+        # The count preflight sees the `$ai_trace` root row, which never reaches `events`, so the
+        # bounded runner can return a trace row with no transcript to grade. A live run keeps
+        # whatever it did with that row before, so only the backfilled run skips.
+        with (
+            time_machine.travel(FROZEN_NOW, tick=False),
+            patch("posthog.temporal.ai_observability.run_trace_evaluation._count_trace_events", return_value=2),
+            patch("posthog.temporal.ai_observability.run_trace_evaluation.TraceQueryRunner") as mock_runner,
+        ):
+            mock_runner.return_value.calculate.return_value = MagicMock(results=[empty_trace])
+            outcome = fetch_trace_for_evaluation(team.id, "trace-123", FROZEN_NOW, window_end)
+
+        assert outcome.skip_reason == expected_skip
+        assert outcome.trace is (None if expected_skip else empty_trace)
 
 
 class TestRunHogEvalOverRecentTraces:
@@ -339,7 +443,7 @@ class TestRunHogEvalOverRecentTraces:
         rewritten_condition = where_clause.exprs[-1]
         assert rewritten_condition.left.chain == ["input"]
 
-    @freeze_time(FROZEN_NOW)
+    @time_machine.travel(FROZEN_NOW, tick=False)
     def test_uses_the_sampled_trigger_and_configured_aggregation_window(self):
         team = MagicMock(spec=Team)
         trigger_timestamp = FROZEN_NOW - timedelta(hours=2)
@@ -558,8 +662,8 @@ class TestEmitTraceEvaluationEventActivity:
             "output_tokens": 18,
         }
 
-        with patch("posthog.temporal.ai_observability.run_trace_evaluation.Team.objects.get", return_value=team):
-            with patch("posthog.temporal.ai_observability.run_trace_evaluation.capture_internal") as mock_capture:
+        with patch("posthog.temporal.ai_observability.team_capture.get_team_api_token", return_value=team.api_token):
+            with patch("posthog.temporal.ai_observability.team_capture.capture_ai_internal") as mock_capture:
                 mock_capture.return_value = MagicMock(status_code=200, raise_for_status=MagicMock())
 
                 await emit_trace_evaluation_event_activity(
@@ -587,6 +691,196 @@ class TestEmitTraceEvaluationEventActivity:
                 assert props["$ai_model"] == "gpt-5-mini"
                 assert "$ai_target_event_id" not in props
                 assert "$ai_target_event_type" not in props
+
+    @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.parametrize(
+        "expected_trigger,backfill_id,event_timestamp",
+        [
+            pytest.param("live", None, None, id="live"),
+            pytest.param("backfill", "bf-1", "2026-08-01T12:00:00+00:00", id="backfill"),
+        ],
+    )
+    async def test_stamps_trigger_and_timestamp(
+        self,
+        setup_data,
+        expected_trigger: str,
+        backfill_id: str | None,
+        event_timestamp: str | None,
+    ):
+        team = setup_data["team"]
+        result: EvaluationActivityResult = {
+            "result_type": "boolean",
+            "verdict": True,
+            "reasoning": "Looks good",
+            "allows_na": False,
+        }
+
+        with (
+            time_machine.travel(FROZEN_NOW, tick=False),
+            patch("posthog.temporal.ai_observability.team_capture.get_team_api_token", return_value=team.api_token),
+            patch("posthog.temporal.ai_observability.team_capture.capture_ai_internal") as mock_capture,
+        ):
+            mock_capture.return_value = MagicMock(status_code=200, raise_for_status=MagicMock())
+
+            await emit_trace_evaluation_event_activity(
+                EmitTraceEvaluationEventInputs(
+                    evaluation=evaluation_dict(setup_data),
+                    team_id=team.id,
+                    trace_id="trace-123",
+                    distinct_id="test-user",
+                    session_id=None,
+                    result=result,
+                    start_time=datetime(2024, 1, 1, 12, 0, 0),
+                    backfill_id=backfill_id,
+                    event_timestamp=event_timestamp,
+                )
+            )
+
+        call_kwargs = mock_capture.call_args[1]
+        props = call_kwargs["properties"]
+        assert props["$ai_evaluation_trigger"] == expected_trigger
+        if backfill_id:
+            assert props["$ai_evaluation_backfill_id"] == backfill_id
+        else:
+            assert "$ai_evaluation_backfill_id" not in props
+        if event_timestamp:
+            # Offset inside the unit's second, so verdicts that would share an ingestion dedup
+            # key no longer do.
+            assert call_kwargs["timestamp"] == backfill_verdict_timestamp(
+                datetime.fromisoformat(event_timestamp),
+                str(evaluation_dict(setup_data)["id"]),
+                cast(str, backfill_id),
+                "trace-123",
+            )
+        else:
+            # A live verdict is stamped when it is emitted.
+            assert call_kwargs["timestamp"] == FROZEN_NOW
+
+    @pytest.mark.asyncio
+    @pytest.mark.django_db(transaction=True)
+    @pytest.mark.parametrize(
+        "status_code,should_raise",
+        [
+            pytest.param(402, False, id="billing_limit_is_swallowed"),
+            pytest.param(500, True, id="server_error_still_raises"),
+        ],
+    )
+    async def test_emits_event_billing_limit(self, setup_data, status_code: int, should_raise: bool):
+        team = setup_data["team"]
+        result: EvaluationActivityResult = {
+            "result_type": "boolean",
+            "verdict": True,
+            "reasoning": "Looks good",
+            "allows_na": False,
+            "model": "gpt-5-mini",
+            "provider": "openai",
+        }
+        capture_result = MagicMock(
+            raise_for_status=MagicMock(side_effect=CaptureInternalError("boom", status_code=status_code))
+        )
+        inputs = EmitTraceEvaluationEventInputs(
+            evaluation=evaluation_dict(setup_data),
+            team_id=team.id,
+            trace_id="trace-123",
+            distinct_id="test-user",
+            session_id="session-1",
+            result=result,
+            start_time=datetime(2024, 1, 1, 12, 0, 0),
+        )
+
+        with patch("posthog.temporal.ai_observability.team_capture.get_team_api_token", return_value=team.api_token):
+            with patch(
+                "posthog.temporal.ai_observability.team_capture.capture_ai_internal", return_value=capture_result
+            ):
+                if should_raise:
+                    with pytest.raises(CaptureInternalError):
+                        await emit_trace_evaluation_event_activity(inputs)
+                else:
+                    await emit_trace_evaluation_event_activity(inputs)
+
+
+class TestEmitSessionEvaluationEvent:
+    @pytest.mark.parametrize(
+        "target,ai_session_id,expected_target_type,expected_target_id",
+        [
+            ("trace", None, "trace_id", "trace-123"),
+            ("session", "session-abc", "session_id", "session-abc"),
+        ],
+    )
+    def test_target_linkage_per_target(
+        self,
+        target: str,
+        ai_session_id: str | None,
+        expected_target_type: str,
+        expected_target_id: str,
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def _capture(**kwargs: Any) -> MagicMock:
+            captured.update(kwargs)
+            response = MagicMock()
+            response.raise_for_status.return_value = None
+            return response
+
+        with (
+            patch("posthog.temporal.ai_observability.team_capture.get_team_api_token", return_value="phc_test"),
+            patch("posthog.temporal.ai_observability.team_capture.capture_ai_internal", side_effect=_capture),
+        ):
+            async_to_sync(emit_trace_evaluation_event_activity)(
+                EmitTraceEvaluationEventInputs(
+                    evaluation={"id": "eval-1", "name": "n", "output_type": "boolean"},
+                    team_id=1,
+                    trace_id="trace-123",
+                    distinct_id="user-1",
+                    session_id="ph-session-1",
+                    result={"verdict": True, "reasoning": "", "result_type": "boolean"},
+                    start_time=FROZEN_NOW,
+                    target=target,
+                    ai_session_id=ai_session_id,
+                )
+            )
+
+        props = captured["properties"]
+        assert props["$ai_target_type"] == expected_target_type
+        assert props["$ai_target_id"] == expected_target_id
+        # $session_id is the product-analytics session and is unrelated to $ai_session_id.
+        assert props["$session_id"] == "ph-session-1"
+        if ai_session_id is None:
+            assert "$ai_session_id" not in props
+        else:
+            assert props["$ai_session_id"] == ai_session_id
+
+    def test_session_verdict_carries_no_trace_id(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def _capture(**kwargs: Any) -> MagicMock:
+            captured.update(kwargs)
+            response = MagicMock()
+            response.raise_for_status.return_value = None
+            return response
+
+        with (
+            patch("posthog.temporal.ai_observability.team_capture.get_team_api_token", return_value="phc_test"),
+            patch("posthog.temporal.ai_observability.team_capture.capture_ai_internal", side_effect=_capture),
+        ):
+            async_to_sync(emit_trace_evaluation_event_activity)(
+                EmitTraceEvaluationEventInputs(
+                    evaluation={"id": "eval-1", "name": "n", "output_type": "boolean"},
+                    team_id=1,
+                    trace_id="trace-123",
+                    distinct_id="user-1",
+                    session_id=None,
+                    result={"verdict": True, "reasoning": "", "result_type": "boolean"},
+                    start_time=FROZEN_NOW,
+                    target="session",
+                    ai_session_id="session-abc",
+                )
+            )
+
+        props = captured["properties"]
+        assert "$ai_trace_id" not in props
+        assert props["$ai_session_id"] == "session-abc"
 
 
 class TestRunTraceEvaluationWorkflowInputs:

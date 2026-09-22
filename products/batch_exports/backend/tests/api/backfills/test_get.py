@@ -1,6 +1,7 @@
 import datetime as dt
 
 import pytest
+import time_machine
 
 from django.test.client import Client as HttpClient
 
@@ -160,7 +161,11 @@ def test_can_get_backfills_for_your_organizations(
 
     client.force_login(user)
 
-    backfill_data = get_batch_export_backfill_ok(client, team.pk, batch_export.id, backfill.id)
+    # Freeze time so that BatchExportBackfill.total_expected_runs (which uses datetime.now() for RUNNING backfills
+    # without end_at) yields deterministic results. TEST_TIME is captured at module import, and without this the
+    # asserted total_runs can drift as other tests in the same shard run before this one.
+    with time_machine.travel(TEST_TIME, tick=False):
+        backfill_data = get_batch_export_backfill_ok(client, team.pk, batch_export.id, backfill.id)
 
     # as long as the created_at and last_updated_at are strings, we don't care about their exact values
     created_at = backfill_data.pop("created_at")

@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -23,7 +17,10 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.fleetio.fleetio import (
+    DEFAULT_VERSION,
+    SUPPORTED_VERSIONS,
     FleetioResumeConfig,
     fleetio_source,
     validate_credentials as validate_fleetio_credentials,
@@ -40,9 +37,9 @@ from products.warehouse_sources.backend.types import ExternalDataSourceType
 
 @SourceRegistry.register
 class FleetioSource(ResumableSource[FleetioSourceConfig, FleetioResumeConfig]):
-    supported_versions = ("v1",)
-    default_version = "v1"
-    api_docs_url = "https://developer.fleetio.com"
+    supported_versions = SUPPORTED_VERSIONS
+    default_version = DEFAULT_VERSION
+    api_docs_url = "https://developer.fleetio.com/docs/overview/versioning"
 
     lists_tables_without_credentials = True  # static endpoint catalog — safe for public docs
 
@@ -61,7 +58,7 @@ class FleetioSource(ResumableSource[FleetioSourceConfig, FleetioResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.FLEETIO,
+            name=ExternalDataSourceType.FLEETIO,
             category=DataWarehouseSourceCategory.PRODUCTIVITY,
             label="Fleetio",
             releaseStatus=ReleaseStatus.ALPHA,
@@ -127,7 +124,7 @@ Create an API key under **Account Menu → Account Settings → API Keys** in Fl
         schema_name: Optional[str] = None,
         api_version: str | None = None,
     ) -> tuple[bool, str | None]:
-        if validate_fleetio_credentials(config.api_key, config.account_token):
+        if validate_fleetio_credentials(config.api_key, config.account_token, self.resolve_api_version(api_version)):
             return True, None
 
         return False, "Invalid Fleetio API key or account token"
@@ -147,6 +144,7 @@ Create an API key under **Account Menu → Account Settings → API Keys** in Fl
             endpoint=inputs.schema_name,
             team_id=inputs.team_id,
             job_id=inputs.job_id,
+            api_version=self.resolve_api_version(inputs.api_version),
             resumable_source_manager=resumable_source_manager,
             should_use_incremental_field=inputs.should_use_incremental_field,
             db_incremental_field_last_value=inputs.db_incremental_field_last_value

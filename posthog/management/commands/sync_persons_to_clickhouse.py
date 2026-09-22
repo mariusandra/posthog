@@ -79,7 +79,8 @@ def run_person_sync(team_id: int, live_run: bool, deletes: bool):
     # lookup what needs to be updated in ClickHouse and send kafka messages for only those
     with persons_db_connection(writer=False) as conn, conn.cursor() as cursor:
         cursor.execute(
-            "SELECT uuid, version, properties, is_identified, created_at FROM posthog_person WHERE team_id = %s",
+            "SELECT uuid, version, properties, is_identified, created_at FROM posthog_person"
+            " WHERE team_id = %s AND is_deleted = false",
             [team_id],
         )
         persons = [
@@ -137,8 +138,9 @@ def run_person_sync(team_id: int, live_run: bool, deletes: bool):
                         uuid=str(uuid),
                         team_id=team_id,
                         properties={},
-                        version=int(version or 0)
-                        + 100,  # keep in sync with deletePerson in plugin-server/src/utils/db/db.ts
+                        # Keep this tombstone version in sync with deletePerson in
+                        # nodejs/src/common/persons/repositories/postgres-person-repository.ts.
+                        version=int(version or 0) + 100,
                         is_deleted=True,
                     )
 
@@ -150,7 +152,7 @@ def run_distinct_id_sync(team_id: int, live_run: bool, deletes: bool):
         cursor.execute(
             "SELECT pdi.distinct_id, pdi.version, p.uuid "
             "FROM posthog_persondistinctid pdi JOIN posthog_person p ON p.id = pdi.person_id "
-            "WHERE pdi.team_id = %s",
+            "WHERE pdi.team_id = %s AND pdi.is_deleted = false AND p.is_deleted = false",
             [team_id],
         )
         person_distinct_ids = [

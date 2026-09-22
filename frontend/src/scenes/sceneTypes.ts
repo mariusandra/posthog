@@ -30,9 +30,9 @@ export enum Scene {
     Cohort = 'Cohort',
     CohortCalculationHistory = 'CohortCalculationHistory',
     Cohorts = 'Cohorts',
-    Comments = 'Comments',
     CustomCss = 'CustomCss',
     CustomerAnalytics = 'CustomerAnalytics',
+    CustomerAnalyticsAccount = 'CustomerAnalyticsAccount',
     CustomerAnalyticsConfiguration = 'CustomerAnalyticsConfiguration',
     CustomerJourneyBuilder = 'CustomerJourneyBuilder',
     Dashboard = 'Dashboard',
@@ -54,10 +54,11 @@ export enum Scene {
     Error404 = '404',
     ErrorAccessDenied = 'AccessDenied',
     ErrorNetwork = '4xx',
+    ErrorProjectAccessDenied = 'ProjectAccessDenied',
     ErrorProjectUnavailable = 'ProjectUnavailable',
     ErrorTracking = 'ErrorTracking',
+    ErrorTrackingFingerprint = 'ErrorTrackingFingerprint',
     ErrorTrackingIssue = 'ErrorTrackingIssue',
-    ErrorTrackingIssueFingerprints = 'ErrorTrackingIssueFingerprints',
     EventDefinition = 'EventDefinition',
     EventDefinitions = 'EventDefinitions',
     EventDefinitionEdit = 'EventDefinitionEdit',
@@ -68,6 +69,7 @@ export enum Scene {
     Subscription = 'Subscription',
     ExperimentsSharedMetric = 'ExperimentsSharedMetric',
     ExperimentsSharedMetrics = 'ExperimentsSharedMetrics',
+    ExperimentsStaffTools = 'ExperimentsStaffTools',
     ExploreEvents = 'ExploreEvents',
     ExploreSessions = 'ExploreSessions',
     FeatureFlag = 'FeatureFlag',
@@ -89,8 +91,11 @@ export enum Scene {
     IntegrationsLanding = 'IntegrationsLanding',
     StripeConfirmInstall = 'StripeConfirmInstall',
     IngestionWarnings = 'IngestionWarnings',
+    IdentityProviderConfig = 'IdentityProviderConfig',
     InviteSignup = 'InviteSignup',
     BusinessKnowledge = 'BusinessKnowledge',
+    BusinessKnowledgeSettings = 'BusinessKnowledgeSettings',
+    BusinessKnowledgeSource = 'BusinessKnowledgeSource',
     LegacyPlugin = 'LegacyPlugin',
     LegalDocuments = 'LegalDocuments',
     LegalDocumentNew = 'LegalDocumentNew',
@@ -103,6 +108,10 @@ export enum Scene {
     Login2FA = 'Login2FA',
     MaterializedColumns = 'MaterializedColumns',
     Max = 'Max',
+    McpGateway = 'McpGateway',
+    McpGatewayAgent = 'McpGatewayAgent',
+    McpGatewayMember = 'McpGatewayMember',
+    McpGatewayServer = 'McpGatewayServer',
     Models = 'Models',
     NodeDetail = 'NodeDetail',
     MoveToPostHogCloud = 'MoveToPostHogCloud',
@@ -133,8 +142,6 @@ export enum Scene {
     PropertyDefinition = 'PropertyDefinition',
     PropertyDefinitions = 'PropertyDefinitions',
     PropertyDefinitionEdit = 'PropertyDefinitionEdit',
-    QueryPerformance = 'QueryPerformance',
-    Quickstart = 'Quickstart',
     Replay = 'Replay',
     ReplayFilePlayback = 'ReplayFilePlayback',
     ReplayPlaylist = 'ReplayPlaylist',
@@ -145,10 +152,8 @@ export enum Scene {
     ReplayVisionScanner = 'ReplayVisionScanner',
     ReplayVisionScannerEditor = 'ReplayVisionScannerEditor',
     ReplayVisionObservation = 'ReplayVisionObservation',
-    ReplayVisionAction = 'ReplayVisionAction',
-    ReplayVisionActionEditor = 'ReplayVisionActionEditor',
-    ReplayVisionActionRun = 'ReplayVisionActionRun',
     ResourceTransfer = 'ResourceTransfer',
+    RealTimeUsage = 'RealTimeUsage',
     SqlVariableEdit = 'SqlVariableEdit',
     SQLEditor = 'SQLEditor',
     SavedInsights = 'SavedInsights',
@@ -157,8 +162,6 @@ export enum Scene {
     HealthAlerts = 'HealthAlerts',
     SdkHealth = 'SdkHealth',
     SessionAttributionExplorer = 'SessionAttributionExplorer',
-    SessionGroupSummariesTable = 'SessionGroupSummariesTable',
-    SessionGroupSummary = 'SessionGroupSummary',
     SessionSummaries = 'SessionSummaries',
     SessionProfile = 'SessionProfile',
     Settings = 'Settings',
@@ -169,6 +172,9 @@ export enum Scene {
     Coupons = 'Coupons',
     Sources = 'Sources',
     StartupProgram = 'StartupProgram',
+    Stamphog = 'Stamphog',
+    StamphogRuns = 'StamphogRuns',
+    StamphogDigests = 'StamphogDigests',
     Survey = 'Survey',
     SurveyWizard = 'SurveyWizard',
     SurveyFormBuilder = 'SurveyFormBuilder',
@@ -183,12 +189,16 @@ export enum Scene {
     Unsubscribe = 'Unsubscribe',
     CodeCanvasLink = 'CodeCanvasLink',
     CodeChannelLink = 'CodeChannelLink',
+    CodeTaskLink = 'CodeTaskLink',
+    CodeLoopLink = 'CodeLoopLink',
     UserInterview = 'UserInterview',
     UserInterviewResponse = 'UserInterviewResponse',
     UserInterviews = 'UserInterviews',
     VercelConnect = 'VercelConnect',
     VercelLinkError = 'VercelLinkError',
     VerifyEmail = 'VerifyEmail',
+    WarehouseDestinations = 'WarehouseDestinations',
+    WarehouseProperties = 'WarehouseProperties',
     WebAnalytics = 'WebAnalytics',
     WebAnalyticsPageReports = 'WebAnalyticsPageReports',
     WebAnalyticsWebVitals = 'WebAnalyticsWebVitals',
@@ -200,7 +210,6 @@ export enum Scene {
     Endpoint = 'Endpoint',
     Workflow = 'Workflow',
     Workflows = 'Workflows',
-    Wizard = 'Wizard',
     EarlyAccessFeature = 'EarlyAccessFeature',
     EndpointsScene = 'EndpointsScene',
     Game368Hedgehogs = 'Game368Hedgehogs',
@@ -211,6 +220,7 @@ export enum Scene {
     AIObservabilityDatasets = 'AIObservabilityDatasets',
     AIObservabilityEvaluation = 'AIObservabilityEvaluation',
     AIObservabilityEvaluations = 'AIObservabilityEvaluations',
+    AIObservabilityEvaluationTemplates = 'AIObservabilityEvaluationTemplates',
     AIObservabilityPlayground = 'AIObservabilityPlayground',
     AIObservabilityTag = 'AIObservabilityTag',
     AIObservabilityTags = 'AIObservabilityTags',
@@ -223,6 +233,8 @@ export enum Scene {
     LogsAlertNotificationDetail = 'LogsAlertNotificationDetail',
     LogsSamplingNew = 'LogsSamplingNew',
     LogsSamplingDetail = 'LogsSamplingDetail',
+    LogsRetentionNew = 'LogsRetentionNew',
+    LogsRetentionDetail = 'LogsRetentionDetail',
     ManagedMigration = 'ManagedMigration',
     ManagedMigrationNew = 'ManagedMigrationNew',
     MarketingAnalytics = 'MarketingAnalytics',
@@ -235,6 +247,8 @@ export enum Scene {
     OrganizationPendingDeletion = 'OrganizationPendingDeletion',
     ProjectPendingDeletion = 'ProjectPendingDeletion',
     CustomerJourneyTemplates = 'CustomerJourneyTemplates',
+    SupportTicketDetail = 'SupportTicketDetail',
+    SupportSettings = 'SupportSettings',
 }
 
 export type SceneComponent<T> = (props: T) => JSX.Element | null
@@ -300,6 +314,8 @@ export interface SceneConfig {
     name?: string
     /** Optional static description of the scene or product. Used both in the UI and by Max AI as context on what the scene is for */
     description?: string
+    /** Link to this product's page on posthog.com/docs. Shown next to the product in sidebar settings */
+    docsHref?: string
     /** Route should only be accessed when logged out (N.B. should be added to posthog/urls.py too) */
     onlyUnauthenticated?: boolean
     /** Route **can** be accessed when logged out (i.e. can be accessed when logged in too; should be added to posthog/urls.py too) */
@@ -372,9 +388,6 @@ export const sceneToAccessControlResourceType: Partial<Record<Scene, AccessContr
     [Scene.ReplayVisionScanner]: AccessControlResourceType.ReplayScanner,
     [Scene.ReplayVisionScannerEditor]: AccessControlResourceType.ReplayScanner,
     [Scene.ReplayVisionObservation]: AccessControlResourceType.ReplayScanner,
-    [Scene.ReplayVisionAction]: AccessControlResourceType.ReplayScanner,
-    [Scene.ReplayVisionActionEditor]: AccessControlResourceType.ReplayScanner,
-    [Scene.ReplayVisionActionRun]: AccessControlResourceType.ReplayScanner,
 
     // Toolbar
     [Scene.ToolbarLaunch]: AccessControlResourceType.Toolbar,
@@ -392,9 +405,23 @@ export const sceneToAccessControlResourceType: Partial<Record<Scene, AccessContr
     // Metrics
     [Scene.Metrics]: AccessControlResourceType.Metrics,
 
+    // Error tracking
+    [Scene.ErrorTracking]: AccessControlResourceType.ErrorTracking,
+    [Scene.ErrorTrackingFingerprint]: AccessControlResourceType.ErrorTracking,
+    [Scene.ErrorTrackingIssue]: AccessControlResourceType.ErrorTracking,
+
+    // Stamphog
+    [Scene.Stamphog]: AccessControlResourceType.Stamphog,
+    [Scene.StamphogRuns]: AccessControlResourceType.Stamphog,
+    [Scene.StamphogDigests]: AccessControlResourceType.Stamphog,
+
     // Surveys
     [Scene.Survey]: AccessControlResourceType.Survey,
     [Scene.Surveys]: AccessControlResourceType.Survey,
+
+    // Support (conversations)
+    [Scene.SupportTickets]: AccessControlResourceType.Ticket,
+    [Scene.SupportTicketDetail]: AccessControlResourceType.Ticket,
 
     // Endpoints
     [Scene.EndpointsScene]: AccessControlResourceType.Endpoint,
@@ -428,9 +455,10 @@ export const sceneToAccessControlResourceType: Partial<Record<Scene, AccessContr
     [Scene.AIObservabilityClusters]: AccessControlResourceType.AiObservabilityClusters,
     [Scene.AIObservabilityDataset]: AccessControlResourceType.LlmAnalytics,
     [Scene.AIObservabilityDatasets]: AccessControlResourceType.LlmAnalytics,
-    [Scene.AIObservabilityEvaluation]: AccessControlResourceType.LlmAnalytics,
-    [Scene.AIObservabilityEvaluations]: AccessControlResourceType.LlmAnalytics,
-    [Scene.AIObservabilityPlayground]: AccessControlResourceType.LlmAnalytics,
+    [Scene.AIObservabilityEvaluation]: AccessControlResourceType.Evaluation,
+    [Scene.AIObservabilityEvaluations]: AccessControlResourceType.Evaluation,
+    [Scene.AIObservabilityEvaluationTemplates]: AccessControlResourceType.Evaluation,
+    [Scene.AIObservabilityPlayground]: AccessControlResourceType.LlmPlayground,
     [Scene.AIObservabilityTag]: AccessControlResourceType.Tagger,
     [Scene.AIObservabilityTags]: AccessControlResourceType.Tagger,
     [Scene.AIObservabilityTrace]: AccessControlResourceType.LlmAnalytics,

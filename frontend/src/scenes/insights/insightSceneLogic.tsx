@@ -1,6 +1,7 @@
+import type { BreakPointFunction } from 'kea'
 import {
-    MakeLogicType,
     BuiltLogic,
+    MakeLogicType,
     actions,
     connect,
     kea,
@@ -10,7 +11,7 @@ import {
     selectors,
     sharedListeners,
 } from 'kea'
-import type { BreakPointFunction } from 'kea'
+import { combineUrl, router } from 'kea-router'
 import { objectsEqual } from 'kea-test-utils'
 import posthog from 'posthog-js'
 
@@ -21,10 +22,15 @@ import { tabAwareScene } from 'lib/logic/scenes/tabAwareScene'
 import { tabAwareUrlToAction } from 'lib/logic/scenes/tabAwareUrlToAction'
 import { InsightEventSource, eventUsageLogic } from 'lib/utils/eventUsageLogic'
 import { isEmptyObject, isObject } from 'lib/utils/guards'
-import { isDashboardFilterEmpty } from 'scenes/dashboard/dashboardFilterEmpty'
+import { isDashboardFilterOverrideEmpty } from 'scenes/dashboard/dashboardFilterEmpty'
 import { dashboardLogic } from 'scenes/dashboard/dashboardLogic'
-import { createEmptyInsight, insightLogic } from 'scenes/insights/insightLogic'
+import {
+    SEARCH_PARAM_FILTERS_KEY,
+    dashboardSearchParamsFromOverrides,
+    parseURLFilters,
+} from 'scenes/dashboard/dashboardUtils'
 import type { insightLogicType } from 'scenes/insights/insightLogic'
+import { createEmptyInsight, insightLogic } from 'scenes/insights/insightLogic'
 import { MaxContextInput, createMaxContextHelpers } from 'scenes/max/maxTypes'
 import { preflightLogic } from 'scenes/PreflightCheck/preflightLogic'
 import { sceneLogic } from 'scenes/sceneLogic'
@@ -72,8 +78,8 @@ import { PRODUCT_ANALYTICS_DEFAULT_QUERY_TAGS } from 'products/product_analytics
 import type { FeatureFlagsSet } from '../../lib/logic/featureFlagLogic'
 import type { QuerySchema } from '../../queries/schema/schema-general'
 import type { TeamPublicType, TeamType } from '../../types'
-import { insightDataLogic } from './insightDataLogic'
 import type { insightDataLogicType } from './insightDataLogic'
+import { insightDataLogic } from './insightDataLogic'
 import { getInsightIconTypeFromQuery, parseDraftQueryFromURL } from './utils'
 
 const NEW_INSIGHT = 'new' as const
@@ -83,17 +89,11 @@ export interface InsightSceneLogicProps {
     tabId?: string
 }
 
-function normalizeItemId(itemId: string | undefined): string | number | null {
-    if (itemId === undefined) {
+function normalizeItemId(itemId: string | undefined): number | null {
+    if (!itemId) {
         return null
     }
-    if (itemId === 'new' || itemId.startsWith('new-')) {
-        return 'new'
-    }
-    if (Number.isInteger(+itemId)) {
-        return parseInt(itemId, 10)
-    }
-    return itemId
+    return Number(itemId) || null
 }
 
 // Tag a new insight's query with the product_analytics productKey (on the executed source query) so
@@ -130,6 +130,7 @@ export interface insightSceneLogicValues {
     currentTeamId: number | null // teamLogic
     alertId: AlertType['id'] | null
     breadcrumbs: Breadcrumb[]
+    dashboardBackPath: string | null
     dashboardId: DashboardType['id'] | null
     dashboardName: DashboardType['name'] | null
     filtersOverride: DashboardFilter | null
@@ -160,12 +161,13 @@ export interface insightSceneLogicValues {
               props?: InsightLogicProps<QuerySchema> | undefined
           ) => Partial<QueryBasedInsightModel<Node<Record<string, any>>>>)
         | undefined
-    itemId: number | string | null
+    isNewSubscription: boolean
+    itemId: number | null
     maxContext: MaxContextInput[]
     projectTreeRef: ProjectTreeRef
     sceneSource: InsightSceneSource | null
     sidePanelContext: SidePanelSceneContext | null
-    tabId: any
+    tabId: string | undefined
     tileFiltersOverride: TileFilters | null
     variablesOverride: Record<string, HogQLVariable> | null
 }
@@ -244,7 +246,7 @@ export interface insightSceneLogicMeta {
         ) => void | Promise<void>
     }
     __keaTypeGenInternalSelectorTypes: {
-        tabId: (arg: string | undefined) => any
+        tabId: (arg: string | undefined) => string | undefined
         insightQuerySelector: (
             insightDataLogicRef: {
                 logic: BuiltLogic<insightDataLogicType>
@@ -277,6 +279,11 @@ export interface insightSceneLogicMeta {
         insight: (
             arg: Partial<QueryBasedInsightModel<Node<Record<string, any>>>> | null | undefined
         ) => Partial<QueryBasedInsightModel<Node<Record<string, any>>>> | null | undefined
+        dashboardBackPath: (
+            dashboardId: number | null,
+            variablesOverride: Record<string, HogQLVariable> | null,
+            searchParams: Record<string, any>
+        ) => string | null
         breadcrumbs: (
             insightLogicRef: {
                 logic: BuiltLogic<insightLogicType>
@@ -286,8 +293,9 @@ export interface insightSceneLogicMeta {
             insightQuery: Node<Record<string, any>> | null | undefined,
             dashboardId: number | null,
             dashboardName: string | null,
-            arg: string | undefined,
-            sceneSource: InsightSceneSource | null
+            sceneSource: InsightSceneSource | null,
+            dashboardBackPath: string | null,
+            arg: string | undefined
         ) => Breadcrumb[]
         projectTreeRef: (insightId: InsightId) => ProjectTreeRef
         sidePanelContext: (
@@ -391,9 +399,16 @@ export const insightSceneLogic = kea<insightSceneLogicType>([
             },
         ],
         itemId: [
-            null as null | string | number,
+            null as number | null,
             {
                 setSceneState: (_, { itemId }) => normalizeItemId(itemId),
+            },
+        ],
+        isNewSubscription: [
+            false,
+            {
+                setSceneState: (_, { insightMode, itemId }) =>
+                    insightMode === ItemMode.Subscriptions && itemId === 'new',
             },
         ],
         alertId: [
@@ -520,6 +535,27 @@ export const insightSceneLogic = kea<insightSceneLogicType>([
             ],
             (insight: Partial<QueryBasedInsightModel<Node<Record<string, any>>>> | null | undefined) => insight,
         ],
+        // The insight and the dashboard name the same overrides differently, so a link back to the dashboard
+        // has to translate them. Take the filters from the url instead of from `filtersOverride`, because an
+        // override that clears a saved dashboard filter reads as empty and normalizes to null on the way into
+        // scene state. The dashboard needs that explicit empty value, or it restores the saved filter.
+        dashboardBackPath: [
+            (s) => [s.dashboardId, s.variablesOverride, router.selectors.searchParams],
+            (
+                dashboardId: DashboardType['id'] | null,
+                variablesOverride: Record<string, HogQLVariable> | null,
+                searchParams: Record<string, any>
+            ): string | null =>
+                dashboardId === null
+                    ? null
+                    : combineUrl(
+                          urls.dashboard(dashboardId),
+                          dashboardSearchParamsFromOverrides(
+                              variablesOverride,
+                              parseURLFilters({ [SEARCH_PARAM_FILTERS_KEY]: searchParams['filters_override'] })
+                          )
+                      ).url,
+        ],
         breadcrumbs: [
             (s) => [
                 s.insightLogicRef,
@@ -527,8 +563,9 @@ export const insightSceneLogic = kea<insightSceneLogicType>([
                 s.insightQuery,
                 s.dashboardId,
                 s.dashboardName,
-                (_, props: InsightSceneLogicProps) => props.tabId,
                 s.sceneSource,
+                s.dashboardBackPath,
+                (state, props) => s.insightLogicRef(state, props)?.logic.selectors.insightName(state, props),
             ],
             (
                 insightLogicRef: {
@@ -539,8 +576,9 @@ export const insightSceneLogic = kea<insightSceneLogicType>([
                 insightQuery: Node<Record<string, any>> | null | undefined,
                 dashboardId: DashboardType['id'] | null,
                 dashboardName: DashboardType['name'] | null,
-                tabId: string | undefined,
-                sceneSource: InsightSceneSource | null
+                sceneSource: InsightSceneSource | null,
+                dashboardBackPath: string | null,
+                insightName: string | undefined
             ): Breadcrumb[] => {
                 const dashboardLabel = dashboardName ?? 'Dashboard'
                 return [
@@ -555,7 +593,8 @@ export const insightSceneLogic = kea<insightSceneLogicType>([
                               {
                                   key: Scene.Dashboard,
                                   name: dashboardLabel,
-                                  path: urls.dashboard(dashboardId),
+                                  // Going back must land on the dashboard as the user left it, not on its saved state
+                                  path: dashboardBackPath ?? urls.dashboard(dashboardId),
                                   iconType: 'dashboard' as FileSystemIconType,
                               },
                           ]
@@ -589,8 +628,8 @@ export const insightSceneLogic = kea<insightSceneLogicType>([
                                         },
                           ]),
                     {
-                        key: [Scene.Insight, insight?.short_id || `new-${tabId}`],
-                        name: insightLogicRef?.logic.values.insightName,
+                        key: [Scene.Insight, insight?.short_id || 'new'],
+                        name: insightName,
                         forceEditMode: insightLogicRef?.logic.values.canEditInsight,
                         iconType: getInsightIconTypeFromQuery(insightQuery),
                     },
@@ -657,9 +696,9 @@ export const insightSceneLogic = kea<insightSceneLogicType>([
                 variablesOverride: Record<string, HogQLVariable> | null,
                 tileFiltersOverride: TileFilters | null
             ) =>
-                !isDashboardFilterEmpty(filtersOverride) ||
+                !isDashboardFilterOverrideEmpty(filtersOverride) ||
                 (isObject(variablesOverride) && !isEmptyObject(variablesOverride)) ||
-                !isDashboardFilterEmpty(tileFiltersOverride),
+                !isDashboardFilterOverrideEmpty(tileFiltersOverride),
         ],
     }),
     sharedListeners(({ actions, values }) => ({
@@ -737,6 +776,13 @@ export const insightSceneLogic = kea<insightSceneLogicType>([
             }
         },
         upgradeQuery: async ({ query }) => {
+            // Capture the target insight before the await — a navigation while the upgrade request
+            // is in flight remounts insightLogicRef/insightDataLogicRef for the new insight, and
+            // applying the old URL's query to them would leak it onto the wrong insight.
+            const insightIdAtStart = values.insightId
+            const insightLogicRefAtStart = values.insightLogicRef
+            const insightDataLogicRefAtStart = values.insightDataLogicRef
+
             let upgradedQuery: Node | null = null
 
             if (!checkLatestVersionsOnQuery(query)) {
@@ -747,6 +793,14 @@ export const insightSceneLogic = kea<insightSceneLogicType>([
             }
 
             upgradedQuery = convertDataTableNodeToDataVisualizationNode(upgradedQuery)
+
+            if (
+                values.insightId !== insightIdAtStart ||
+                values.insightLogicRef !== insightLogicRefAtStart ||
+                values.insightDataLogicRef !== insightDataLogicRefAtStart
+            ) {
+                return
+            }
 
             if (values.insightId === 'new' || values.insightId?.startsWith('new-')) {
                 values.insightLogicRef?.logic.actions.setInsight(
@@ -761,7 +815,7 @@ export const insightSceneLogic = kea<insightSceneLogicType>([
                     }
                 )
             } else {
-                values.insightDataLogicRef?.logic.actions.setQuery(upgradedQuery)
+                values.insightDataLogicRef?.logic.actions.setQuery(upgradedQuery, true)
             }
         },
     })),
@@ -840,7 +894,7 @@ export const insightSceneLogic = kea<insightSceneLogicType>([
                 method === 'PUSH' ||
                 insightId !== values.insightId ||
                 insightMode !== values.insightMode ||
-                (itemId ?? null) !== values.itemId ||
+                normalizeItemId(itemId) !== values.itemId ||
                 (sceneSource ?? null) !== values.sceneSource ||
                 alertChanged ||
                 !objectsEqual(variablesOverride ?? null, values.variablesOverride) ||
@@ -855,9 +909,9 @@ export const insightSceneLogic = kea<insightSceneLogicType>([
                     itemId,
                     alert_id,
                     // Only pass filters/variables if overrides exist
-                    filtersOverride && isDashboardFilterEmpty(filtersOverride) ? undefined : filtersOverride,
+                    filtersOverride && isDashboardFilterOverrideEmpty(filtersOverride) ? undefined : filtersOverride,
                     variablesOverride && !isEmptyObject(variablesOverride) ? variablesOverride : undefined,
-                    tileFiltersOverride && isDashboardFilterEmpty(tileFiltersOverride)
+                    tileFiltersOverride && isDashboardFilterOverrideEmpty(tileFiltersOverride)
                         ? undefined
                         : tileFiltersOverride,
                     dashboard,
@@ -907,6 +961,15 @@ export const insightSceneLogic = kea<insightSceneLogicType>([
                     }
 
                     eventUsageLogic.actions.reportInsightStarted(query)
+                } else {
+                    // queryFromUrl can also come from the insightType hash param (above), so only
+                    // treat it as a shared link's query when q itself is present.
+                    const sharedQueryFromUrl = q ? queryFromUrl : null
+                    if (sharedQueryFromUrl) {
+                        // In-app navigation to a shared link — the saved insight loads fresh, so the
+                        // query the link carries has to be applied on top of it.
+                        actions.upgradeQuery(sharedQueryFromUrl)
+                    }
                 }
             }
         },

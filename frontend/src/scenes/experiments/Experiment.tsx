@@ -48,7 +48,7 @@ export function Experiment(props: ExperimentSceneLogicProps): JSX.Element {
         return <NotFound object="experiment" />
     }
 
-    const isCreateMode = formMode && ([FORM_MODES.create, FORM_MODES.duplicate] as string[]).includes(formMode)
+    const isCreateMode = formMode === FORM_MODES.create
 
     return (
         <BindLogic logic={experimentLogic} props={logicProps}>

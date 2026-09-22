@@ -11,20 +11,33 @@ import { apiMutator } from '../../../../frontend/src/lib/api-orval-mutator'
 import type {
     ActivityLogPaginatedResponseApi,
     ArchiveExperimentApi,
+    BulkUpdateTagsRequestApi,
+    BulkUpdateTagsResponseApi,
     CopyExperimentToProjectApi,
     CreateFromPromptInputApi,
     EndExperimentApi,
     ExperimentApi,
+    ExperimentFlagCleanupTargetApi,
     ExperimentFlagCleanupTaskApi,
     ExperimentHoldoutApi,
     ExperimentHoldoutsListParams,
+    ExperimentInSessionExposureApi,
+    ExperimentMatchingIdsResponseApi,
     ExperimentMetricsRecalculationApi,
     ExperimentSavedMetricApi,
     ExperimentSavedMetricsListParams,
+    ExperimentSessionBucketRequestApi,
+    ExperimentSessionBucketResponseApi,
     ExperimentSessionContextResponseApi,
+    ExperimentSessionContextsRequestApi,
+    ExperimentSessionContextsResponseApi,
+    ExperimentSessionEventDeltaResponseApi,
+    ExperimentSetupContextInputApi,
+    ExperimentSetupContextResponseApi,
     ExperimentWriteApi,
     ExperimentsActivityRetrieveParams,
     ExperimentsListParams,
+    ExperimentsMatchingIdsRetrieveParams,
     ExperimentsPromptTemplatesRetrieve200Item,
     ExperimentsSessionContextRetrieveParams,
     ExperimentsTimeseriesResultsRetrieveParams,
@@ -73,6 +86,9 @@ export const getExperimentHoldoutsListUrl = (projectId: string, params?: Experim
         : `/api/projects/${projectId}/experiment_holdouts/`
 }
 
+/**
+ * Create, read, update and delete experiment holdouts.
+ */
 export const experimentHoldoutsList = async (
     projectId: string,
     params?: ExperimentHoldoutsListParams,
@@ -88,6 +104,9 @@ export const getExperimentHoldoutsCreateUrl = (projectId: string) => {
     return `/api/projects/${projectId}/experiment_holdouts/`
 }
 
+/**
+ * Create, read, update and delete experiment holdouts.
+ */
 export const experimentHoldoutsCreate = async (
     projectId: string,
     experimentHoldoutApi: NonReadonly<ExperimentHoldoutApi>,
@@ -105,6 +124,9 @@ export const getExperimentHoldoutsRetrieveUrl = (projectId: string, id: number) 
     return `/api/projects/${projectId}/experiment_holdouts/${id}/`
 }
 
+/**
+ * Create, read, update and delete experiment holdouts.
+ */
 export const experimentHoldoutsRetrieve = async (
     projectId: string,
     id: number,
@@ -120,6 +142,9 @@ export const getExperimentHoldoutsUpdateUrl = (projectId: string, id: number) =>
     return `/api/projects/${projectId}/experiment_holdouts/${id}/`
 }
 
+/**
+ * Create, read, update and delete experiment holdouts.
+ */
 export const experimentHoldoutsUpdate = async (
     projectId: string,
     id: number,
@@ -138,6 +163,9 @@ export const getExperimentHoldoutsPartialUpdateUrl = (projectId: string, id: num
     return `/api/projects/${projectId}/experiment_holdouts/${id}/`
 }
 
+/**
+ * Create, read, update and delete experiment holdouts.
+ */
 export const experimentHoldoutsPartialUpdate = async (
     projectId: string,
     id: number,
@@ -156,6 +184,9 @@ export const getExperimentHoldoutsDestroyUrl = (projectId: string, id: number) =
     return `/api/projects/${projectId}/experiment_holdouts/${id}/`
 }
 
+/**
+ * Create, read, update and delete experiment holdouts.
+ */
 export const experimentHoldoutsDestroy = async (
     projectId: string,
     id: number,
@@ -428,9 +459,9 @@ export const getExperimentsActivityRetrieveUrl = (
 /**
  * Change history for this experiment.
  *
- * Returns a paginated audit trail of changes to the experiment and its holdouts
- * and shared metrics: who made each change, what changed (field-level before/after
- * values), and when. Ordered newest first.
+ * Returns a paginated audit trail of changes to the experiment, its holdouts and
+ * shared metrics, and its linked feature flag: who made each change, what changed
+ * (field-level before/after values), and when. Ordered newest first.
  */
 export const experimentsActivityRetrieve = async (
     projectId: string,
@@ -584,6 +615,29 @@ export const experimentsEndCreate = async (
     })
 }
 
+export const getExperimentsFlagCleanupTargetRetrieveUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/experiments/${id}/flag_cleanup_target/`
+}
+
+/**
+ * Repository a flag-cleanup pull request for this experiment would be opened in.
+ *
+ * Resolution order: the experiment's saved repository, else the environment's default
+ * cleanup repository, else the team's only connected GitHub repository. When the team
+ * has several repositories and none is saved (source=ambiguous), pass one via
+ * `repository` on end/ship_variant.
+ */
+export const experimentsFlagCleanupTargetRetrieve = async (
+    projectId: string,
+    id: number,
+    options?: RequestInit
+): Promise<ExperimentFlagCleanupTargetApi> => {
+    return apiMutator<ExperimentFlagCleanupTargetApi>(getExperimentsFlagCleanupTargetRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
 export const getExperimentsFlagCleanupTaskRetrieveUrl = (projectId: string, id: number) => {
     return `/api/projects/${projectId}/experiments/${id}/flag_cleanup_task/`
 }
@@ -632,6 +686,29 @@ export const experimentsFreezeExposureCreate = async (
     return apiMutator<ExperimentApi>(getExperimentsFreezeExposureCreateUrl(projectId, id), {
         ...options,
         method: 'POST',
+    })
+}
+
+export const getExperimentsInSessionExposureRetrieveUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/experiments/${id}/in_session_exposure/`
+}
+
+/**
+ * How the recordings tab's in-session exposure scope reads on this experiment.
+ *
+ * Resolved through the same seam as the recordings query's `in_session` refusal, so the
+ * scope control disables exactly what a query would be refused for, and the copy can say
+ * when sessions are matched on the stamped flag property rather than on the exposure event.
+ * Postgres reads only, so it can serve the tab's mount path.
+ */
+export const experimentsInSessionExposureRetrieve = async (
+    projectId: string,
+    id: number,
+    options?: RequestInit
+): Promise<ExperimentInSessionExposureApi> => {
+    return apiMutator<ExperimentInSessionExposureApi>(getExperimentsInSessionExposureRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
     })
 }
 
@@ -839,6 +916,72 @@ export const experimentsResumeCreate = async (
     })
 }
 
+export const getExperimentsSessionBucketsCreateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/experiments/${id}/session_buckets/`
+}
+
+/**
+ * Session recordings of this experiment matching a bucket.
+ *
+ * Answers the questions a recordings query can't express on its own — "fired any of these
+ * metrics", "fired none of them", "was exposed but never completed the funnel in this
+ * session" — by returning a bounded, most-recent-first list of session IDs to pass back as
+ * a recordings query's session_ids. POST because the metric list doesn't fit a query
+ * string; the endpoint only reads.
+ *
+ * Session-scoped and goal-free: the set describes what happened in each session, while the
+ * experiment analysis counts per person over the whole run window. A session can be in the
+ * drop-off bucket while the same person converts in a later one.
+ */
+export const experimentsSessionBucketsCreate = async (
+    projectId: string,
+    id: number,
+    experimentSessionBucketRequestApi: ExperimentSessionBucketRequestApi,
+    options?: RequestInit
+): Promise<ExperimentSessionBucketResponseApi> => {
+    return apiMutator<ExperimentSessionBucketResponseApi>(getExperimentsSessionBucketsCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(experimentSessionBucketRequestApi),
+    })
+}
+
+export const getExperimentsSessionEventDeltasCreateUrl = (projectId: string, id: number) => {
+    return `/api/projects/${projectId}/experiments/${id}/session_event_deltas/`
+}
+
+/**
+ * The recordings worth watching for this experiment, grouped into cards.
+ *
+ * Each card is one sentence and the recordings that back it: an event one variant did clearly
+ * more than the others, an error signal concentrated in one variant, or a shortcut to a
+ * metric event happening on screen. Every card's count is a count of recordings that actually
+ * exist, so handing its session ids to the recordings list can't come back empty. POST to
+ * take the same throttle and cache posture as the other reads in this family rather than
+ * because it carries a body: it takes no parameters, and it only reads.
+ *
+ * It reports no effect size. Cards carry a direction and a band rather than a rate, a ratio
+ * or a person count: the experiment's results already state magnitudes, computed per person
+ * over the whole run window, and this reads one session per person over a clamped one. Two
+ * numbers for the same event would read as a contradiction, so this surface states none. That
+ * is what lets a card sit on one of the experiment's own metric events, which it names, so a
+ * reader is sent to the results rather than given a second answer.
+ */
+export const experimentsSessionEventDeltasCreate = async (
+    projectId: string,
+    id: number,
+    options?: RequestInit
+): Promise<ExperimentSessionEventDeltaResponseApi> => {
+    return apiMutator<ExperimentSessionEventDeltaResponseApi>(
+        getExperimentsSessionEventDeltasCreateUrl(projectId, id),
+        {
+            ...options,
+            method: 'POST',
+        }
+    )
+}
+
 export const getExperimentsShipVariantCreateUrl = (projectId: string, id: number) => {
     return `/api/projects/${projectId}/experiments/${id}/ship_variant/`
 }
@@ -964,6 +1107,42 @@ export const experimentsUnfreezeExposureCreate = async (
     })
 }
 
+export const getExperimentsBulkUpdateTagsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/experiments/bulk_update_tags/`
+}
+
+/**
+ * Bulk update tags on multiple objects.
+ *
+ * PAT access: this action has no ``required_scopes=`` on the decorator —
+ * inheriting viewsets must add ``"bulk_update_tags"`` to their
+ * ``scope_object_write_actions`` list to accept personal API keys.
+ * Without that opt-in, ``APIScopePermission`` rejects PAT requests with
+ * "This action does not support personal API key access". Done per-viewset
+ * so granting ``<scope>:write`` for one resource doesn't leak access to
+ * sibling resources that share this mixin.
+ *
+ * Accepts:
+ * - {"ids": [...], "action": "add"|"remove"|"set", "tags": ["tag1", "tag2"]}
+ *
+ * Actions:
+ * - "add": Add tags to existing tags on each object
+ * - "remove": Remove specific tags from each object
+ * - "set": Replace all tags on each object with the provided list
+ */
+export const experimentsBulkUpdateTagsCreate = async (
+    projectId: string,
+    bulkUpdateTagsRequestApi: BulkUpdateTagsRequestApi,
+    options?: RequestInit
+): Promise<BulkUpdateTagsResponseApi> => {
+    return apiMutator<BulkUpdateTagsResponseApi>(getExperimentsBulkUpdateTagsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(bulkUpdateTagsRequestApi),
+    })
+}
+
 export const getExperimentsCalculateRunningTimeCreateUrl = (projectId: string) => {
     return `/api/projects/${projectId}/experiments/calculate_running_time/`
 }
@@ -1011,6 +1190,41 @@ export const experimentsCreateFromPromptCreate = async (
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...options?.headers },
         body: JSON.stringify(createFromPromptInputApi),
+    })
+}
+
+export const getExperimentsMatchingIdsRetrieveUrl = (
+    projectId: string,
+    params?: ExperimentsMatchingIdsRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/projects/${projectId}/experiments/matching_ids/?${stringifiedParams}`
+        : `/api/projects/${projectId}/experiments/matching_ids/`
+}
+
+/**
+ * Get IDs of all experiments matching the current list filters.
+ * Accepts the same query params as the list endpoint and returns only
+ * IDs of experiments the user has permission to edit.
+ */
+export const experimentsMatchingIdsRetrieve = async (
+    projectId: string,
+    params?: ExperimentsMatchingIdsRetrieveParams,
+    options?: RequestInit
+): Promise<ExperimentMatchingIdsResponseApi> => {
+    return apiMutator<ExperimentMatchingIdsResponseApi>(getExperimentsMatchingIdsRetrieveUrl(projectId, params), {
+        ...options,
+        method: 'GET',
     })
 }
 
@@ -1064,6 +1278,62 @@ export const experimentsSessionContextRetrieve = async (
     return apiMutator<ExperimentSessionContextResponseApi>(getExperimentsSessionContextRetrieveUrl(projectId, params), {
         ...options,
         method: 'GET',
+    })
+}
+
+export const getExperimentsSessionContextsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/experiments/session_contexts/`
+}
+
+/**
+ * Resolve experiment context for a batch of session recordings.
+ *
+ * Batch variant of `session_context`, used to prefetch the replay player's experiments
+ * box for a whole recordings list in one request. POST because the id list doesn't fit a
+ * query string; the endpoint only reads. Already-computed sessions are served from (and
+ * cold ones written to) the same short-lived per-viewer cache the single-session endpoint
+ * uses, so opening any prefetched recording renders its context instantly. Sessions whose
+ * recording metadata doesn't exist yet are omitted from the response, as are recordings
+ * the caller can't access and sessions beyond the batch's recording-day budget (each
+ * distinct recording day costs its own set of ClickHouse scans, so only the most recent
+ * days are computed per request).
+ */
+export const experimentsSessionContextsCreate = async (
+    projectId: string,
+    experimentSessionContextsRequestApi: ExperimentSessionContextsRequestApi,
+    options?: RequestInit
+): Promise<ExperimentSessionContextsResponseApi> => {
+    return apiMutator<ExperimentSessionContextsResponseApi>(getExperimentsSessionContextsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(experimentSessionContextsRequestApi),
+    })
+}
+
+export const getExperimentsSetupContextCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/experiments/setup_context/`
+}
+
+/**
+ * Facts about this project that decide how to configure a new experiment.
+ *
+ * Returns the team's experiment defaults, which SDKs call feature flags, traffic on a target
+ * surface, the baseline of a candidate metric, how recent experiments were set up, and the
+ * most reused shared metrics. Each section has its own status, so a slow or failed read
+ * leaves the others valid. POST because the inputs describe a plan rather than a resource;
+ * the endpoint only reads.
+ */
+export const experimentsSetupContextCreate = async (
+    projectId: string,
+    experimentSetupContextInputApi?: ExperimentSetupContextInputApi,
+    options?: RequestInit
+): Promise<ExperimentSetupContextResponseApi> => {
+    return apiMutator<ExperimentSetupContextResponseApi>(getExperimentsSetupContextCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(experimentSetupContextInputApi),
     })
 }
 

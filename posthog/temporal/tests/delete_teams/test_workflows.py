@@ -1,4 +1,5 @@
 import uuid
+import datetime as dt
 
 import pytest
 from unittest.mock import patch
@@ -34,7 +35,6 @@ WORKFLOWS = [DeleteTeamsDataWorkflow, DeleteProjectDataWorkflow, DeleteOrganizat
 CORE_ACTIVITY_ORDER = [
     "queue_recording_deletions_activity",
     "delete_misc_small_tables_activity",
-    "delete_personless_distinct_ids_activity",
     "delete_cohort_members_activity",
     "delete_groups_activity",
     "delete_team_persons_activity",
@@ -45,7 +45,9 @@ CORE_ACTIVITY_ORDER = [
 ]
 
 
-def _recording_activities(calls: list[str]) -> list:
+def _recording_activities(
+    calls: list[str], exclude: frozenset[str] = frozenset(), project_pending: bool = True
+) -> list:
     """Mock every delete_teams activity by name; each records its invocation order."""
 
     def _team_activity(name: str):
@@ -54,6 +56,15 @@ def _recording_activities(calls: list[str]) -> list:
             calls.append(name)
 
         return _fn
+
+    @activity.defn(name="deprovision_managed_warehouse_activity")
+    async def deprovision_managed_warehouse_activity(inputs: OrganizationRecordInputs) -> None:
+        calls.append("deprovision_managed_warehouse_activity")
+
+    @activity.defn(name="check_project_pending_deletion_activity")
+    async def check_project_pending_deletion_activity(inputs: ProjectRecordInputs) -> bool:
+        calls.append("check_project_pending_deletion_activity")
+        return project_pending
 
     @activity.defn(name="delete_project_record_activity")
     async def delete_project_record_activity(inputs: ProjectRecordInputs) -> None:
@@ -71,23 +82,26 @@ def _recording_activities(calls: list[str]) -> list:
     async def send_organization_deleted_email_activity(inputs: OrganizationEmailInputs) -> None:
         calls.append("send_organization_deleted_email_activity")
 
-    return [
+    mocks = [
         *[_team_activity(name) for name in CORE_ACTIVITY_ORDER],
+        deprovision_managed_warehouse_activity,
+        check_project_pending_deletion_activity,
         delete_project_record_activity,
         delete_organization_record_activity,
         send_project_deleted_email_activity,
         send_organization_deleted_email_activity,
     ]
+    return [fn for fn in mocks if fn.__name__ not in exclude]
 
 
-async def _run(workflow, inputs, calls: list[str]) -> None:
+async def _run(workflow, inputs, calls: list[str], project_pending: bool = True) -> None:
     task_queue = str(uuid.uuid4())
     async with await WorkflowEnvironment.start_time_skipping() as env:
         async with Worker(
             env.client,
             task_queue=task_queue,
             workflows=WORKFLOWS,
-            activities=_recording_activities(calls),
+            activities=_recording_activities(calls, project_pending=project_pending),
             workflow_runner=temporalio.worker.UnsandboxedWorkflowRunner(),
         ):
             await env.client.execute_workflow(
@@ -117,7 +131,23 @@ async def test_project_workflow_deletes_record_then_emails():
         DeleteProjectDataWorkflowInputs(team_ids=[1], project_id=42, user_id=7, project_name="proj"),
         calls,
     )
-    assert calls == [*CORE_ACTIVITY_ORDER, "delete_project_record_activity", "send_project_deleted_email_activity"]
+    assert calls == [
+        "check_project_pending_deletion_activity",
+        *CORE_ACTIVITY_ORDER,
+        "delete_project_record_activity",
+        "send_project_deleted_email_activity",
+    ]
+
+
+async def test_project_workflow_stops_when_project_is_not_pending_deletion():
+    calls: list[str] = []
+    await _run(
+        DeleteProjectDataWorkflow.run,
+        DeleteProjectDataWorkflowInputs(team_ids=[1], project_id=42, user_id=7, project_name="proj"),
+        calls,
+        project_pending=False,
+    )
+    assert calls == ["check_project_pending_deletion_activity"]
 
 
 async def test_environment_only_deletion_skips_project_record():
@@ -145,6 +175,7 @@ async def test_organization_workflow_deletes_record_then_emails():
         calls,
     )
     assert calls == [
+        "deprovision_managed_warehouse_activity",
         *CORE_ACTIVITY_ORDER,
         "delete_organization_record_activity",
         "send_organization_deleted_email_activity",
@@ -212,6 +243,52 @@ async def test_transient_error_is_retried():
     await _run_core_with(activities)  # completes despite the first failure
 
     assert len(attempts) == 2  # retried once, then succeeded
+
+
+async def test_warehouse_deprovision_failure_blocks_org_record_deletion():
+    # The rest of the org deletion is conditional on duckgres accepting the deprovision: the
+    # org-record cascade destroys the DuckgresServer pointer, so a persistent control-plane
+    # outage must stall the workflow (the activity keeps retrying) rather than orphan a live
+    # warehouse with no pointer left. The execution timeout is test-only, to bound the
+    # otherwise-indefinite retries.
+    attempts: list[str] = []
+    calls: list[str] = []
+
+    @activity.defn(name="deprovision_managed_warehouse_activity")
+    async def failing_deprovision(inputs: OrganizationRecordInputs) -> None:
+        attempts.append("attempt")
+        raise RuntimeError("duckgres control plane unavailable")
+
+    activities = [
+        *_recording_activities(calls, exclude=frozenset({"deprovision_managed_warehouse_activity"})),
+        failing_deprovision,
+    ]
+    task_queue = str(uuid.uuid4())
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        async with Worker(
+            env.client,
+            task_queue=task_queue,
+            workflows=WORKFLOWS,
+            activities=activities,
+            workflow_runner=temporalio.worker.UnsandboxedWorkflowRunner(),
+        ):
+            with pytest.raises(WorkflowFailureError):
+                await env.client.execute_workflow(
+                    DeleteOrganizationWorkflow.run,
+                    DeleteOrganizationWorkflowInputs(
+                        team_ids=[1],
+                        organization_id="11111111-1111-1111-1111-111111111111",
+                        user_id=7,
+                        organization_name="org",
+                        project_names=["a"],
+                    ),
+                    id=str(uuid.uuid4()),
+                    task_queue=task_queue,
+                    execution_timeout=dt.timedelta(hours=1),
+                )
+
+    assert len(attempts) > 1  # durably retried until the test-only execution timeout
+    assert calls == []  # nothing else ran — the pointer-destroying cascade never started
 
 
 async def test_recording_deletion_failure_does_not_block_workflow():

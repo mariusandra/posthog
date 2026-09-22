@@ -9,8 +9,8 @@ import { LemonSkeleton } from 'lib/lemon-ui/LemonSkeleton'
 import { LemonTable } from 'lib/lemon-ui/LemonTable'
 import { ProfilePicture } from 'lib/lemon-ui/ProfilePicture'
 import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { useAttachedLogic } from 'lib/logic/scenes/useAttachedLogic'
 import { humanFriendlyDuration } from 'lib/utils/durations'
-import { asDisplay } from 'scenes/persons/person-utils'
 import { ActivityScoreLabel } from 'scenes/session-recordings/components/RecordingRow'
 import { sessionRecordingsPlaylistLogic } from 'scenes/session-recordings/playlist/sessionRecordingsPlaylistLogic'
 import { teamLogic } from 'scenes/teamLogic'
@@ -20,6 +20,8 @@ import { webAnalyticsLogic } from 'scenes/web-analytics/webAnalyticsLogic'
 
 import { ProductIntentContext, ProductKey } from '~/queries/schema/schema-general'
 import { SessionRecordingType } from '~/types'
+
+import { asDisplay } from 'products/persons/frontend/person-utils'
 
 export function WebAnalyticsRecordingsTile({ tile }: { tile: ReplayTile }): JSX.Element {
     const { layout } = tile
@@ -33,6 +35,7 @@ export function WebAnalyticsRecordingsTile({ tile }: { tile: ReplayTile }): JSX.
         logicKey: 'webAnalytics',
         filters: replayFilters,
     })
+    useAttachedLogic(sessionRecordingsListLogicInstance, webAnalyticsLogic)
 
     const { sessionRecordings, sessionRecordingsResponseLoading } = useValues(sessionRecordingsListLogicInstance)
     const items = sessionRecordings.slice(0, 5)

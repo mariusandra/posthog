@@ -1,7 +1,3 @@
-// Side-effect: registers the CDP hog-function approval-card previews (cdp-functions-partial-update diff)
-// into the shared PostHog AI tool registry. Imported here so it's registered whenever the config scene loads.
-import './registerHogFunctionToolPreviews'
-
 import clsx from 'clsx'
 import { BindLogic, useActions, useValues } from 'kea'
 import { Form } from 'kea-forms'
@@ -201,12 +197,16 @@ export function HogFunctionConfiguration({
                                             disabled={loading}
                                             bordered
                                             fullWidth
-                                            label="Enable destination"
+                                            label={type === 'transformation_log' ? 'Enable' : 'Enable destination'}
                                             tooltip={
                                                 <>
-                                                    {value
-                                                        ? 'Enabled. Events will be processed.'
-                                                        : 'Disabled. Events will not be processed.'}
+                                                    {type === 'transformation_log'
+                                                        ? value
+                                                            ? 'Enabled. Log records will be processed.'
+                                                            : 'Disabled. Log records will not be processed.'
+                                                        : value
+                                                          ? 'Enabled. Events will be processed.'
+                                                          : 'Disabled. Events will not be processed.'}
                                                 </>
                                             }
                                         />
@@ -226,9 +226,19 @@ export function HogFunctionConfiguration({
                             {mightDropEvents && (
                                 <div>
                                     <LemonBanner type="info">
-                                        <b>Warning:</b> This transformation can filter out events, dropping them
-                                        irreversibly. Make sure to double check your configuration, and use filters to
-                                        limit the events that this transformation is applied to.
+                                        {type === 'transformation_log' ? (
+                                            <>
+                                                <b>Warning:</b> This transformation can drop log records irreversibly
+                                                (any record it returns null for is discarded). Double check your code
+                                                before enabling.
+                                            </>
+                                        ) : (
+                                            <>
+                                                <b>Warning:</b> This transformation can filter out events, dropping them
+                                                irreversibly. Make sure to double check your configuration, and use
+                                                filters to limit the events that this transformation is applied to.
+                                            </>
+                                        )}
                                     </LemonBanner>
                                 </div>
                             )}

@@ -1,9 +1,9 @@
 """GitHub event matching and firing for Loops.
 
-The entry point is ``handle_github_event_for_loops``, registered as a handler in the
-GitHub App webhook fan-out (``posthog.urls.github_webhook``) for the ``pull_request``,
-``issues``, ``issue_comment`` and ``push`` events. Called after signature verification
-and JSON parsing, alongside the other webhook consumers.
+The entry point is ``handle_github_event_for_loops``, registered by
+``products/tasks/backend/webhook_consumers.py`` as the ``loops`` consumer on the GitHub App
+endpoint for the ``pull_request``, ``issues``, ``issue_comment`` and ``push`` events. Called
+after signature verification and JSON parsing, alongside the other consumers.
 """
 
 import time
@@ -13,6 +13,7 @@ import structlog
 from prometheus_client import Counter
 
 from posthog.exceptions_capture import capture_exception
+from posthog.ingress.dispatch.database import bounded_statement_timeout, is_statement_timeout
 from posthog.models.integration import Integration
 from posthog.redis import get_client
 
@@ -29,6 +30,12 @@ _SELF_TRIGGER_BRANCH_PREFIX = "loop/"
 # would otherwise write. Sized well above a busy repo's real event volume.
 _EVENT_THROTTLE_LIMIT = 300
 _EVENT_THROTTLE_WINDOW_SECONDS = 300
+
+# Cap the matching lookups. This consumer runs inside the fan-out's shared per-delivery budget,
+# which cannot interrupt a query already in flight, so a slow lookup costs every other consumer
+# on the delivery too. Bounding it degrades to a missed match instead. Same cap as the GitHub
+# attribution lookup in posthog/github/attribution.py.
+_MATCH_STATEMENT_TIMEOUT_MS = 800
 
 LoopGithubEventOutcome = Literal["matched", "deduped", "skipped", "throttled", "fired", "error"]
 
@@ -85,11 +92,24 @@ def handle_github_event_for_loops(event_type: str, payload: dict[str, Any], deli
     action = payload.get("action")
     summary = _build_event_summary(event_type, payload)
 
-    matched = 0
-    for integration in Integration.objects.filter(kind="github", integration_id=installation_id):
-        matched += _match_and_fire_for_integration(
-            integration, repository_full_name, event_type, action, payload, delivery_id, summary
+    try:
+        triggers = _matching_triggers(installation_id, repository_full_name, event_type, action, payload, delivery_id)
+    except Exception as e:
+        if not is_statement_timeout(e):
+            raise
+        logger.warning(
+            "loop_github_event_match_timed_out",
+            event_type=event_type,
+            delivery_id=delivery_id,
+            repository=repository_full_name,
         )
+        _observe_github_event("skipped")
+        return
+
+    # Outside the cap on purpose: firing writes rows and dispatches a run, and the cap is there to
+    # bound the lookups a delivery waits on, not the work it decided to do.
+    for trigger in triggers:
+        _fire_matched_trigger(trigger, delivery_id, summary)
 
     logger.info(
         "loop_github_event_matched",
@@ -97,52 +117,89 @@ def handle_github_event_for_loops(event_type: str, payload: dict[str, Any], deli
         action=action,
         delivery_id=delivery_id,
         repository=repository_full_name,
-        matched_triggers=matched,
+        matched_triggers=len(triggers),
     )
 
 
-def _match_and_fire_for_integration(
+def _matching_triggers(
+    installation_id: str,
+    repository_full_name: str,
+    event_type: str,
+    action: str | None,
+    payload: dict[str, Any],
+    delivery_id: str,
+) -> list[LoopTrigger]:
+    """Collect the triggers every team on this installation matches.
+
+    Only the installation lookup is capped here. Each team's trigger lookup carries its own cap,
+    so a cancelled statement for one team leaves the matches the other teams already produced.
+    """
+    with bounded_statement_timeout(_MATCH_STATEMENT_TIMEOUT_MS, models=[Integration]):
+        integrations = list(Integration.objects.filter(kind="github", integration_id=installation_id))
+
+    triggers: list[LoopTrigger] = []
+    for integration in integrations:
+        triggers.extend(
+            _matching_triggers_for_integration(
+                integration, repository_full_name, event_type, action, payload, delivery_id
+            )
+        )
+    return triggers
+
+
+def _matching_triggers_for_integration(
     integration: Integration,
     repository_full_name: str,
     event_type: str,
     action: str | None,
     payload: dict[str, Any],
     delivery_id: str,
-    summary: dict[str, Any],
-) -> int:
-    """Match and fire triggers for one team's integration, isolated from other teams.
+) -> list[LoopTrigger]:
+    """Match triggers for one team's integration, isolated from other teams.
 
     A lookup failure for one team (e.g. a stale team reference) must not stop the
     same delivery from firing loops for every other team sharing the installation.
+
+    The cap sits on this query rather than around the whole match, because a cancelled statement
+    aborts the transaction it was installed in. One transaction per team keeps that abort local.
     """
     try:
-        triggers = (
-            LoopTrigger.objects.for_team(integration.team_id)
-            .filter(
-                type=LoopTrigger.TriggerType.GITHUB,
-                enabled=True,
-                loop__enabled=True,
-                loop__deleted=False,
-                github_integration_id=integration.id,
-                repository__iexact=repository_full_name,
-                event_types__contains=[event_type],
+        with bounded_statement_timeout(_MATCH_STATEMENT_TIMEOUT_MS, models=[LoopTrigger]):
+            triggers = list(
+                LoopTrigger.objects.for_team(integration.team_id)
+                .filter(
+                    type=LoopTrigger.TriggerType.GITHUB,
+                    enabled=True,
+                    loop__enabled=True,
+                    loop__deleted=False,
+                    github_integration_id=integration.id,
+                    repository__iexact=repository_full_name,
+                    event_types__contains=[event_type],
+                )
+                .select_related("loop")
             )
-            .select_related("loop")
-        )
     except Exception as e:
+        if is_statement_timeout(e):
+            logger.warning(
+                "loop_github_events_trigger_lookup_timed_out",
+                integration_id=integration.id,
+                team_id=integration.team_id,
+                delivery_id=delivery_id,
+            )
+            _observe_github_event("skipped")
+            return []
         logger.exception("loop_github_event_team_lookup_failed", team_id=integration.team_id, delivery_id=delivery_id)
         capture_exception(e)
         _observe_github_event("error")
-        return 0
+        return []
 
-    matched = 0
+    matched: list[LoopTrigger] = []
     for trigger in triggers:
         if not _trigger_filters_match(trigger, action, payload):
             continue
 
-        matched += 1
+        matched.append(trigger)
         _observe_github_event("matched")
-        _fire_matched_trigger(trigger, delivery_id, summary)
 
     return matched
 
@@ -246,6 +303,10 @@ def _filters_match(filters: dict[str, Any], action: str | None, payload: dict[st
     if allowed_labels and not _labels_match(allowed_labels, payload):
         return False
 
+    payload_conditions = filters.get("payload")
+    if payload_conditions and not _payload_matches(payload_conditions, payload):
+        return False
+
     return True
 
 
@@ -280,6 +341,42 @@ def _labels_match(allowed_labels: list[Any], payload: dict[str, Any]) -> bool:
     return bool(_event_labels(payload).intersection(allowed_labels))
 
 
+def _resolve_payload_path(payload: dict[str, Any], path: str) -> Any:
+    """Walk a dot-path through nested objects. Objects only: a segment landing on a list or a
+    scalar resolves to nothing, so `pull_request.labels.0.name` never matches — that is what the
+    `labels` filter is for."""
+    current: Any = payload
+    for segment in path.split("."):
+        if not isinstance(current, dict) or segment not in current:
+            return None
+        current = current[segment]
+    return current
+
+
+def _payload_leaf_as_string(value: Any) -> str | None:
+    # bool before int: `isinstance(True, int)` is True, and "true" is what an author writes.
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int | float):
+        return str(value)
+    return None
+
+
+def _payload_matches(conditions: list[Any], payload: dict[str, Any]) -> bool:
+    """Every condition's dot-path must resolve to a scalar whose string form is one of its
+    expected values (AND across conditions, OR within one), matching how `actions`/`branches`/
+    `labels` combine. Values arrive normalized to lists of strings from the trigger serializer."""
+    for condition in conditions:
+        if not isinstance(condition, dict):
+            return False
+        leaf = _payload_leaf_as_string(_resolve_payload_path(payload, str(condition.get("path", ""))))
+        if leaf is None or leaf not in (condition.get("equals") or []):
+            return False
+    return True
+
+
 def _excerpt(text: Any, limit: int = _EXCERPT_LIMIT) -> str | None:
     if not isinstance(text, str):
         return None
@@ -311,6 +408,17 @@ def _build_event_summary(event_type: str, payload: dict[str, Any]) -> dict[str, 
             "head_ref": (pull_request.get("head") or {}).get("ref"),
             "base_ref": (pull_request.get("base") or {}).get("ref"),
         }
+
+    # A loop can gate on "my team was asked to review", so the run needs to know which team.
+    # Unlike the commit messages dropped below, a team slug and a reviewer login are
+    # org-controlled identifiers rather than text an external contributor can author.
+    requested_team = payload.get("requested_team")
+    if isinstance(requested_team, dict):
+        summary["requested_team"] = {"slug": requested_team.get("slug"), "name": requested_team.get("name")}
+
+    requested_reviewer = payload.get("requested_reviewer")
+    if isinstance(requested_reviewer, dict):
+        summary["requested_reviewer"] = {"login": requested_reviewer.get("login")}
 
     issue = payload.get("issue")
     if isinstance(issue, dict):

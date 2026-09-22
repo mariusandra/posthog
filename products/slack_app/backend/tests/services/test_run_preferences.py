@@ -1,0 +1,248 @@
+from dataclasses import dataclass
+
+import pytest
+from unittest.mock import patch
+
+from products.slack_app.backend.services import run_preferences
+from products.slack_app.backend.services.model_catalogue import (
+    ModelChoice,
+    available_model_choices,
+    describe_run_model,
+    display_name_for_model,
+)
+from products.slack_app.backend.services.run_preferences import (
+    SLACK_DEFAULT_MODEL,
+    LiveRunModelChange,
+    resolve_live_run_override,
+    resolve_run_preferences,
+)
+from products.slack_app.backend.services.slack_settings import AIPreferences
+
+# Real model ids: the resolver validates efforts against the tasks catalogue (the
+# authority on what a model accepts), not against these tuples, so inventing ids here
+# would make the fixture lie.
+CATALOGUE = (
+    ModelChoice("claude", "claude-sonnet-4-6", "Claude Sonnet 4.6", ("low", "medium", "high")),
+    ModelChoice("claude", "claude-fable-5", "Claude Fable 5", ("low", "medium", "high", "xhigh", "max")),
+    ModelChoice("claude", "moonshotai/kimi-k3", "Moonshotai Kimi K3", ()),
+    ModelChoice("codex", "gpt-5.6-sol", "gpt-5.6-sol", ("low", "medium", "high", "xhigh", "max")),
+)
+
+
+@pytest.fixture
+def catalogue():
+    with patch.object(run_preferences, "available_model_choices", return_value=CATALOGUE):
+        yield
+
+
+@dataclass
+class _Override:
+    """Stands in for the Temporal payload the activity returns."""
+
+    model: str | None = None
+    reasoning_effort: str | None = None
+
+
+def _resolve(override_model=None, override_effort=None, central_default=None):
+    """Resolve with the central default stubbed, so these stay unit tests over the
+    precedence rules rather than over the rows behind them."""
+    with patch.object(run_preferences, "_central_run_default", return_value=central_default):
+        return resolve_run_preferences(
+            override=_Override(model=override_model, reasoning_effort=override_effort),
+            # Any ids will do — the lookup they feed is stubbed; passing team_id is what
+            # opts the central-default rung into the chain at all.
+            team_id=1,
+            user_id=7,
+        )
+
+
+CENTRAL = AIPreferences(runtime_adapter="claude", model="claude-fable-5", reasoning_effort=None)
+
+
+class TestResolveRunPreferences:
+    @pytest.mark.parametrize(
+        "override_model,override_effort,expected",
+        [
+            # A model named in the mention wins outright, over central and floor alike.
+            ("claude-fable-5", "high", AIPreferences("claude", "claude-fable-5", "high")),
+            # Crossing runtimes derives the adapter from the model, never from the request.
+            ("gpt-5.6-sol", None, AIPreferences("codex", "gpt-5.6-sol", None)),
+            ("CLAUDE-Fable-5", None, AIPreferences("claude", "claude-fable-5", None)),
+            # Nothing on offer matches, so the run keeps deferring to the central default.
+            ("gemini-3-pro", None, AIPreferences(None, None, None)),
+            (None, None, AIPreferences(None, None, None)),
+            # `xhigh` is real for Fable but not for Sonnet 4.6, so it is dropped.
+            ("claude-sonnet-4-6", "xhigh", AIPreferences("claude", "claude-sonnet-4-6", None)),
+            # A model that exposes no effort setting at all takes none.
+            ("moonshotai/kimi-k3", "high", AIPreferences("claude", "moonshotai/kimi-k3", None)),
+        ],
+    )
+    def test_mention_override_precedence_over_a_central_default(
+        self, catalogue, override_model, override_effort, expected
+    ):
+        assert _resolve(override_model, override_effort, central_default=CENTRAL) == expected
+
+    def test_falls_back_to_the_slack_default_when_nothing_is_configured(self, catalogue):
+        """A user with no preference anywhere must still get a pinned model, not
+        whatever the agent server would otherwise choose."""
+        assert _resolve() == AIPreferences("claude", SLACK_DEFAULT_MODEL, None)
+
+    def test_override_applies_on_top_of_the_floor(self, catalogue):
+        resolved = _resolve(override_model="claude-fable-5")
+        assert resolved == AIPreferences("claude", "claude-fable-5", None)
+
+    # The floor pinning a model unconditionally is what put the project and user
+    # defaults out of reach from Slack, and it fails silently — the run still works,
+    # just never on the configured model. This locks the deferral in.
+    def test_a_central_default_leaves_the_triple_empty_for_downstream_resolution(self, catalogue):
+        assert _resolve(central_default=CENTRAL) == AIPreferences(None, None, None)
+
+    # An effort named on its own has no model to be validated against while the run is
+    # deferring, so without the deferred default it is silently dropped and the mention
+    # does nothing at all.
+    @pytest.mark.parametrize(
+        "deferred_model,override_effort,expected",
+        [
+            ("claude-fable-5", "xhigh", AIPreferences("claude", "claude-fable-5", "xhigh")),
+            # Sonnet 4.6 takes no `xhigh`, so the ask is impossible and the run keeps
+            # deferring rather than pinning a default it was never asked to pin.
+            ("claude-sonnet-4-6", "xhigh", AIPreferences(None, None, None)),
+        ],
+    )
+    def test_an_effort_only_mention_resolves_against_the_central_default(
+        self, catalogue, deferred_model, override_effort, expected
+    ):
+        central = AIPreferences(runtime_adapter="claude", model=deferred_model, reasoning_effort=None)
+        resolved = _resolve(override_effort=override_effort, central_default=central)
+        assert resolved == expected
+
+
+class TestResolveLiveRunOverride:
+    """A run already in flight can only move within the runtime its sandbox started on."""
+
+    RUNNING = {"runtime_adapter": "claude", "model": "claude-sonnet-4-6", "reasoning_effort": "medium"}
+
+    @pytest.mark.parametrize(
+        "override_model,override_effort,expected",
+        [
+            # The everyday ask: a different model on the same runtime.
+            ("claude-fable-5", None, LiveRunModelChange(model="claude-fable-5")),
+            (None, "high", LiveRunModelChange(reasoning_effort="high")),
+            ("claude-fable-5", "xhigh", LiveRunModelChange(model="claude-fable-5", reasoning_effort="xhigh")),
+            # The harness is the process the sandbox launched with, so a Codex model is
+            # refused outright — effort included, since it was one request.
+            ("gpt-5.6-sol", "high", LiveRunModelChange(refused_model="gpt-5.6-sol")),
+            # Asking for what the run is already on changes nothing.
+            ("claude-sonnet-4-6", "medium", LiveRunModelChange()),
+            # `xhigh` is real for Fable but not for Sonnet 4.6, so it is dropped rather
+            # than sent to an agent that would reject it.
+            (None, "xhigh", LiveRunModelChange()),
+            (None, None, LiveRunModelChange()),
+        ],
+    )
+    def test_only_sends_what_the_run_can_take(self, catalogue, override_model, override_effort, expected):
+        assert (
+            resolve_live_run_override(_Override(model=override_model, reasoning_effort=override_effort), **self.RUNNING)
+            == expected
+        )
+
+    def test_derives_the_runtime_from_the_model_when_the_run_never_recorded_one(self, catalogue):
+        """Runs started before models were pinned carry no adapter; the model still places them."""
+        change = resolve_live_run_override(
+            _Override(model="gpt-5.6-sol"),
+            runtime_adapter=None,
+            model="claude-sonnet-4-6",
+            reasoning_effort=None,
+        )
+        assert change == LiveRunModelChange(refused_model="gpt-5.6-sol")
+
+    def test_refuses_to_place_a_run_it_cannot_identify(self, catalogue):
+        """With neither adapter nor model there is nothing to check a request against,
+        and guessing the harness would hand the agent a model it can't load."""
+        change = resolve_live_run_override(
+            _Override(model="claude-fable-5"), runtime_adapter=None, model=None, reasoning_effort=None
+        )
+        assert change == LiveRunModelChange(refused_model="claude-fable-5")
+
+    def test_ignores_a_model_the_catalogue_does_not_offer(self, catalogue):
+        assert resolve_live_run_override(_Override(model="gemini-3-pro"), **self.RUNNING).is_empty
+
+
+class TestDescribeRunModel:
+    @pytest.mark.parametrize(
+        "model,reasoning_effort,expected",
+        [
+            ("claude-fable-5", "high", "*Claude Fable 5* [High]"),
+            ("claude-fable-5", None, "*Claude Fable 5*"),
+            ("claude-opus-5", "ultracode", "*Claude Opus 5* [Ultracode]"),
+        ],
+    )
+    def test_renders_the_shared_phrasing(self, model, reasoning_effort, expected):
+        assert describe_run_model(model, reasoning_effort) == expected
+
+
+class TestFormatModelId:
+    @pytest.mark.parametrize(
+        "model_id,expected",
+        [
+            ("claude-opus-5", "Claude Opus 5"),
+            # A dashed version survives the split as one component.
+            ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+            # Vendor initialisms keep their casing and stay glued to the version, so
+            # the picker reads "GPT-5.6 Sol" rather than "Gpt 5.6 Sol".
+            ("gpt-5.2", "GPT-5.2"),
+            ("gpt-5.6-sol", "GPT-5.6 Sol"),
+            ("gpt-5.3-codex", "GPT-5.3 Codex"),
+            ("gpt-5-mini", "GPT-5 Mini"),
+            # A provider-prefixed id drops the prefix before naming.
+            ("openai/gpt-5.5", "GPT-5.5"),
+            # A vendor-served id derives badly, so the catalog names it and that name wins.
+            ("@cf/zai-org/glm-5.2", "GLM-5.2"),
+        ],
+    )
+    def test_names_every_family_without_a_lookup_table(self, model_id, expected):
+        assert display_name_for_model(model_id) == expected
+
+
+class TestAvailableModelChoices:
+    def test_reads_the_catalog_rather_than_the_gateway(self):
+        """Slack asks only what the catalog answers, so a gateway outage must not leave a
+        mention with nothing to match its model against."""
+        # Fails the call rather than emptying it: returning `()` would pass whether or not
+        # Slack still reaches the gateway, which is the whole claim under test.
+        with patch(
+            "products.tasks.backend.logic.services.model_catalogue.list_gateway_models",
+            side_effect=AssertionError("Slack must not reach the gateway for its model list"),
+        ):
+            choices = available_model_choices()
+
+        models = {c.model for c in choices}
+        assert {"claude-sonnet-5", "gpt-5.6-sol", "zai-org/glm-5.3"} <= models
+        assert all(c.label and c.runtime_adapter for c in choices)
+
+
+class TestCentralRunDefault:
+    def _resolved(self, **kwargs):
+        from products.tasks.backend.facade.ai_run_defaults import ResolvedAIRunConfig
+
+        return ResolvedAIRunConfig(**kwargs)
+
+    def test_an_acp_default_is_carried_through(self):
+        resolved = self._resolved(runtime="acp", runtime_adapter="claude", model="claude-fable-5", source="team")
+        with patch(
+            "products.tasks.backend.facade.ai_run_defaults.resolve_ai_run_defaults",
+            return_value=resolved,
+        ):
+            assert run_preferences._central_run_default(team_id=1, user_id=7) is resolved
+
+    @pytest.mark.parametrize(
+        "runtime, model",
+        [("pi", "gpt-5.6-terra"), ("acp", None)],
+        ids=["a_pi_default_slack_cannot_run", "a_default_with_no_model"],
+    )
+    def test_a_default_slack_cannot_use_falls_back_to_its_own_floor(self, runtime, model):
+        with patch(
+            "products.tasks.backend.facade.ai_run_defaults.resolve_ai_run_defaults",
+            return_value=self._resolved(runtime=runtime, runtime_adapter=None, model=model, source="user"),
+        ):
+            assert run_preferences._central_run_default(team_id=1, user_id=7) is None

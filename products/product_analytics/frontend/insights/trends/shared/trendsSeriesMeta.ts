@@ -1,11 +1,14 @@
 import type { SeriesDatum } from 'scenes/insights/InsightTooltip/insightTooltipUtils'
-import type { IndexedTrendResult } from 'scenes/trends/types'
 
 import type { Noun } from '~/models/groupsModel'
 import type { ActionFilter } from '~/types'
 
+import type { IndexedTrendResult } from 'products/product_analytics/frontend/insights/trends/types'
+
 export type TrendsSeriesMeta = {
     action?: ActionFilter
+    /** Series name for results without an `action` — formula results carry their formula label here. */
+    series_name?: string
     breakdown_value?: string | number | string[]
     compare_label?: SeriesDatum['compare_label']
     days?: string[]
@@ -15,6 +18,9 @@ export type TrendsSeriesMeta = {
 
 export const buildTrendsSeriesMeta = (r: IndexedTrendResult): TrendsSeriesMeta => ({
     action: r.action ?? undefined,
+    // Formula results have no `action`; their raw label (custom name or "Formula (…)") is the
+    // only series name available for tooltip attribution.
+    series_name: r.action ? undefined : r.label,
     breakdown_value: r.breakdown_value,
     compare_label: r.compare_label,
     days: r.days,

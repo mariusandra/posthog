@@ -2,7 +2,8 @@ import { useValues } from 'kea'
 
 import { LemonSkeleton } from 'lib/lemon-ui/LemonSkeleton'
 import { Tooltip } from 'lib/lemon-ui/Tooltip'
-import { PersonDisplay } from 'scenes/persons/PersonDisplay'
+
+import { PersonDisplay } from 'products/persons/frontend/components/PersonDisplay'
 
 import { playerMetaLogic } from '../player-meta/playerMetaLogic'
 import { sessionRecordingPlayerLogic } from '../sessionRecordingPlayerLogic'
@@ -28,7 +29,7 @@ export function ResolutionView(): JSX.Element {
                 </>
             }
         >
-            <span className="text-secondary text-xs flex flex-row items-center gap-x-1">
+            <span className="text-secondary text-xs flex flex-row items-center gap-x-1 tabular-nums">
                 <span>{resolutionDisplay}</span>
                 <span>({scaleDisplay})</span>
             </span>

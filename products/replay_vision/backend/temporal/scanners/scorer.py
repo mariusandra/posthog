@@ -10,6 +10,8 @@ from products.replay_vision.backend.temporal.scanners.base import (
     BaseScannerOutput,
     Segment,
     confidence_field,
+    notability_field,
+    notability_reason_field,
 )
 
 
@@ -23,6 +25,11 @@ class ScoreScale(BaseModel, frozen=True):
         if self.min >= self.max:
             raise ValueError(f"scale.min ({self.min}) must be less than scale.max ({self.max})")
         return self
+
+
+# Applied when a stored config carries no scale (legacy or direct-write rows). Lives with the contract so
+# the proposer's grounding and the patch fallback can't drift from what `ScoreScale` accepts.
+DEFAULT_SCORE_SCALE = ScoreScale(min=1.0, max=5.0)
 
 
 class ScorerOutput(BaseScannerOutput, frozen=True):
@@ -51,6 +58,8 @@ class ScorerScanner(BaseScanner, frozen=True):
             "ScorerLlmResponse",
             reasoning=(str, Field(description="One paragraph grounding the score in concrete moments.")),
             score=(float, Field(ge=self.scale.min, le=self.scale.max, description=score_description)),
+            notability_reason=(str | None, notability_reason_field()),
+            notability=(float | None, notability_field()),
             confidence=(float, confidence_field()),
         )
 

@@ -5,7 +5,10 @@ import { useEffect, useState } from 'react'
 import { IconDatabase, IconPlus } from '@posthog/icons'
 import { LemonButton, LemonCard, LemonInput, LemonSkeleton } from '@posthog/lemon-ui'
 
-import { ExternalDataSourceType, SourceConfig } from '~/queries/schema/schema-general'
+import {
+    ExternalDataSourceTypeEnumApi,
+    SourceConfigResponseApi,
+} from 'products/warehouse_sources/frontend/generated/api.schemas'
 
 import { availableSourcesLogic } from '../../scenes/NewSourceScene/availableSourcesLogic'
 import { AvailableSourcesError, NewSourcesWizard } from '../../scenes/NewSourceScene/NewSourceScene'
@@ -16,7 +19,7 @@ import { SourceIcon } from './SourceIcon'
 export type InlineSourceSetupView = 'selection' | 'connecting'
 
 interface SourceItem {
-    id: ExternalDataSourceType
+    id: ExternalDataSourceTypeEnumApi
     label: string
 }
 
@@ -35,26 +38,35 @@ export interface InlineSourceSetupProps {
     autoConfigureTables?: boolean
 }
 
+interface InternalInlineSourceSetupProps extends InlineSourceSetupProps {
+    currentView: InlineSourceSetupView
+    selectedSource: ExternalDataSourceTypeEnumApi | null
+    onSourceSelect: (sourceId: ExternalDataSourceTypeEnumApi) => void
+    onBack: () => void
+    onFormSuccess: () => void
+}
+
 function InternalInlineSourceSetup({
-    onComplete,
     featured = false,
     title,
     subtitle = 'Choose a source to import data from',
     showWizard = false,
     autoConfigureTables = false,
-}: InlineSourceSetupProps): JSX.Element {
+    currentView,
+    selectedSource,
+    onSourceSelect,
+    onBack,
+    onFormSuccess,
+}: InternalInlineSourceSetupProps): JSX.Element {
     const { connectors } = useValues(sourceWizardLogic)
-    const { onClear } = useActions(sourceWizardLogic)
     const { searchParams, location } = useValues(router)
     const { replace } = useActions(router)
 
-    const [currentView, setCurrentView] = useState<InlineSourceSetupView>('selection')
-    const [selectedSource, setSelectedSource] = useState<ExternalDataSourceType | null>(null)
     const [expanded, setExpanded] = useState(!featured)
     const [searchQuery, setSearchQuery] = useState('')
 
     // Filter out unreleased sources
-    const availableConnectors = connectors.filter((c: SourceConfig) => !c.unreleasedSource)
+    const availableConnectors = connectors.filter((c: SourceConfigResponseApi) => !c.unreleasedSource)
 
     // Resume an OAuth round-trip: an OAuth source redirects the whole page to the provider and
     // back to this onboarding URL with ?kind=<source>. On mount, re-open the wizard for that
@@ -67,8 +79,7 @@ function InternalInlineSourceSetup({
         }
         const match = availableConnectors.find((c) => c.name.toLowerCase() === String(kind).toLowerCase())
         if (match) {
-            setSelectedSource(match.name)
-            setCurrentView('connecting')
+            onSourceSelect(match.name)
         }
         // Consume the param so a later remount (refresh, back-navigation, cancel) doesn't force the
         // wizard back open after the connection has already been handled.
@@ -76,43 +87,27 @@ function InternalInlineSourceSetup({
         replace(location.pathname, restParams)
         // oxlint-disable-next-line react-hooks/exhaustive-deps
     }, [])
-    const featuredSources = availableConnectors.filter((c: SourceConfig) => c.featured)
-    const hiddenSources = availableConnectors.filter((c: SourceConfig) => !c.featured)
+    const featuredSources = availableConnectors.filter((c: SourceConfigResponseApi) => c.featured)
+    const hiddenSources = availableConnectors.filter((c: SourceConfigResponseApi) => !c.featured)
 
     const trimmedQuery = searchQuery.trim().toLowerCase()
     const isSearching = trimmedQuery.length > 0
     // While searching, match across every source — the featured/expand split only applies
     // to the default (unsearched) view.
     const sourcesToShow = isSearching
-        ? availableConnectors.filter((c: SourceConfig) => (c.label ?? c.name).toLowerCase().includes(trimmedQuery))
+        ? availableConnectors.filter((c: SourceConfigResponseApi) =>
+              (c.label ?? c.name).toLowerCase().includes(trimmedQuery)
+          )
         : expanded
           ? availableConnectors
           : featuredSources
 
-    const sourceItems: SourceItem[] = sourcesToShow.map((source: SourceConfig) => ({
+    const sourceItems: SourceItem[] = sourcesToShow.map((source: SourceConfigResponseApi) => ({
         id: source.name,
         label: source.label ?? source.name,
     }))
 
     const effectiveTitle = title ?? `Choose from ${availableConnectors.length} sources`
-
-    const handleSourceSelect = (sourceId: ExternalDataSourceType): void => {
-        setSelectedSource(sourceId)
-        setCurrentView('connecting')
-    }
-
-    const handleFormSuccess = (): void => {
-        setCurrentView('selection')
-        setSelectedSource(null)
-        onClear()
-        onComplete?.()
-    }
-
-    const handleBack = (): void => {
-        setCurrentView('selection')
-        setSelectedSource(null)
-        onClear()
-    }
 
     return (
         <div className="space-y-6">
@@ -147,7 +142,7 @@ function InternalInlineSourceSetup({
                                     <div
                                         key={source.id}
                                         className="flex items-center gap-3 p-3 rounded-lg border border-border bg-bg-light cursor-pointer"
-                                        onClick={() => handleSourceSelect(source.id)}
+                                        onClick={() => onSourceSelect(source.id)}
                                     >
                                         <SourceIcon type={source.id} size="small" disableTooltip />
                                         <span className="font-medium text-sm">{source.label}</span>
@@ -182,14 +177,14 @@ function InternalInlineSourceSetup({
                 <LemonCard hoverEffect={false}>
                     <div className="space-y-4">
                         <div className="flex items-center justify-between mb-4">
-                            <LemonButton type="secondary" size="small" onClick={handleBack}>
+                            <LemonButton type="secondary" size="small" onClick={onBack}>
                                 ← Back to sources
                             </LemonButton>
                         </div>
                         <NewSourcesWizard
                             hideBackButton
-                            onComplete={handleFormSuccess}
-                            allowedSources={availableConnectors.map((c: SourceConfig) => c.name)}
+                            onComplete={onFormSuccess}
+                            allowedSources={availableConnectors.map((c: SourceConfigResponseApi) => c.name)}
                             initialSource={selectedSource}
                             autoConfigureTables={autoConfigureTables}
                         />
@@ -202,6 +197,32 @@ function InternalInlineSourceSetup({
 
 export function InlineSourceSetup(props: InlineSourceSetupProps): JSX.Element {
     const { availableSources, availableSourcesLoading } = useValues(availableSourcesLogic)
+    const { onClear } = useActions(sourceWizardLogic)
+
+    const [currentView, setCurrentView] = useState<InlineSourceSetupView>('selection')
+    const [selectedSource, setSelectedSource] = useState<ExternalDataSourceTypeEnumApi | null>(null)
+
+    // Defined once here and bound as the logic's `onComplete` below, so the wizard's step-5
+    // completion listener always sees this same callback — never the logic's unbound default —
+    // regardless of which of this component's `BindLogic` mounts happens to be active at that
+    // moment (see `NewSourcesWizard`'s own nested `BindLogic`, which receives this same callback).
+    const handleFormSuccess = (): void => {
+        setCurrentView('selection')
+        setSelectedSource(null)
+        onClear()
+        props.onComplete?.()
+    }
+
+    const handleSourceSelect = (sourceId: ExternalDataSourceTypeEnumApi): void => {
+        setSelectedSource(sourceId)
+        setCurrentView('connecting')
+    }
+
+    const handleBack = (): void => {
+        setCurrentView('selection')
+        setSelectedSource(null)
+        onClear()
+    }
 
     if (availableSourcesLoading) {
         return <LemonSkeleton />
@@ -212,8 +233,18 @@ export function InlineSourceSetup(props: InlineSourceSetupProps): JSX.Element {
     }
 
     return (
-        <BindLogic logic={sourceWizardLogic} props={{ availableSources }}>
-            <InternalInlineSourceSetup {...props} />
+        <BindLogic
+            logic={sourceWizardLogic}
+            props={{ availableSources, onComplete: handleFormSuccess, autoConfigureTables: props.autoConfigureTables }}
+        >
+            <InternalInlineSourceSetup
+                {...props}
+                currentView={currentView}
+                selectedSource={selectedSource}
+                onSourceSelect={handleSourceSelect}
+                onBack={handleBack}
+                onFormSuccess={handleFormSuccess}
+            />
         </BindLogic>
     )
 }

@@ -11,12 +11,15 @@ from pydantic import BaseModel
 from rest_framework.exceptions import ValidationError
 
 from posthog.schema import (
+    ActionsNode,
     CachedExperimentQueryResponse,
+    EventsNode,
     ExperimentActorsQuery,
     ExperimentBreakdownResult,
     ExperimentDataWarehouseNode,
     ExperimentFunnelMetric,
     ExperimentMeanMetric,
+    ExperimentMetricMathType,
     ExperimentQuery,
     ExperimentQueryResponse,
     ExperimentRatioMetric,
@@ -48,18 +51,27 @@ from products.analytics_platform.backend.lazy_computation.lazy_computation_execu
 )
 from products.cohorts.backend.models.cohort import Cohort
 from products.experiments.backend.hogql_queries import MULTIPLE_VARIANT_KEY, get_baseline_variant_key
-from products.experiments.backend.hogql_queries.base_query_utils import experiment_window, experiment_window_end
+from products.experiments.backend.hogql_queries.base_query_utils import (
+    conversion_window_to_seconds,
+    experiment_window,
+    experiment_window_end,
+    is_session_property_metric,
+)
 from products.experiments.backend.hogql_queries.cuped_config import get_cuped_config
 from products.experiments.backend.hogql_queries.error_handling import experiment_error_handler
+from products.experiments.backend.hogql_queries.experiment_metric_values import get_conversion_window_seconds
 from products.experiments.backend.hogql_queries.experiment_query_builder import (
     ExperimentQueryBuilder,
     get_exposure_config_params_for_builder,
+    resolve_exposure_config_for_builder,
 )
 from products.experiments.backend.hogql_queries.experiment_query_context import ExperimentPrecomputationContext
 from products.experiments.backend.hogql_queries.exposure_query_logic import (
     get_entity_key,
     get_multiple_variant_handling_from_experiment,
+    has_activation_config,
 )
+from products.experiments.backend.hogql_queries.types import PrecomputeSkipReason
 from products.experiments.backend.hogql_queries.utils import (
     aggregate_variants_across_breakdowns,
     get_bayesian_experiment_result,
@@ -97,6 +109,17 @@ DEFAULT_EXPOSURE_TTL_SECONDS = {
 # instead of failing atomically on every attempt.
 PRECOMPUTE_MAX_WINDOW_DAYS = 7
 
+# Spread frozen chunk expiries so an experiment's history does not expire all at once
+# (see TtlSchedule.default_ttl_jitter_seconds). 14 days means roughly one chunk expiry
+# per day for a months-long experiment; a larger value would only keep data on disk longer.
+PRECOMPUTE_TTL_JITTER_SECONDS = 14 * 24 * 60 * 60
+
+# Upper bound on how far past the experiment end a metric-events build may scan.
+# retention_window_end is an unrestricted user-supplied integer; without a cap, a huge
+# window would stretch the precompute horizon into thousands of daily jobs before the
+# executor's timeout check. Past the cap the metric falls back to the direct scan.
+METRIC_EVENTS_MAX_WINDOW_EXTENSION_SECONDS = 90 * 24 * 60 * 60  # 90 days
+
 
 def experiment_precompute_ttl_schedule(team_timezone: str) -> TtlSchedule:
     """The experiment TTL schedule with job width capped at PRECOMPUTE_MAX_WINDOW_DAYS."""
@@ -104,6 +127,7 @@ def experiment_precompute_ttl_schedule(team_timezone: str) -> TtlSchedule:
         DEFAULT_EXPOSURE_TTL_SECONDS,
         team_timezone,
         max_window_days=PRECOMPUTE_MAX_WINDOW_DAYS,
+        default_ttl_jitter_seconds=PRECOMPUTE_TTL_JITTER_SECONDS,
     )
 
 
@@ -198,7 +222,80 @@ def has_uncalculated_cohorts(team: Team, *filter_sources: Any) -> bool:
     ).exists()
 
 
-class ExperimentQueryRunner(QueryRunner):
+# Reasons that mean "do not precompute". The other PrecomputeSkipReason members explain a
+# direct-path query that precompute was attempted for, so they must not gate the bool.
+BLOCKING_PRECOMPUTE_SKIP_REASONS = frozenset(
+    {
+        PrecomputeSkipReason.OVERRIDE_DIRECT,
+        PrecomputeSkipReason.TEAM_DISABLED,
+        PrecomputeSkipReason.MIN_RUNTIME,
+        PrecomputeSkipReason.ACTIVATION_CONFIG,
+        PrecomputeSkipReason.COHORT_NOT_CALCULATED,
+    }
+)
+
+
+def team_precompute_skip_reason(
+    team: Team,
+    config: TeamExperimentsConfig,
+    experiment: Experiment,
+    exposure_criteria: Any,
+    *cohort_filter_sources: Any,
+) -> Optional[PrecomputeSkipReason]:
+    """The precompute gates that apply to every experiment query, shared by both runners."""
+    if not config.experiment_precomputation_enabled:
+        return PrecomputeSkipReason.TEAM_DISABLED
+    if not experiment_has_min_runtime_for_precomputation(experiment.start_date, experiment.end_date):
+        return PrecomputeSkipReason.MIN_RUNTIME
+    # Activation-mode exposures can't be cached per day: the flag→activation ordering
+    # crosses bucket boundaries.
+    if has_activation_config(exposure_criteria):
+        return PrecomputeSkipReason.ACTIVATION_CONFIG
+    if has_uncalculated_cohorts(team, exposure_criteria, *cohort_filter_sources):
+        return PrecomputeSkipReason.COHORT_NOT_CALCULATED
+    return None
+
+
+def ensure_exposures_precomputed(
+    team: Team,
+    builder: ExperimentQueryBuilder,
+    time_range_start: datetime,
+    time_range_end: datetime,
+) -> LazyComputationResult:
+    """Ensure lazy-computed exposure data exists for the window, and return its job_ids."""
+    query_string, placeholders = builder.get_exposure_query_for_precomputation()
+
+    return ensure_precomputed(
+        team=team,
+        insert_query=query_string,
+        time_range_start=time_range_start,
+        time_range_end=time_range_end,
+        ttl_seconds=experiment_precompute_ttl_schedule(team.timezone),
+        table=LazyComputationTable.EXPERIMENT_EXPOSURES_PREAGGREGATED,
+        placeholders=placeholders,
+        sentinel_placeholders={"experiment_date_to"},
+        end_is_data_horizon=True,
+        # High-volume teams' builds OOM even at capped window widths; spilling the
+        # GROUP BY to disk degrades gracefully instead of failing the build.
+        spill_to_disk=True,
+    )
+
+
+class ExperimentResultsCacheMixin:
+    """24-hour result cache, shared by the experiment query runners."""
+
+    def cache_target_age(self, last_refresh: Optional[datetime], lazy: bool = False) -> Optional[datetime]:
+        if last_refresh is None:
+            return None
+        return last_refresh + timedelta(hours=24)
+
+    def _is_stale(self, last_refresh: Optional[datetime], lazy: bool = False) -> bool:
+        if not last_refresh:
+            return True
+        return (datetime.now(UTC) - last_refresh) > timedelta(hours=24)
+
+
+class ExperimentQueryRunner(ExperimentResultsCacheMixin, QueryRunner):
     query: ExperimentQuery
     cached_response: CachedExperimentQueryResponse
     actors_query: Optional[ExperimentActorsQuery] = None
@@ -217,6 +314,7 @@ class ExperimentQueryRunner(QueryRunner):
         self.user_facing = user_facing
         self.max_execution_time = max_execution_time if max_execution_time is not None else MAX_EXECUTION_TIME
         self.bypass_warehouse_access_control = bypass_warehouse_access_control
+        self._requested_as_of = as_of
         # Tags the terminal `experiment metric error` event with where the load came from. Defaults to "ui"
         # because the generic /query API path constructs runners without kwargs; internal callers that own
         # their own retries/telemetry (recalc, warming, canary, backfills) must pass None or user_facing=False
@@ -278,7 +376,6 @@ class ExperimentQueryRunner(QueryRunner):
             start_is_dw = isinstance(self.query.metric.start_event, ExperimentDataWarehouseNode)
             completion_is_dw = isinstance(self.query.metric.completion_event, ExperimentDataWarehouseNode)
             self.is_data_warehouse_query = start_is_dw or completion_is_dw
-        self.is_ratio_metric = isinstance(self.query.metric, ExperimentRatioMetric)
 
         self.stats_method = get_experiment_stats_method(self.experiment)
 
@@ -316,45 +413,24 @@ class ExperimentQueryRunner(QueryRunner):
         return breakdowns
 
     def _ensure_exposures_precomputed(self, builder: ExperimentQueryBuilder) -> LazyComputationResult:
-        """
-        Ensures lazy-computed exposure data exists for this experiment.
-
-        Gets the exposure query from the builder and passes it to the lazy computation
-        system, which will compute and store the exposure data if not already cached.
-
-        Returns:
-            LazyComputationResult with job_ids that can be used to query the data
-        """
-        query_string, placeholders = builder.get_exposure_query_for_precomputation()
-
         if not self.experiment.start_date:
             raise ValidationError("Experiment must have a start date for lazy computation")
 
-        date_from = self.experiment.start_date
-        date_to = experiment_window_end(self.experiment, self.as_of)
-
-        return ensure_precomputed(
-            team=self.team,
-            insert_query=query_string,
-            time_range_start=date_from,
-            time_range_end=date_to,
-            ttl_seconds=experiment_precompute_ttl_schedule(self.team.timezone),
-            table=LazyComputationTable.EXPERIMENT_EXPOSURES_PREAGGREGATED,
-            placeholders=placeholders,
-            sentinel_placeholders={"experiment_date_to"},
-            # High-volume teams' builds OOM even at capped window widths; spilling the
-            # GROUP BY to disk degrades gracefully instead of failing the build.
-            spill_to_disk=True,
+        return ensure_exposures_precomputed(
+            self.team,
+            builder,
+            self.experiment.start_date,
+            experiment_window_end(self.experiment, self.as_of),
         )
 
     def _ensure_metric_events_precomputed(self, builder: ExperimentQueryBuilder) -> LazyComputationResult:
         """
-        Ensures lazy-computed funnel metric event data exists for this experiment.
+        Ensures lazy-computed metric event data exists for this experiment.
 
-        Stores one row per matching event with step indicators in the
-        experiment_metric_events_preaggregated table.
+        Stores one row per matching event in the experiment_metric_events_preaggregated
+        table: funnel metrics store step indicators, mean metrics the per-event value.
         """
-        query_string, placeholders = builder.get_funnel_metric_events_query_for_precomputation()
+        query_string, placeholders = builder.get_metric_events_query_for_precomputation()
 
         if not self.experiment.start_date:
             raise ValidationError("Experiment must have a start date for lazy computation")
@@ -362,10 +438,13 @@ class ExperimentQueryRunner(QueryRunner):
         date_from = self.experiment.start_date
         date_to = experiment_window_end(self.experiment, self.as_of)
 
-        # Extend time range by conversion window — funnel step events can occur after experiment end
-        conversion_window_seconds = builder._get_conversion_window_seconds()
-        if conversion_window_seconds > 0:
-            date_to = date_to + timedelta(seconds=conversion_window_seconds)
+        # Extend time range past experiment end — metric events can occur after it: within
+        # the conversion window, plus for retention the retention window (a completion can
+        # land up to retention_window_end after a start event that itself lands up to
+        # conversion_window after the last exposure).
+        extension_seconds = builder.get_metric_events_window_extension_seconds()
+        if extension_seconds > 0:
+            date_to = date_to + timedelta(seconds=extension_seconds)
 
         return ensure_precomputed(
             team=self.team,
@@ -376,6 +455,7 @@ class ExperimentQueryRunner(QueryRunner):
             table=LazyComputationTable.EXPERIMENT_METRIC_EVENTS_PREAGGREGATED,
             placeholders=placeholders,
             sentinel_placeholders={"experiment_date_to"},
+            end_is_data_horizon=True,
             spill_to_disk=True,
         )
 
@@ -385,52 +465,94 @@ class ExperimentQueryRunner(QueryRunner):
 
     def _should_precompute(self) -> bool:
         """Resolve whether to use precomputation: query-level override > team-level default + duration gate."""
-        if self.query.precomputation_mode == PrecomputationMode.PRECOMPUTED:
-            return True
-        if self.query.precomputation_mode == PrecomputationMode.DIRECT:
-            return False
+        return self._precompute_skip_reason() not in BLOCKING_PRECOMPUTE_SKIP_REASONS
 
-        if not self._team_experiments_config.experiment_precomputation_enabled:
-            return False
-
-        if not experiment_has_min_runtime_for_precomputation(
-            self.experiment.start_date,
-            self.experiment.end_date,
-        ):
-            return False
-
-        return not has_uncalculated_cohorts(self.team, self.experiment.exposure_criteria, self.metric)
-
-    def _precompute_skip_reason(self) -> Optional[str]:
+    def _precompute_skip_reason(self) -> Optional[PrecomputeSkipReason]:
         """Why precompute was not used, for the query-performance UI. None when it was attempted."""
         if self.query.precomputation_mode == PrecomputationMode.PRECOMPUTED:
             return None
         if self.query.precomputation_mode == PrecomputationMode.DIRECT:
-            return "override_direct"
-        if not self._team_experiments_config.experiment_precomputation_enabled:
-            return "team_disabled"
-        if not experiment_has_min_runtime_for_precomputation(
-            self.experiment.start_date,
-            self.experiment.end_date,
-        ):
-            return "min_runtime"
-        if has_uncalculated_cohorts(self.team, self.experiment.exposure_criteria, self.metric):
-            return "cohort_not_calculated"
+            return PrecomputeSkipReason.OVERRIDE_DIRECT
+
+        blocked = team_precompute_skip_reason(
+            self.team,
+            self._team_experiments_config,
+            self.experiment,
+            self.experiment.exposure_criteria,
+            self.metric,
+        )
+        if blocked is not None:
+            return blocked
+
         if self.is_data_warehouse_query:
-            return "data_warehouse"
+            return PrecomputeSkipReason.DATA_WAREHOUSE
         if self.group_type_index is not None:
-            return "group_aggregation"
+            return PrecomputeSkipReason.GROUP_AGGREGATION
         return None  # precompute was attempted; a direct path means the build failed / wasn't ready
 
     def _metric_events_precompute_applicable(self) -> bool:
-        """Metric-events precompute only supports ordered funnels without breakdowns, CUPED, or data warehouse."""
-        return (
-            isinstance(self.metric, ExperimentFunnelMetric)
-            and (self.metric.funnel_order_type or "ordered") == "ordered"
-            and not self._get_breakdowns_for_builder()
-            and not self.cuped_config.enabled
-            and not self.is_data_warehouse_query
-        )
+        """
+        Metric-events precompute supports ordered funnels, mean metrics with
+        numeric math (count/sum/avg/min/max) or ID-valued math (unique users /
+        unique sessions), and retention metrics, in all cases without
+        breakdowns, CUPED, or data warehouse sources.
+        """
+        if self._get_breakdowns_for_builder() or self.cuped_config.enabled or self.is_data_warehouse_query:
+            return False
+        if isinstance(self.metric, ExperimentFunnelMetric):
+            return (self.metric.funnel_order_type or "ordered") == "ordered"
+        if isinstance(self.metric, ExperimentMeanMetric):
+            source = self.metric.source
+            if not isinstance(source, (EventsNode, ActionsNode)):
+                return False
+            # Session-property means aggregate via a per-session dedup CTE that the
+            # precomputed table can't feed. Unique-group math is excluded because
+            # the build INSERT can't resolve $group_N (MATERIALIZED on
+            # sharded_events), and HogQL math because user expressions are arbitrary.
+            if is_session_property_metric(source):
+                return False
+            math_type = getattr(source, "math", None) or ExperimentMetricMathType.TOTAL
+            # Numeric math types are safe because the build query stores the same
+            # coalesced per-event float regardless of math type, and the math is
+            # applied at read time by build_value_aggregation_expr on both paths.
+            if math_type in (
+                ExperimentMetricMathType.TOTAL,
+                ExperimentMetricMathType.SUM,
+                ExperimentMetricMathType.AVG,
+                ExperimentMetricMathType.MIN,
+                ExperimentMetricMathType.MAX,
+            ):
+                return True
+            # unique_session counts distinct session_id, which every mean build stores.
+            if math_type == ExperimentMetricMathType.UNIQUE_SESSION:
+                return True
+            # dau counts distinct entity_id, which is the person id only when the
+            # experiment is person-keyed. Group experiments never reach precompute,
+            # but keep the guard explicit in case that exclusion is ever lifted.
+            if math_type == ExperimentMetricMathType.DAU:
+                return self.group_type_index is None
+            return False
+        if isinstance(self.metric, ExperimentRetentionMetric):
+            if not isinstance(self.metric.start_event, (EventsNode, ActionsNode)) or not isinstance(
+                self.metric.completion_event, (EventsNode, ActionsNode)
+            ):
+                return False
+            extension_seconds = get_conversion_window_seconds(self.metric) + conversion_window_to_seconds(
+                self.metric.retention_window_end, self.metric.retention_window_unit
+            )
+            return extension_seconds <= METRIC_EVENTS_MAX_WINDOW_EXTENSION_SECONDS
+        return False
+
+    @property
+    def metric_events_path(self) -> str:
+        """
+        Which source fed the metric-events side of the built query: "precomputed",
+        "direct_scan", or "not_applicable". Meaningful after _get_experiment_query()
+        has run. The exposures side is reported separately (response.is_precomputed).
+        """
+        if not self._metric_events_precompute_applicable():
+            return "not_applicable"
+        return "precomputed" if self._metric_events_precomputed else "direct_scan"
 
     def _get_experiment_query(self) -> ast.SelectQuery:
         """
@@ -442,18 +564,16 @@ class ExperimentQueryRunner(QueryRunner):
         )
 
         # Get the "missing" (not directly accessible) parameters required for the builder
-        (
-            exposure_config,
-            multiple_variant_handling,
-            filter_test_accounts,
-        ) = get_exposure_config_params_for_builder(self.experiment.exposure_criteria)
+        exposure_params = get_exposure_config_params_for_builder(
+            self.experiment.exposure_criteria, self.team, self.experiment.start_date
+        )
 
         builder = ExperimentQueryBuilder(
             team=self.team,
             feature_flag_key=self.feature_flag_key,
-            exposure_config=exposure_config,
-            filter_test_accounts=filter_test_accounts,
-            multiple_variant_handling=multiple_variant_handling,
+            exposure_config=exposure_params.exposure_config,
+            filter_test_accounts=exposure_params.filter_test_accounts,
+            multiple_variant_handling=exposure_params.multiple_variant_handling,
             variants=self.variants,
             date_range_query=self.date_range_query,
             entity_key=self.entity_key,
@@ -461,6 +581,7 @@ class ExperimentQueryRunner(QueryRunner):
             breakdowns=self._get_breakdowns_for_builder(),
             only_count_matured_users=self.experiment.only_count_matured_users,
             cuped_config=self.cuped_config,
+            activation_config=exposure_params.activation_config,
         )
 
         should_precompute = self._should_precompute()
@@ -495,10 +616,11 @@ class ExperimentQueryRunner(QueryRunner):
                     },
                 )
 
-            # Precompute metric events for ordered funnel metrics. CUPED extends the
-            # funnel scan back by `lookback_days` to source the pre-exposure covariate;
-            # the precomputed metric_events table only covers the experiment window, so
-            # skip precomputation here and let the builder issue a fresh scan.
+            # Precompute metric events for eligible metrics (ordered funnels, count/sum
+            # means). CUPED extends the metric scan back by `lookback_days` to source the
+            # pre-exposure covariate; the precomputed metric_events table only covers the
+            # experiment window, so skip precomputation here and let the builder issue a
+            # fresh scan.
             if self._metric_events_precompute_applicable():
                 try:
                     with tags_context(
@@ -555,15 +677,13 @@ class ExperimentQueryRunner(QueryRunner):
 
         # Tag after _get_experiment_query() which sets the precompute flags
         exposures_path = "precomputed" if self._is_precomputed else "direct_scan"
-        if not self._metric_events_precompute_applicable():
-            metric_events_path = "not_applicable"
-        else:
-            metric_events_path = "precomputed" if self._metric_events_precomputed else "direct_scan"
+        metric_events_path = self.metric_events_path
+        skip_reason = self._precompute_skip_reason()
         tag_queries(
             experiment_exposures_path=exposures_path,
             experiment_metric_events_path=metric_events_path,
             experiment_execution_path=exposures_path,
-            experiment_precompute_skip_reason=self._precompute_skip_reason(),
+            experiment_precompute_skip_reason=skip_reason.value if skip_reason is not None else None,
             experiment_scan_date_from=self.date_range.date_from,
             experiment_scan_date_to=self.date_range.date_to,
         )
@@ -730,20 +850,18 @@ class ExperimentQueryRunner(QueryRunner):
         """
         variants_seen = [v.key for _, v in variants]
 
-        has_breakdown = (
-            self.metric.breakdownFilter is not None
-            and self.metric.breakdownFilter.breakdowns
-            and len(self.metric.breakdownFilter.breakdowns) > 0
-        )
+        # Fan out over the breakdown combinations actually present in the results, not over the
+        # metric's breakdown config: a metric can declare breakdowns and still come back with no
+        # rows at all (no data yet), and there is then nothing to fan out over — fall back to the
+        # single breakdown-less zero row so the baseline variant still exists.
+        breakdown_tuples = {bv for bv, _ in variants if bv is not None}
 
         # Type annotation required for empty list so mypy knows the expected element type:
         # list of tuples containing (breakdown_values, stats) where breakdown_values can be None
         variants_missing: list[tuple[tuple[str, ...] | None, ExperimentStatsBase]] = []
         for key in self.variants:
             if key not in variants_seen:
-                if has_breakdown:
-                    # Extract all breakdown value combinations that exist in the results
-                    breakdown_tuples = {bv for bv, _ in variants if bv is not None}
+                if breakdown_tuples:
                     # Use extend to add MULTIPLE tuples - one for each breakdown combination
                     # Each missing variant needs to appear across ALL breakdown values to maintain consistency
                     variants_missing.extend(
@@ -794,52 +912,21 @@ class ExperimentQueryRunner(QueryRunner):
 
         num_metric_steps = len(self.metric.series)
 
-        # Validate step range (same validation as before)
-        if funnel_step == -1:
-            # -1 would mean "dropped before first metric step" which is invalid
-            # because we only query exposed users who are already past the exposure checkpoint
-            # Build event names string (handle EventsNode, ActionsNode, and ExperimentDataWarehouseNode)
-            from posthog.schema import ActionsNode, EventsNode
-
-            event_names: list[str] = []
-            for step in self.metric.series[:2]:
-                if isinstance(step, EventsNode):
-                    event_names.append(step.event or "All events")
-                elif isinstance(step, ActionsNode):
-                    event_names.append(f"Action {step.id}")
-                else:  # ExperimentDataWarehouseNode
-                    event_names.append(f"DW table {step.table_name}")
-
-            metric_events_str = " → ".join(event_names)
-            if len(self.metric.series) > 2:
-                metric_events_str += " → ..."
-
-            raise ValidationError(
-                f"Cannot query drop-offs before the first metric step in experiment funnels. "
-                f"Experiment funnel structure: [Exposure → {metric_events_str}]. "
-                f"Drop-offs at funnelStep=-1 would mean 'exposed but never entered the funnel', "
-                f"which cannot be queried through the actors API. "
-                f"Valid drop-off steps: -2 (dropped after first metric step) to -{num_metric_steps + 1}."
-            )
-
-        if funnel_step == 0:
-            raise ValidationError(
-                "Funnel steps are 1-indexed. Step 0 does not exist. "
-                f"Valid conversion steps: 1 (first metric step) to {num_metric_steps}."
-            )
-
-        if funnel_step < -1:
+        # funnelStep=-1 is a valid drop-off: "exposed but never reached the first metric step".
+        # step_reached is 0-indexed with exposure as step 0, so the WHERE clause resolves it to
+        # step_reached == 0 — the exposed users who did not validly enter the funnel.
+        if funnel_step < 0:
             max_drop_off = -(num_metric_steps + 1)
             if funnel_step < max_drop_off:
                 raise ValidationError(
                     f"Invalid drop-off step {funnel_step} for experiment with {num_metric_steps} metric steps. "
-                    f"Valid drop-off steps: -2 (dropped after first metric step) to {max_drop_off}."
+                    f"Valid drop-off steps: -1 (exposed, did not reach first metric step) to {max_drop_off}."
                 )
 
         if funnel_step > num_metric_steps:
             raise ValidationError(
                 f"Invalid conversion step {funnel_step} for experiment with {num_metric_steps} metric steps. "
-                f"Valid conversion steps: 1 (first metric step) to {num_metric_steps}."
+                f"Valid conversion steps: 0 (exposure step) to {num_metric_steps}."
             )
 
         # Extract exposure configuration from actors query
@@ -847,22 +934,20 @@ class ExperimentQueryRunner(QueryRunner):
         from posthog.schema import ActionsNode, ExperimentEventExposureConfig
 
         exposure_config: ExperimentEventExposureConfig | ActionsNode
+        activation_config: ExperimentEventExposureConfig | ActionsNode | None = None
         if self.actors_query.exposureConfig is not None:
-            exposure_config = self.actors_query.exposureConfig
-        elif self.experiment.exposure_criteria and self.experiment.exposure_criteria.get("exposure_config"):
-            from products.experiments.backend.hogql_queries.experiment_query_builder import (
-                normalize_to_exposure_criteria,
+            # An explicit override replaces the whole exposure definition, including any
+            # stored activation event.
+            exposure_config = resolve_exposure_config_for_builder(
+                self.actors_query.exposureConfig, self.team, self.experiment.start_date
             )
-
-            criteria = normalize_to_exposure_criteria(self.experiment.exposure_criteria)
-            if criteria and criteria.exposure_config:
-                exposure_config = criteria.exposure_config
-            else:
-                # Default to $feature_flag_called
-                exposure_config = ExperimentEventExposureConfig(event="$feature_flag_called", properties=[])
         else:
-            # Default to $feature_flag_called
-            exposure_config = ExperimentEventExposureConfig(event="$feature_flag_called", properties=[])
+            # Same resolution as the main experiment query, so the actor list matches the counts.
+            exposure_params = get_exposure_config_params_for_builder(
+                self.experiment.exposure_criteria, self.team, self.experiment.start_date
+            )
+            exposure_config = exposure_params.exposure_config
+            activation_config = exposure_params.activation_config
 
         # Get multiple variant handling
         if self.actors_query.multipleVariantHandling is not None:
@@ -926,26 +1011,31 @@ class ExperimentQueryRunner(QueryRunner):
             funnel_step=funnel_step,
             funnel_step_breakdown=funnel_step_breakdown,
             include_recordings=self.actors_query.includeRecordings or False,
+            activation_config=activation_config,
         )
+
+        # Step 0 is the exposure step: return everyone exposed to the variant,
+        # without funnel evaluation.
+        if funnel_step == 0:
+            return builder.build_exposure_actors_query()
 
         return builder.build_actors_query()
 
     def to_query(self) -> ast.SelectQuery:
         raise ValidationError(f"Cannot convert source query of type {self.query.metric.kind} to query")
 
-    # Cache results for 24 hours
-    def cache_target_age(self, last_refresh: Optional[datetime], lazy: bool = False) -> Optional[datetime]:
-        if last_refresh is None:
-            return None
-        return last_refresh + timedelta(hours=24)
+    def single_flight_variant(self) -> str:
+        # A recalculation passes its own window end, warehouse access, and execution time. None of
+        # them reach the cache key, so a recalculation must not pair with a results request.
+        as_of = self._requested_as_of.isoformat() if self._requested_as_of else ""
+        return (
+            f"{super().single_flight_variant()}:as_of={as_of}"
+            f":bypass_warehouse_access_control={self.bypass_warehouse_access_control}"
+            f":max_execution_time={self.max_execution_time}"
+        )
 
     def get_cache_payload(self) -> dict:
         payload = super().get_cache_payload()
         payload["experiment_response_version"] = 2
         payload["stats_method"] = self.stats_method
         return payload
-
-    def _is_stale(self, last_refresh: Optional[datetime], lazy: bool = False) -> bool:
-        if not last_refresh:
-            return True
-        return (datetime.now(UTC) - last_refresh) > timedelta(hours=24)

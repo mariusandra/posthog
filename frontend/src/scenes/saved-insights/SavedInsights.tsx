@@ -26,7 +26,7 @@ import { accessLevelSatisfied } from 'lib/utils/accessControlUtils'
 import { cn } from 'lib/utils/css-classes'
 import { deleteInsightWithUndo } from 'lib/utils/deleteWithUndo'
 import { isNonEmptyObject } from 'lib/utils/guards'
-import { SavedInsightsEmptyState } from 'scenes/insights/EmptyStates'
+import { SavedInsightsEmptyState, SavedInsightsErrorState } from 'scenes/insights/EmptyStates'
 import { useSummarizeInsight } from 'scenes/insights/summarizeInsight'
 import { projectLogic } from 'scenes/projectLogic'
 import { NewInsightShortcuts } from 'scenes/saved-insights/newInsightsMenu'
@@ -47,10 +47,16 @@ import {
     SavedInsightsTabs,
 } from '~/types'
 
+import { productAnalyticsEmptyState } from 'products/product_analytics/frontend/emptyState/productAnalyticsEmptyState'
+
 export * from './insightTypesMetadata'
+
+import { ProductAnalyticsNotifications } from 'products/product_analytics/frontend/notifications/ProductAnalyticsNotifications'
+import { productAnalyticsNotificationsLogic } from 'products/product_analytics/frontend/notifications/productAnalyticsNotificationsLogic'
 
 import { isDraftInsightRow } from './draftInsight'
 import { DraftInsightMoreMenu, DraftInsightNameCell } from './DraftInsightRow'
+import { HomeTab } from './HomeTab'
 import { QUERY_TYPES_METADATA } from './insightTypesMetadata'
 import { NewInsightButton } from './NewInsightMenu'
 import { SavedInsightListItem, savedInsightsLogic } from './savedInsightsLogic'
@@ -59,6 +65,7 @@ export const scene: SceneExport = {
     component: SavedInsights,
     logic: savedInsightsLogic,
     productKey: ProductKey.PRODUCT_ANALYTICS,
+    emptyState: productAnalyticsEmptyState,
 }
 
 export function InsightIcon({
@@ -92,15 +99,18 @@ export function SavedInsights(): JSX.Element {
     const {
         insights,
         insightsLoading,
+        insightsLoadFailed,
         filters,
         sorting,
         pagination,
         usingFilters,
         bulkDeleteResponseLoading,
         draftInsightRow,
+        showHomeTab,
     } = useValues(savedInsightsLogic)
 
     const { currentProjectId } = useValues(projectLogic)
+    const { notificationCount } = useValues(productAnalyticsNotificationsLogic)
     const summarizeInsight = useSummarizeInsight()
 
     const { tab } = filters
@@ -336,15 +346,33 @@ export function SavedInsights(): JSX.Element {
                     setSavedInsightsFilters({ tab })
                 }}
                 tabs={[
+                    ...(showHomeTab ? [{ key: SavedInsightsTabs.Home, label: 'Home' }] : []),
                     { key: SavedInsightsTabs.All, label: 'All insights' },
                     { key: SavedInsightsTabs.Yours, label: 'My insights' },
                     { key: SavedInsightsTabs.Alerts, label: 'Alerts' },
+                    {
+                        key: SavedInsightsTabs.Notifications,
+                        label: (
+                            <span className="flex items-center gap-1.5">
+                                Notifications
+                                {notificationCount > 0 && (
+                                    <LemonTag type="completion" size="small">
+                                        {notificationCount}
+                                    </LemonTag>
+                                )}
+                            </span>
+                        ),
+                    },
                     { key: SavedInsightsTabs.History, label: 'History' },
                 ]}
                 sceneInset
             />
 
-            {tab === SavedInsightsTabs.History ? (
+            {tab === SavedInsightsTabs.Home && showHomeTab ? (
+                <HomeTab />
+            ) : tab === SavedInsightsTabs.Notifications ? (
+                <ProductAnalyticsNotifications />
+            ) : tab === SavedInsightsTabs.History ? (
                 <ActivityLog scope={ActivityScope.INSIGHT} />
             ) : (
                 <>
@@ -352,15 +380,17 @@ export function SavedInsights(): JSX.Element {
                         filters={filters}
                         setFilters={setSavedInsightsFilters}
                         quickFilters={
-                            tab === SavedInsightsTabs.Yours
-                                ? ['insightType', 'tags', 'favorites', 'featureFlags']
-                                : undefined
+                            tab === SavedInsightsTabs.Yours ? ['insightType', 'tags', 'favorites'] : undefined
                         }
                     />
                     <LemonTable
                         loading={insightsLoading}
                         columns={columns}
-                        dataSource={draftInsightRow ? [draftInsightRow, ...insights.results] : insights.results}
+                        dataSource={
+                            draftInsightRow && !(insightsLoadFailed && insights.results.length < 1)
+                                ? [draftInsightRow, ...insights.results]
+                                : insights.results
+                        }
                         rowClassName={(record) => (isDraftInsightRow(record) ? 'bg-warning-highlight' : null)}
                         pagination={pagination}
                         noSortingCancellation
@@ -377,7 +407,11 @@ export function SavedInsights(): JSX.Element {
                         nouns={['insight', 'insights']}
                         hideSortingIndicatorWhenInactive
                         emptyState={
-                            !insightsLoading && insights.count < 1 ? (
+                            !insightsLoading && insightsLoadFailed && insights.results.length < 1 ? (
+                                <div className="py-8">
+                                    <SavedInsightsErrorState onRetry={() => loadInsights(false)} />
+                                </div>
+                            ) : !insightsLoading && insights.count < 1 ? (
                                 <div className="py-8">
                                     <SavedInsightsEmptyState filters={filters} usingFilters={usingFilters} />
                                 </div>

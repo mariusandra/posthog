@@ -28,7 +28,12 @@ import { tabUiStateLogic } from 'lib/logic/tabUiStateLogic'
 import { getAppContext } from 'lib/utils/getAppContext'
 import { isChunkLoadError } from 'lib/utils/isChunkLoadError'
 import { isDesktopApp, isDesktopFreshWindow } from 'lib/utils/isDesktopApp'
-import { addProjectIdIfMissing, removeProjectIdIfPresent, stripTrailingSlash } from 'lib/utils/kea-router'
+import {
+    addProjectIdIfMissing,
+    removeProjectIdIfPresent,
+    stripTrailingSlash,
+    getProjectIdentifierInPath,
+} from 'lib/utils/kea-router'
 import { retryImport } from 'lib/utils/retryImport'
 import { identifierToHuman } from 'lib/utils/strings'
 import { getRelativeNextPath } from 'lib/utils/url'
@@ -113,11 +118,28 @@ const sanitizeTabForPersistence = (tab: SceneTab): SceneTab => {
     return tabToPersistableSnapshot(tab, { pinned: true, active: false })
 }
 
+// `/` and `/home` both resolve the configured homepage through this, so anything asking whether a
+// location is the homepage has to derive it the same way.
+const homepageTargetPathname = (homepage: SceneTab): string => {
+    const targetPathname = addProjectIdIfMissing(homepage.pathname || urls.projectHomepage())
+    return removeProjectIdIfPresent(targetPathname) === '/'
+        ? addProjectIdIfMissing(urls.projectHomepage())
+        : targetPathname
+}
+
 // Bootstrapped by Django into APP_CONTEXT so the configured homepage is known on first paint,
 // before any async fetch — otherwise urlToAction runs with a null homepage and /home can't redirect.
 const getBootstrappedHomepage = (): SceneTab | null => {
     const homepage = getAppContext()?.homepage
-    return homepage ? sanitizeTabForPersistence(homepage) : null
+    if (!homepage) {
+        return null
+    }
+    // A homepage saved against a scene that no longer ships would send `/` to a dead route on
+    // every visit, with no way back except reconfiguring it. Fall back to the project default.
+    if (homepage.sceneId && !sceneConfigurations[homepage.sceneId]) {
+        return null
+    }
+    return sanitizeTabForPersistence(homepage)
 }
 
 /** localStorage key the desktop app persists its tab set under (see layout/scenes/sceneTabsLogic). */
@@ -220,7 +242,6 @@ const pathPrefixesOnboardingNotRequiredFor = [
     '/settings',
     urls.organizationBilling(),
     urls.billingAuthorizationStatus(),
-    urls.wizard(),
     '/instance',
     urls.moveToPostHogCloud(),
     urls.unsubscribe(),
@@ -347,10 +368,10 @@ export interface sceneLogicValues {
     organizationBeingDeleted: string | null // organizationLogic
     activeExportedScene: SceneExport<SceneProps> | null
     activeLoadedScene: LoadedScene | null
-    activeSceneComponentParamsWithTabId: Record<string, any>
+    activeSceneComponentParams: Record<string, any>
     activeSceneId: string | null
     activeSceneLogic: BuiltLogic | null
-    activeSceneLogicPropsWithTabId: Record<string, any>
+    activeSceneLogicProps: Record<string, any>
     activeSceneProductKey: ProductKey | null
     activeTab: SceneTab | null
     activeTabId: string | null
@@ -364,8 +385,8 @@ export interface sceneLogicValues {
     lastSetScenePayload: Record<string, any>
     loadingScene: string | null
     sceneConfig: SceneConfig | null
-    sceneId: any
-    sceneKey: any
+    sceneId: string | null
+    sceneKey: string | undefined
     sceneParams: SceneParams
     searchParams: Record<string, any>
     tabIds: Record<string, boolean>
@@ -528,6 +549,9 @@ export interface sceneLogicActions {
         activeId: string
         overId: string
     }
+    resetUnavailableHomepage: (pathname: string) => {
+        pathname: string
+    }
     saveTabEdit: (
         tab: SceneTab,
         name: string
@@ -597,11 +621,19 @@ export interface sceneLogicMeta {
     __keaTypeGenInternalSelectorTypes: {
         activeTab: (tabs: SceneTab[]) => SceneTab | null
         activeTabId: (activeTab: SceneTab | null) => string | null
-        sceneId: (activeTab: SceneTab | null) => any
-        sceneKey: (activeTab: SceneTab | null) => any
-        sceneConfig: (sceneId: any) => SceneConfig | null
+        sceneId: (activeTab: SceneTab | null) => string | null
+        sceneKey: (activeTab: SceneTab | null) => string | undefined
+        sceneConfig: (sceneId: string | undefined) => SceneConfig | null
         sceneParams: (activeTab: SceneTab | null) => SceneParams
-        activeSceneId: (sceneId: any, isCurrentTeamUnavailable: boolean) => string | null
+        activeSceneId: (
+            sceneId: string | undefined,
+            isCurrentTeamUnavailable: boolean,
+            location: {
+                hash: string
+                pathname: string
+                search: string
+            }
+        ) => string | null
         activeExportedScene: (
             activeSceneId: string | null,
             exportedScenes: Record<string, SceneExport<SceneProps>>
@@ -612,18 +644,15 @@ export interface sceneLogicMeta {
             sceneParams: SceneParams,
             activeTabId: string | null
         ) => LoadedScene | null
-        activeSceneComponentParamsWithTabId: (
-            sceneParams: SceneParams,
-            activeTabId: string | null
-        ) => Record<string, any>
-        activeSceneLogicPropsWithTabId: (
+        activeSceneComponentParams: (sceneParams: SceneParams, activeTabId: string | null) => Record<string, any>
+        activeSceneLogicProps: (
             activeExportedScene: SceneExport<SceneProps> | null,
             sceneParams: SceneParams,
             activeTabId: string | null
         ) => Record<string, any>
         activeSceneLogic: (
             activeExportedScene: SceneExport<SceneProps> | null,
-            activeSceneLogicPropsWithTabId: Record<string, any>
+            activeSceneLogicProps: Record<string, any>
         ) => BuiltLogic | null
         searchParams: (sceneParams: SceneParams) => Record<string, any>
         hashParams: (sceneParams: SceneParams) => Record<string, any>
@@ -648,7 +677,7 @@ export const sceneLogic = kea<sceneLogicType>([
     path(['scenes', 'sceneLogic']),
 
     connect(() => ({
-        logic: [router, userLogic, preflightLogic],
+        logic: [router, userLogic, preflightLogic, teamLogic],
         actions: [router, ['locationChanged', 'push'], inviteLogic, ['hideInviteModal']],
         values: [billingLogic, ['billing'], organizationLogic, ['organizationBeingDeleted']],
     })),
@@ -761,6 +790,7 @@ export const sceneLogic = kea<sceneLogicType>([
         setFrozenWidths: (widths: Record<string, number> | null) => ({ widths }),
         clearFrozenWidths: true,
         freezeTabWidths: true,
+        resetUnavailableHomepage: (pathname: string) => ({ pathname }),
     }),
     reducers({
         // We store all state in "tabs". This allows us to have multiple tabs open, each with its own scene and parameters.
@@ -1038,7 +1068,7 @@ export const sceneLogic = kea<sceneLogicType>([
             (s) => [s.activeTab],
             (activeTab: SceneTab | null): string | null => (activeTab ? activeTab.id : null),
         ],
-        sceneId: [(s) => [s.activeTab], (activeTab: SceneTab | null) => activeTab?.sceneId],
+        sceneId: [(s) => [s.activeTab], (activeTab: SceneTab | null): string | null => activeTab?.sceneId ?? null],
         sceneKey: [(s) => [s.activeTab], (activeTab: SceneTab | null) => activeTab?.sceneKey],
         sceneConfig: [
             (s) => [s.sceneId],
@@ -1055,9 +1085,22 @@ export const sceneLogic = kea<sceneLogicType>([
             },
         ],
         activeSceneId: [
-            (s) => [s.sceneId, teamLogic.selectors.isCurrentTeamUnavailable],
-            (sceneId: string | null, isCurrentTeamUnavailable: boolean) => {
-                const effectiveResourceAccessControl = getAppContext()?.effective_resource_access_control
+            (s) => [s.sceneId, teamLogic.selectors.isCurrentTeamUnavailable, router.selectors.location],
+            (sceneId: string | null, isCurrentTeamUnavailable: boolean, location: { pathname: string }) => {
+                const appContext = getAppContext()
+                const effectiveResourceAccessControl = appContext?.effective_resource_access_control
+
+                // The server refused the project this address names and served the user's own one,
+                // so the page cannot load. Once the address bar names a project we do serve, the
+                // scene loads as usual.
+                if (
+                    appContext?.project_access_denied &&
+                    sceneId &&
+                    sceneConfigurations[sceneId]?.projectBased &&
+                    getProjectIdentifierInPath(location.pathname) === appContext.project_access_denied
+                ) {
+                    return Scene.ErrorProjectAccessDenied
+                }
 
                 // Get the access control resource type for the current scene
                 const sceneAccessControlResource = sceneId ? sceneToAccessControlResourceType[sceneId as Scene] : null
@@ -1111,7 +1154,7 @@ export const sceneLogic = kea<sceneLogicType>([
                 }
             },
         ],
-        activeSceneComponentParamsWithTabId: [
+        activeSceneComponentParams: [
             (s) => [s.sceneParams, s.activeTabId],
             (sceneParams: SceneParams, activeTabId: string | null): Record<string, any> => {
                 return {
@@ -1121,7 +1164,7 @@ export const sceneLogic = kea<sceneLogicType>([
             },
             { resultEqualityCheck: equal },
         ],
-        activeSceneLogicPropsWithTabId: [
+        activeSceneLogicProps: [
             (s) => [s.activeExportedScene, s.sceneParams, s.activeTabId],
             (
                 activeExportedScene: SceneExport<import('scenes/sceneTypes').SceneProps> | null,
@@ -1136,14 +1179,14 @@ export const sceneLogic = kea<sceneLogicType>([
             { resultEqualityCheck: equal },
         ],
         activeSceneLogic: [
-            (s) => [s.activeExportedScene, s.activeSceneLogicPropsWithTabId],
+            (s) => [s.activeExportedScene, s.activeSceneLogicProps],
             (
                 activeExportedScene: SceneExport<import('scenes/sceneTypes').SceneProps> | null,
-                activeSceneLogicPropsWithTabId: Record<string, any>
+                activeSceneLogicProps: Record<string, any>
             ): BuiltLogic | null => {
                 if (activeExportedScene?.logic) {
                     try {
-                        return activeExportedScene.logic.build(activeSceneLogicPropsWithTabId)
+                        return activeExportedScene.logic.build(activeSceneLogicProps)
                     } catch (e) {
                         // Building a keyed logic with undefined key (e.g. during a scene
                         // transition before paramsToProps has resolved) throws
@@ -1302,6 +1345,29 @@ export const sceneLogic = kea<sceneLogicType>([
                 actions.setHomepage(null)
             } else {
                 persistTabs(values.tabs, values.homepage)
+            }
+        },
+        // A homepage pointing at a deleted object answers every `/` and Home with a not-found screen,
+        // and the picker that would change it sits behind that screen. Drop the setting instead.
+        resetUnavailableHomepage: ({ pathname }) => {
+            const target = addProjectIdIfMissing(pathname)
+            if (!values.homepage || homepageTargetPathname(values.homepage) !== target) {
+                return
+            }
+            actions.setHomepage(null)
+            lemonToast.info('Your home pointed to something that no longer exists, so we reset it.')
+            const location = router.values.currentLocation
+            if (addProjectIdIfMissing(location.pathname) === target) {
+                // Carry the hash and allow-listed params over, as the `/` → homepage redirect does,
+                // so a modal bound to `?modal=` does not close on the way out.
+                router.actions.replace(
+                    withForwardedHashAndSearchParams(
+                        urls.projectHomepage(),
+                        location.searchParams,
+                        location.hashParams,
+                        forwardedRedirectQueryParams
+                    )
+                )
             }
         },
         setHomepage: ({ tab }) => {
@@ -1561,11 +1627,11 @@ export const sceneLogic = kea<sceneLogicType>([
             if (user) {
                 // If user is already logged in, redirect away from unauthenticated-only routes (e.g. /signup)
                 if (sceneConfig.onlyUnauthenticated) {
-                    if (sceneId === Scene.Login) {
-                        handleLoginRedirect()
-                    } else {
-                        router.actions.replace(urls.default())
-                    }
+                    // `next` is where the person needs to end up, whichever screen they landed on:
+                    // an OAuth partner sends them to /signup?next=/oauth/authorize?... just as
+                    // `login_required` sends them to /login?next=... . With no `next` this lands on
+                    // the app root, so it covers the plain case too.
+                    handleLoginRedirect()
                     return
                 }
 
@@ -1685,9 +1751,9 @@ export const sceneLogic = kea<sceneLogicType>([
                 } finally {
                     window.clearTimeout(timeout)
                 }
-                if (values.sceneId !== sceneId) {
-                    breakpoint()
-                }
+                // Break before the `values` read below: the import can outlive this logic, and a
+                // detached path throws. The `sceneId` check this replaces read `values` itself.
+                breakpoint()
                 const { default: defaultExport, logic, scene: _scene, ...others } = importedScene
 
                 if (_scene) {
@@ -1821,10 +1887,7 @@ export const sceneLogic = kea<sceneLogicType>([
             if (!homepage) {
                 return false
             }
-            let targetPathname = addProjectIdIfMissing(homepage.pathname || urls.projectHomepage())
-            if (removeProjectIdIfPresent(targetPathname) === '/') {
-                targetPathname = addProjectIdIfMissing(urls.projectHomepage())
-            }
+            const targetPathname = homepageTargetPathname(homepage)
             // Forward the incoming hash and allow-listed params (e.g. modal) onto the homepage, and
             // compare against that final target so a forwarded param can't loop.
             const target = withForwardedHashAndSearchParams(

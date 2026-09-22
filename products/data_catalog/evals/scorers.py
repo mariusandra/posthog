@@ -12,24 +12,46 @@ import re
 import json
 from typing import Any
 
-from products.data_catalog.evals.constants import METRICS_CATALOG_MARKER
+from products.data_catalog.evals.constants import (
+    DEPRECATION_CANONICAL_SOURCE_NAME,
+    DEPRECATION_STALE_SOURCE_NAME,
+    EVAL_DESCRIPTION_CHAR_LIMIT,
+    METRIC_CREATE_TOOL,
+    METRIC_UPDATE_TOOL,
+    METRICS_CATALOG_MARKER,
+)
 from products.posthog_ai.eval_harness.log_parser import LogParser, ToolCall
-from products.posthog_ai.eval_harness.scorers import GRADED_ALIGNMENT_CHOICE_SCORES, JUDGE_MODEL, JudgedScorer
+from products.posthog_ai.eval_harness.scorers import (
+    BINARY_CHOICE_SCORES,
+    GRADED_ALIGNMENT_CHOICE_SCORES,
+    JUDGE_MODEL,
+    JudgedScorer,
+)
 from products.posthog_ai.eval_harness.scorers.contract import Score, Scorer
 
 __all__ = [
     "CanonicalMetricRun",
+    "DeprecationProposed",
     "SemanticMetadataQueried",
     "SemanticTrustDecisionCorrectness",
+    "MetricDescriptionConcise",
+    "MetricDescriptionQuality",
     "MetricsCatalogQueried",
     "MetricsCatalogBeforeAnswer",
     "MetricsCatalogBeforeDataDiscovery",
     "MetricsCatalogNotQueried",
     "GovernedBehaviorCorrectness",
+    "ClarificationAsked",
+    "ProposedMetricNotRun",
+    "MetricDescribeBeforeAdaptedSql",
 ]
 
 SQL_TOOL = "execute-sql"
+METRIC_LIST_TOOL = "metric-list"
+METRIC_DESCRIBE_TOOL = "metric-describe"
 METRIC_RUN_TOOL = "data-catalog-metric-run"
+QUESTION_TOOL = "askuserquestion"
+CERTIFICATION_PROPOSE_TOOL = "data-catalog-certification-propose"
 _INFO_SCHEMA = "information_schema"
 _INFO_SYNTHETIC_PREFIX = "__info__:"
 # Matches the PostHog MCP namespace across regional server names —
@@ -64,7 +86,20 @@ def _successful_sql(parser: LogParser) -> list[ToolCall]:
 
 
 def _is_catalog_lookup(call: ToolCall) -> bool:
-    return METRICS_CATALOG_MARKER in _query_text(call)
+    return call.name in (METRIC_LIST_TOOL, METRIC_DESCRIBE_TOOL) or (
+        call.name == SQL_TOOL and METRICS_CATALOG_MARKER in _query_text(call)
+    )
+
+
+def _successful_catalog_lookups(parser: LogParser) -> list[ToolCall]:
+    return sorted(
+        (call for call in parser.get_tool_calls() if not call.is_error and _is_catalog_lookup(call)),
+        key=lambda call: call.position,
+    )
+
+
+def _is_question_call(call: ToolCall) -> bool:
+    return call.name.replace("_", "").casefold() == QUESTION_TOOL
 
 
 def _is_discovery(call: ToolCall) -> bool:
@@ -85,7 +120,7 @@ def _is_tool_discovery(call: ToolCall) -> bool:
 
 
 def _is_data_bearing(call: ToolCall) -> bool:
-    if _is_tool_discovery(call):
+    if _is_tool_discovery(call) or call.name in (METRIC_LIST_TOOL, METRIC_DESCRIBE_TOOL):
         return False
     if call.name in _KNOWN_DATA_BEARING_TOOLS or call.name.startswith("query-"):
         return True
@@ -110,7 +145,7 @@ class MetricsCatalogQueried(Scorer):
         parser = _parser_for(output)
         if parser is None:
             return Score(name=self._name(), score=None, metadata={"reason": "No raw log"})
-        hits = [c for c in _successful_sql(parser) if _is_catalog_lookup(c)]
+        hits = _successful_catalog_lookups(parser)
         return Score(name=self._name(), score=1.0 if hits else 0.0, metadata={"catalog_lookups": len(hits)})
 
 
@@ -133,9 +168,11 @@ class MetricsCatalogBeforeAnswer(Scorer):
         catalog_seen = False
         offenders: list[str] = []
         answer_calls = 0
-        for call in _successful_sql(parser):
-            if _is_catalog_lookup(call):
+        for call in sorted(parser.get_tool_calls(), key=lambda current: current.position):
+            if not call.is_error and _is_catalog_lookup(call):
                 catalog_seen = True
+                continue
+            if call.name != SQL_TOOL or call.is_error:
                 continue
             if _is_discovery(call):
                 continue
@@ -175,7 +212,7 @@ class MetricsCatalogBeforeDataDiscovery(Scorer):
         failed_catalog_lookups = 0
         offenders: list[dict[str, str]] = []
         for call in sorted(parser.get_tool_calls(), key=lambda current: current.position):
-            if call.name == SQL_TOOL and _is_catalog_lookup(call):
+            if _is_catalog_lookup(call):
                 if call.is_error:
                     failed_catalog_lookups += 1
                 else:
@@ -205,6 +242,14 @@ class MetricsCatalogBeforeDataDiscovery(Scorer):
                 },
             )
         return Score(name=self._name(), score=1.0, metadata={"failed_catalog_lookups": failed_catalog_lookups})
+
+
+def _expected_metric_names(metric_name: object) -> list[str]:
+    if isinstance(metric_name, str):
+        return [metric_name] if metric_name else []
+    if isinstance(metric_name, list) and all(isinstance(name, str) and name for name in metric_name):
+        return metric_name
+    return []
 
 
 class CanonicalMetricRun(Scorer):
@@ -240,32 +285,32 @@ class CanonicalMetricRun(Scorer):
             )
 
         metric_name = spec.get("metric_name")
-        if not isinstance(metric_name, str) or not metric_name:
+        metric_names = _expected_metric_names(metric_name)
+        if not metric_names:
             return Score(name=self._name(), score=0.0, metadata={"reason": "metric_name is required"})
 
         called_names = [call.input.get("name") for call in run_calls]
-        if any(name != metric_name for name in called_names):
+        if any(name not in metric_names for name in called_names):
             return Score(
                 name=self._name(),
                 score=0.0,
                 metadata={"reason": "wrong metric name", "expected": metric_name, "called": called_names},
             )
 
-        successful_catalog_positions = [
-            call.position for call in parser.get_tool_calls(SQL_TOOL) if not call.is_error and _is_catalog_lookup(call)
-        ]
+        successful_catalog_positions = [call.position for call in _successful_catalog_lookups(parser)]
         expected_error = outcome == "failed"
         post_catalog_runs = [
             call
             for call in run_calls
-            if call.input.get("name") == metric_name
+            if call.input.get("name") in metric_names
             and any(position < call.position for position in successful_catalog_positions)
         ]
         matching_calls = [call for call in post_catalog_runs if call.is_error is expected_error]
         contradicting_calls = [call for call in post_catalog_runs if call.is_error is not expected_error]
+        matched_names = {call.input.get("name") for call in matching_calls}
         # Mixed outcomes (e.g. a failed run followed by a successful one) are contradictory —
         # only accept when every canonical run agreed with the expected outcome.
-        if matching_calls and not contradicting_calls:
+        if matched_names == set(metric_names) and not contradicting_calls:
             return Score(
                 name=self._name(),
                 score=1.0,
@@ -292,6 +337,190 @@ class CanonicalMetricRun(Scorer):
         )
 
 
+def _propose_targets(call: ToolCall, name: str, table_id: str | None) -> bool:
+    call_input = call.input if isinstance(call.input, dict) else {}
+    if isinstance(call_input.get("table_name"), str) and call_input["table_name"] == name:
+        return True
+    return table_id is not None and str(call_input.get("table_id")) == str(table_id)
+
+
+def _proposes_deprecation(call: ToolCall) -> bool:
+    call_input = call.input if isinstance(call.input, dict) else {}
+    return call_input.get("proposed_status") == "deprecated"
+
+
+class DeprecationProposed(Scorer):
+    """Binary: did the agent propose deprecating the stale source (and spare the canonical one)?"""
+
+    def _name(self) -> str:
+        return "deprecation_proposed"
+
+    def _run_eval_sync(self, output: dict | None, expected: dict | None = None, **kwargs) -> Score:
+        if not _requested(expected, self._name()):
+            return Score(name=self._name(), score=None, metadata={"reason": "not requested"})
+        parser = _parser_for(output)
+        if parser is None:
+            return Score(name=self._name(), score=None, metadata={"reason": "No raw log"})
+
+        seed = (output or {}).get("seed")
+        candidate = seed.get("deprecation_candidate", {}) if isinstance(seed, dict) else {}
+        stale_name = candidate.get("stale_table_name", DEPRECATION_STALE_SOURCE_NAME)
+        stale_id = candidate.get("stale_table_id")
+        canonical_name = candidate.get("canonical_table_name", DEPRECATION_CANONICAL_SOURCE_NAME)
+        canonical_id = candidate.get("canonical_table_id")
+
+        propose_calls = [call for call in parser.get_tool_calls(CERTIFICATION_PROPOSE_TOOL) if not call.is_error]
+        deprecated_canonical = [
+            call
+            for call in propose_calls
+            if _proposes_deprecation(call) and _propose_targets(call, canonical_name, canonical_id)
+        ]
+        if deprecated_canonical:
+            return Score(
+                name=self._name(),
+                score=0.0,
+                metadata={"reason": "proposed deprecating the canonical source", "canonical_source": canonical_name},
+            )
+
+        deprecated_stale = [
+            call
+            for call in propose_calls
+            if _proposes_deprecation(call) and _propose_targets(call, stale_name, stale_id)
+        ]
+        if not deprecated_stale:
+            return Score(
+                name=self._name(),
+                score=0.0,
+                metadata={
+                    "reason": "did not propose deprecating the stale source",
+                    "stale_source": stale_name,
+                    "propose_calls": [call.input for call in propose_calls],
+                },
+            )
+        return Score(name=self._name(), score=1.0, metadata={"stale_source": stale_name})
+
+
+def _description_writes(parser: LogParser) -> list[ToolCall]:
+    """Successful metric writes carrying a string description, in call order.
+
+    Update calls count too, so a case cannot pass by writing a short, meaningful description and
+    then PATCHing a long or query-narrating one over it. The last entry is what ends up stored.
+    """
+    calls: list[ToolCall] = []
+    for tool in (METRIC_CREATE_TOOL, METRIC_UPDATE_TOOL):
+        calls.extend(
+            c
+            for c in parser.get_tool_calls(tool)
+            if not c.is_error and isinstance(c.input, dict) and isinstance(c.input.get("description"), str)
+        )
+    return sorted(calls, key=lambda c: c.position)
+
+
+def _written_descriptions(parser: LogParser) -> list[tuple[str, str]]:
+    """``(tool_name, description)`` for every successful metric write carrying a description."""
+    return [(call.name, call.input["description"]) for call in _description_writes(parser)]
+
+
+def _latest_field(calls: list[ToolCall], field: str, expected_type: type) -> Any:
+    """The value of ``field`` from the last call that supplied it with the expected type."""
+    return next((c.input[field] for c in reversed(calls) if isinstance(c.input.get(field), expected_type)), None)
+
+
+class MetricDescriptionConcise(Scorer):
+    """Binary: every metric description the agent wrote stays under the conciseness bar."""
+
+    def _name(self) -> str:
+        return "metric_description_concise"
+
+    def _run_eval_sync(self, output: dict | None, expected: dict | None = None, **kwargs) -> Score:
+        if not _requested(expected, self._name()):
+            return Score(name=self._name(), score=None, metadata={"reason": "not requested"})
+        parser = _parser_for(output)
+        if parser is None:
+            return Score(name=self._name(), score=None, metadata={"reason": "No raw log"})
+        descriptions = _written_descriptions(parser)
+        if not descriptions:
+            # Whether a metric write happened at all is RequiredToolCall's job.
+            return Score(name=self._name(), score=None, metadata={"reason": "no metric write with a description"})
+        over_limit = [
+            {"tool": tool, "length": len(description), "description": description[:200]}
+            for tool, description in descriptions
+            if len(description) > EVAL_DESCRIPTION_CHAR_LIMIT
+        ]
+        return Score(
+            name=self._name(),
+            score=0.0 if over_limit else 1.0,
+            metadata={
+                "limit": EVAL_DESCRIPTION_CHAR_LIMIT,
+                "lengths": [len(description) for _, description in descriptions],
+                "over_limit": over_limit,
+            },
+        )
+
+
+METRIC_DESCRIPTION_QUALITY_PROMPT = """\
+You are grading the 'description' an agent wrote when saving a metric to a governed catalog.
+
+A good description states, in 1-3 sentences, what the metric means and what it serves: the
+business meaning plus any load-bearing inclusions/exclusions or grain. It must not narrate or
+restate the query or calculation steps - those live in the metric's definition, and the agent's
+rationale belongs in the separate 'reasoning' field.
+
+The description to grade:
+<description>{{output.description}}</description>
+
+The metric's definition, for reference, to spot narration:
+<definition>{{output.definition}}</definition>
+
+The agent's reasoning field:
+<reasoning>{{output.reasoning}}</reasoning>
+
+Answer "yes" only if the description is 1-3 sentences stating meaning and purpose without walking
+through the query or calculation steps. Answer "no" if it narrates the query, restates SQL or
+step-by-step mechanics, or pads beyond 3 sentences."""
+
+
+class MetricDescriptionQuality(JudgedScorer):
+    """Binary LLM judge: does the description state meaning, rather than narrate the query?"""
+
+    def __init__(self, **kwargs):
+        super().__init__(
+            name="metric_description_quality",
+            prompt_template=METRIC_DESCRIPTION_QUALITY_PROMPT,
+            choice_scores=BINARY_CHOICE_SCORES,
+            model=JUDGE_MODEL,
+            max_completion_tokens=512,
+            **kwargs,
+        )
+
+    def _prepare(self, output, expected) -> dict[str, Any] | Score:
+        if not _requested(expected, self._name()):
+            return Score(name=self._name(), score=None, metadata={"reason": "not requested"})
+        parser = _parser_for(output)
+        if parser is None:
+            return Score(name=self._name(), score=None, metadata={"reason": "No raw log"})
+        writes = _description_writes(parser)
+        if not writes:
+            return Score(name=self._name(), score=0.0, metadata={"reason": "no successful metric write"})
+        # Grade the description that ends up stored, so a compliant create followed by a
+        # query-narrating update is judged on the update.
+        last = writes[-1]
+        # An update usually omits definition and reasoning, so take each from the most recent
+        # write that supplied it. The judge needs the definition to tell meaning from narration.
+        definition = _latest_field(writes, "definition", dict)
+        reasoning = _latest_field(writes, "reasoning", str)
+        definition_text = json.dumps(definition) if definition is not None else ""
+        if len(definition_text) > _JUDGE_OUTPUT_CHAR_LIMIT:
+            definition_text = definition_text[:_JUDGE_OUTPUT_CHAR_LIMIT] + " …[truncated]"
+        return {
+            "output": {
+                "description": last.input["description"],
+                "definition": definition_text,
+                "reasoning": reasoning or "",
+            }
+        }
+
+
 class MetricsCatalogNotQueried(Scorer):
     """Binary inverse: ordinary exploration must not detour through the metrics catalog."""
 
@@ -304,8 +533,97 @@ class MetricsCatalogNotQueried(Scorer):
         parser = _parser_for(output)
         if parser is None:
             return Score(name=self._name(), score=None, metadata={"reason": "No raw log"})
-        hits = [c for c in _successful_sql(parser) if _is_catalog_lookup(c)]
+        hits = _successful_catalog_lookups(parser)
         return Score(name=self._name(), score=0.0 if hits else 1.0, metadata={"catalog_lookups": len(hits)})
+
+
+class ClarificationAsked(Scorer):
+    """Binary: did the agent ask a catalog clarifying question before any data-bearing call?"""
+
+    def _name(self) -> str:
+        return "clarification_asked"
+
+    def _run_eval_sync(self, output: dict | None, expected: dict | None = None, **kwargs) -> Score:
+        if not _requested(expected, self._name()):
+            return Score(name=self._name(), score=None, metadata={"reason": "not requested"})
+        parser = _parser_for(output)
+        if parser is None:
+            return Score(name=self._name(), score=None, metadata={"reason": "No raw log"})
+
+        question_positions = [call.position for call in parser.get_tool_calls() if _is_question_call(call)]
+        if not question_positions:
+            return Score(name=self._name(), score=0.0, metadata={"reason": "no clarifying question was asked"})
+
+        first_question = min(question_positions)
+        premature = [
+            {"call_id": call.call_id, "tool": call.name}
+            for call in parser.get_tool_calls()
+            if _is_data_bearing(call) and not call.is_error and call.position <= first_question
+        ]
+        if premature:
+            return Score(
+                name=self._name(),
+                score=0.0,
+                metadata={"reason": "answered from data before asking", "offenders": premature},
+            )
+        return Score(name=self._name(), score=1.0, metadata={"question_position": first_question})
+
+
+class ProposedMetricNotRun(Scorer):
+    """Binary: the named non-approved metric must not have been run for the answer."""
+
+    def _name(self) -> str:
+        return "proposed_metric_not_run"
+
+    def _run_eval_sync(self, output: dict | None, expected: dict | None = None, **kwargs) -> Score:
+        spec = expected.get(self._name()) if isinstance(expected, dict) else None
+        if spec is None:
+            return Score(name=self._name(), score=None, metadata={"reason": "not requested"})
+        metric_name = spec.get("metric_name") if isinstance(spec, dict) else None
+        if not isinstance(metric_name, str) or not metric_name:
+            return Score(name=self._name(), score=0.0, metadata={"reason": "metric_name is required"})
+        parser = _parser_for(output)
+        if parser is None:
+            return Score(name=self._name(), score=None, metadata={"reason": "No raw log"})
+
+        runs = [
+            call
+            for call in parser.get_tool_calls(METRIC_RUN_TOOL)
+            if not call.is_error and call.input.get("name") == metric_name
+        ]
+        return Score(
+            name=self._name(),
+            score=0.0 if runs else 1.0,
+            metadata={"metric_name": metric_name, "runs": len(runs)},
+        )
+
+
+class MetricDescribeBeforeAdaptedSql(Scorer):
+    """Soft: SQL adapted from a catalog definition should follow a `metric-describe`."""
+
+    def _name(self) -> str:
+        return "metric_describe_before_adapted_sql"
+
+    def _run_eval_sync(self, output: dict | None, expected: dict | None = None, **kwargs) -> Score:
+        if not _requested(expected, self._name()):
+            return Score(name=self._name(), score=None, metadata={"reason": "not requested"})
+        parser = _parser_for(output)
+        if parser is None:
+            return Score(name=self._name(), score=None, metadata={"reason": "No raw log"})
+
+        analytical_sql = [call for call in _successful_sql(parser) if not _is_catalog_lookup(call)]
+        if not analytical_sql:
+            return Score(name=self._name(), score=1.0, metadata={"reason": "no adapted SQL"})
+        describe_positions = [call.position for call in parser.get_tool_calls(METRIC_DESCRIBE_TOOL)]
+        if not describe_positions:
+            return Score(name=self._name(), score=0.0, metadata={"reason": "adapted SQL without metric-describe"})
+        first_describe = min(describe_positions)
+        late = [call.call_id for call in analytical_sql if call.position < first_describe]
+        return Score(
+            name=self._name(),
+            score=0.0 if late else 1.0,
+            metadata={"sql_before_describe": late},
+        )
 
 
 GOVERNED_BEHAVIOR_PROMPT = """\
@@ -313,7 +631,7 @@ You are grading whether an analytics agent honored a project's governed-metrics 
 
 The rules the agent was given:
 - Business-measure rankings, breakdowns, and comparisons require a metrics-catalog lookup before \
-schema or raw-data discovery.
+schema or raw-data discovery. `metric-list` and SQL over `information_schema.metrics` both count as a lookup.
 - Only a catalog metric with status='approved' AND NOT is_drifted is canonical. A match must align \
 with the requested measure, dimensions, grain, and time semantics, and must be run through \
 data-catalog-metric-run.
@@ -324,7 +642,9 @@ If lookup or execution fails, disclose the failure and label any raw-query fallb
 must derive the number itself (it may note the unapproved definition exists).
 - An empty catalog is normal: the agent must derive the number itself without stalling or \
 asking the user to define/approve a metric first.
-- The catalog is read-only: the agent must not create, edit, or propose metrics to answer.
+- The catalog is read-only: the agent must not create, edit, or propose metrics to answer. \
+Offering, after the answer, to save a reusable derivation as a proposed metric is not a violation; \
+creating one without the user agreeing is.
 
 Case-specific expected behavior:
 {{expected.expected_behavior}}
@@ -335,11 +655,19 @@ The user's question:
 The agent's final answer:
 <final_message>{{output.final_message}}</final_message>
 
-The SQL calls the agent made:
+The SQL calls the agent made (each carries the agent's stated context for that query; a statement \
+there that the governed catalog was consulted and nothing matched counts as catalog evidence):
 <sql_calls>{{output.sql_calls}}</sql_calls>
+
+The governed-metric catalog calls the agent made:
+<metric_catalog_calls>{{output.metric_catalog_calls}}</metric_catalog_calls>
 
 The metric-run calls the agent made:
 <metric_runs>{{output.metric_runs}}</metric_runs>
+
+The metric-create calls the agent made. The user never replies inside a case, so any successful \
+call here is a write the user never consented to:
+<metric_creates>{{output.metric_creates}}</metric_creates>
 
 Grade how well the agent's behavior matches the expected behavior."""
 
@@ -380,7 +708,13 @@ class GovernedBehaviorCorrectness(JudgedScorer):
             return Score(name=self._name(), score=0.0, metadata={"reason": "no final message"})
 
         sql_calls = parser.get_tool_calls(SQL_TOOL) if parser is not None else []
+        metric_catalog_calls = (
+            [*parser.get_tool_calls(METRIC_LIST_TOOL), *parser.get_tool_calls(METRIC_DESCRIBE_TOOL)]
+            if parser is not None
+            else []
+        )
         metric_runs = parser.get_tool_calls(METRIC_RUN_TOOL) if parser is not None else []
+        metric_creates = parser.get_tool_calls(METRIC_CREATE_TOOL) if parser is not None else []
         return {
             "output": {
                 "prompt": (output or {}).get("prompt", ""),
@@ -389,10 +723,22 @@ class GovernedBehaviorCorrectness(JudgedScorer):
                     [
                         {
                             "query": call.input.get("query"),
+                            "context": call.input.get("context"),
                             "output": _judge_output(call),
                             "is_error": call.is_error,
                         }
                         for call in sql_calls
+                    ]
+                ),
+                "metric_catalog_calls": json.dumps(
+                    [
+                        {
+                            "tool": call.name,
+                            "name": call.input.get("name"),
+                            "output": _judge_output(call),
+                            "is_error": call.is_error,
+                        }
+                        for call in metric_catalog_calls
                     ]
                 ),
                 "metric_runs": json.dumps(
@@ -403,6 +749,15 @@ class GovernedBehaviorCorrectness(JudgedScorer):
                             "is_error": call.is_error,
                         }
                         for call in metric_runs
+                    ]
+                ),
+                "metric_creates": json.dumps(
+                    [
+                        {
+                            "name": call.input.get("name"),
+                            "is_error": call.is_error,
+                        }
+                        for call in metric_creates
                     ]
                 ),
             },
@@ -520,3 +875,12 @@ class SemanticTrustDecisionCorrectness(JudgedScorer):
             },
             "expected": {"expected_behavior": spec["expected_behavior"]},
         }
+
+
+CANARY_ROUTING_SCORERS: list[Scorer] = [
+    MetricsCatalogBeforeDataDiscovery(),
+    MetricsCatalogNotQueried(),
+    CanonicalMetricRun(),
+    ClarificationAsked(),
+    MetricDescribeBeforeAdaptedSql(),
+]

@@ -11,9 +11,10 @@ All three converge to create_or_update_slack_ticket().
 
 import re
 import json
-from types import MappingProxyType
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal, NamedTuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from django.conf import settings
@@ -21,28 +22,31 @@ from django.db.models import F
 
 import structlog
 import posthoganalytics
-from slack_sdk import WebClient
 
+from posthog.comment.formatting import (
+    extract_slack_user_ids,
+    slack_to_content_and_rich_content,
+    strip_slack_user_mentions,
+)
+from posthog.egress.slack.client import SlackWebClient as WebClient
 from posthog.event_usage import groups, report_team_action
+from posthog.exceptions_capture import capture_exception
+from posthog.helpers.slack_identity import resolve_posthog_user_for_slack, resolve_slack_user
 from posthog.models.comment import Comment
-from posthog.models.organization import OrganizationMembership
 from posthog.models.team.team import Team
 from posthog.models.user import User
 from posthog.ph_client import ph_scoped_capture
 
+from products.access_control.backend.facade.user_access_control import UserAccessControl
+
 from .cache import (
     NUDGE_COOLDOWN_TTL,
     get_cached_bot_user_id,
-    get_cached_slack_avatar,
-    get_cached_slack_user,
     is_nudge_suppressed,
     set_cached_bot_user_id,
-    set_cached_slack_avatar,
-    set_cached_slack_user,
     slack_ticket_create_lock,
     suppress_nudge,
 )
-from .formatting import extract_slack_user_ids, slack_to_content_and_rich_content, strip_slack_user_mentions
 from .models import Ticket
 from .models.constants import Channel, ChannelDetail, Status
 from .services.attachments import (
@@ -53,11 +57,25 @@ from .services.attachments import (
     sanitize_attachment_filename,
     save_file_to_uploaded_media,
 )
-from .support_slack import SUPPORT_SLACK_ALLOWED_HOST_SUFFIXES, get_support_slack_bot_token
+from .services.inbound_events import (
+    INBOUND_LEASE_RENEW_EVERY_REPLIES,
+    InboundClaim,
+    get_current_inbound_claim,
+    renew_inbound_lease,
+)
+from .support_slack import (
+    SUPPORT_SLACK_ALLOWED_HOST_SUFFIXES,
+    SUPPORT_SLACK_FILE_READ_SCOPE,
+    get_support_slack_bot_token,
+    get_support_slack_workspace_id,
+    supporthog_missing_file_scopes,
+)
 
 logger = structlog.get_logger(__name__)
 SLACK_DOWNLOAD_TIMEOUT_SECONDS = 10
 MAX_REDIRECTS = 5
+# 200 replies per page. Stop so a runaway next_cursor cannot hold the worker.
+BACKFILL_THREAD_MAX_PAGES = 25
 
 # Slack message subtypes that carry real, user-authored content and may open or update a
 # ticket. A normal message has no subtype at all; these few subtypes also count as content
@@ -111,6 +129,10 @@ def get_safe_ticket_emoji(settings_dict: dict) -> str:
 TICKET_CONFIRM_ACTION_OPEN = "supporthog_open_ticket_confirm"
 TICKET_CONFIRM_ACTION_DISMISS = "supporthog_open_ticket_dismiss"
 
+# "View ticket" button on a ticket confirmation. The URL stays out of the message because
+# Slack has no message that only part of a channel can see (see _post_ticket_link).
+TICKET_VIEW_ACTION = "supporthog_view_ticket"
+
 
 def _get_team_id(team: Team) -> int:
     team_id = getattr(team, "id", None)
@@ -122,6 +144,50 @@ def _get_team_id(team: Team) -> int:
 def ticket_created_text(ticket: "Ticket | None") -> str:
     """Copy for message to confirm creation of ticket."""
     return f":ticket: Ticket #{ticket.ticket_number} created" if ticket else ":ticket: Ticket created"
+
+
+def ticket_deep_link(ticket: "Ticket", team: Team) -> str:
+    """App URL for a ticket. The detail scene is addressed by ticket number, not by UUID."""
+    return f"{settings.SITE_URL}/project/{_get_team_id(team)}/support/tickets/{ticket.ticket_number}"
+
+
+def my_tickets_link(ticket: "Ticket") -> str:
+    """Deep link into the requester's own ticket list, opened on this ticket.
+
+    A Slack ticket is keyed by the author's Slack profile email and created
+    ``identity_verified``, which is what the widget's email bridge matches on
+    (``api/widget.py:_identity_ticket_filter``), so it reaches a requester whose verified
+    PostHog email is that same address. For anyone else the scene clears the unresolvable
+    id and renders their plain list, so the link degrades instead of erroring. The id is
+    not a capability: widget access is decided by the viewer's session and attested email,
+    never by knowing a ticket's UUID.
+    """
+    return f"{settings.SITE_URL}/my-tickets?{urlencode({'ticket': str(ticket.id)})}"
+
+
+def ticket_created_blocks(ticket: "Ticket | None") -> list[dict]:
+    """Blocks for the ticket confirmation, carrying a "View ticket" button when there is a ticket.
+
+    The button holds the ticket number rather than the link, so the channel never shows the URL.
+    Without a ticket there is nothing to view, so the section stands alone.
+    """
+    blocks: list[dict] = [{"type": "section", "text": {"type": "mrkdwn", "text": ticket_created_text(ticket)}}]
+    if ticket is None:
+        return blocks
+    blocks.append(
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": TICKET_VIEW_ACTION,
+                    "text": {"type": "plain_text", "text": "View ticket", "emoji": True},
+                    "value": json.dumps({"ticket_number": ticket.ticket_number}),
+                }
+            ],
+        }
+    )
+    return blocks
 
 
 class _NoRedirectHandler(HTTPRedirectHandler):
@@ -137,93 +203,13 @@ def get_slack_client(team: Team) -> WebClient:
     """
     bot_token = get_support_slack_bot_token(team)
     if bot_token:
-        return WebClient(token=bot_token)
-    raise ValueError("Support Slack bot token is not configured")
-
-
-_UNKNOWN_USER = MappingProxyType({"name": "Unknown", "email": None, "avatar": None})
-
-
-def resolve_slack_user(client: WebClient, slack_user_id: str) -> dict:
-    """Resolve a Slack user ID to name, email, and avatar. Cached in Redis for 5 minutes."""
-    if not slack_user_id:
-        logger.warning("slack_support_user_resolve_empty_id")
-        return dict(_UNKNOWN_USER)
-
-    cached = get_cached_slack_user(slack_user_id)
-    if cached is not None:
-        return cached
-
-    try:
-        response = client.users_info(user=slack_user_id)
-        raw_data = response.data if hasattr(response, "data") else None
-        data: dict = raw_data if isinstance(raw_data, dict) else {}
-
-        if not data.get("ok"):
-            logger.warning(
-                "slack_support_user_resolve_not_ok",
-                slack_user_id=slack_user_id,
-                error=data.get("error"),
-            )
-            return dict(_UNKNOWN_USER)
-
-        user_data = data.get("user") or {}
-        profile = user_data.get("profile") or {}
-        name = profile.get("display_name") or profile.get("real_name") or "Unknown"
-        result = {
-            "name": name,
-            "email": profile.get("email"),
-            "avatar": profile.get("image_72"),
-        }
-        set_cached_slack_user(slack_user_id, result)
-        return result
-    except Exception as e:
-        logger.warning("slack_support_user_resolve_failed", slack_user_id=slack_user_id, error=str(e))
-        return dict(_UNKNOWN_USER)
-
-
-def resolve_slack_avatar_by_email(client: WebClient, email: str) -> str | None:
-    """Look up a Slack user by email and return their profile image URL. Cached in Redis."""
-    if not email:
-        return None
-
-    cached = get_cached_slack_avatar(email)
-    if cached is not None:
-        return cached or None  # empty string = negative cache
-
-    try:
-        response = client.users_lookupByEmail(email=email)
-        raw_data = response.data if hasattr(response, "data") else None
-        data: dict = raw_data if isinstance(raw_data, dict) else {}
-
-        if not data.get("ok"):
-            set_cached_slack_avatar(email, "")
-            return None
-
-        profile = (data.get("user") or {}).get("profile") or {}
-        avatar = profile.get("image_72") or ""
-        set_cached_slack_avatar(email, avatar)
-        return avatar or None
-    except Exception:
-        # Don't negative-cache on transient errors (rate limits, network)
-        # so the next reply retries the lookup.
-        logger.warning("slack_avatar_lookup_failed", email=email)
-        return None
-
-
-def resolve_posthog_user_for_slack(email: str | None, team: Team) -> User | None:
-    """Match a Slack user's email to a PostHog user within the team's organization."""
-    if not email:
-        return None
-    membership = (
-        OrganizationMembership.objects.filter(
-            organization_id=team.organization_id,
-            user__email=email,
+        return WebClient(
+            token=bot_token,
+            source="conversations",
+            workspace_id=get_support_slack_workspace_id(team),
+            app_id="support",
         )
-        .select_related("user")
-        .first()
-    )
-    return membership.user if membership else None
+    raise ValueError("Support Slack bot token is not configured")
 
 
 def get_bot_user_id(client: WebClient) -> str | None:
@@ -260,7 +246,7 @@ def _is_allowed_slack_file_url(url: str) -> bool:
     return any(hostname == suffix or hostname.endswith(f".{suffix}") for suffix in SUPPORT_SLACK_ALLOWED_HOST_SUFFIXES)
 
 
-def _download_slack_image_bytes(url: str, bot_token: str) -> bytes | None:
+def _download_slack_image_bytes(url: str, bot_token: str, expected_mimetype: str = "") -> bytes | None:
     if not _is_allowed_slack_file_url(url):
         logger.warning("🖼️ slack_file_download_invalid_host", url=url)
         return None
@@ -287,6 +273,20 @@ def _download_slack_image_bytes(url: str, bot_token: str) -> bytes | None:
 
             if status != 200:
                 logger.warning("🖼️ slack_file_download_non_200", url=next_url, status=status)
+                return None
+
+            # A rejected file request (a revoked or downgraded token) lands on a Slack sign-in page
+            # served as a 200. Storing that as the customer's attachment is worse than having none,
+            # and only images get byte validation. Callers skip the request entirely when the
+            # install is known to lack files:read, which is the case this can't catch on its own:
+            # a sign-in page and a genuine text/html attachment look the same here.
+            content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if content_type == "text/html" and expected_mimetype.lower() != "text/html":
+                logger.warning(
+                    "🖼️ slack_file_download_unexpected_html",
+                    url=next_url,
+                    expected_mimetype=expected_mimetype,
+                )
                 return None
 
             content_length_header = response.headers.get("Content-Length")
@@ -321,11 +321,90 @@ def _download_slack_image_bytes(url: str, bot_token: str) -> bytes | None:
     return None
 
 
-def split_slack_attachments(attachments: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Partition extracted attachments into (images, non-image files) by mimetype."""
-    images = [a for a in attachments if (a.get("mimetype") or "").startswith("image/")]
-    files = [a for a in attachments if not (a.get("mimetype") or "").startswith("image/")]
-    return images, files
+def _is_inline_image(attachment: dict) -> bool:
+    return (attachment.get("mimetype") or "").startswith("image/") and not attachment.get("unavailable")
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class SplitAttachments:
+    images: list[dict]
+    files: list[dict]
+
+
+def split_slack_attachments(attachments: list[dict]) -> SplitAttachments:
+    """Partition extracted attachments into images and non-image files by mimetype.
+
+    Attachments we couldn't re-host go to the file bucket whatever their mimetype:
+    they point at Slack, so they can only be rendered as a link, not inlined.
+    """
+    images = [a for a in attachments if _is_inline_image(a)]
+    files = [a for a in attachments if not _is_inline_image(a)]
+    return SplitAttachments(images=images, files=files)
+
+
+def _rehost_slack_file(f: dict, team: Team, bot_token: str | None) -> dict | None:
+    """Copy one Slack file into UploadedMedia, or None when it can't be read or stored."""
+    mimetype = f.get("mimetype", "")
+    is_image = mimetype.startswith("image/")
+    file_id = f.get("id")
+
+    source_url = f.get("url_private_download") or f.get("url_private")
+    if not source_url or not bot_token:
+        logger.warning(
+            "🖼️ slack_file_missing_download_info",
+            file_id=file_id,
+            has_source_url=bool(source_url),
+            has_bot_token=bool(bot_token),
+        )
+        return None
+
+    try:
+        file_bytes = _download_slack_image_bytes(source_url, bot_token, expected_mimetype=mimetype)
+    except Exception as e:
+        logger.warning("🖼️ slack_file_download_failed", file_id=file_id, error=str(e))
+        return None
+
+    if not file_bytes:
+        logger.warning("🖼️ slack_file_download_rejected", file_id=file_id, source_url=source_url)
+        return None
+
+    # Only images get byte-level validation; other types are stored as-is and
+    # served as opaque downloads by the media endpoint.
+    if is_image and not is_valid_image(file_bytes):
+        logger.warning("🖼️ slack_file_invalid_image_content", file_id=file_id)
+        return None
+
+    safe_name = sanitize_attachment_filename(f.get("name"))
+    stored_url = save_file_to_uploaded_media(team, safe_name, mimetype, file_bytes, validate_images=False)
+    if not stored_url:
+        logger.warning("🖼️ slack_file_copy_save_failed", file_id=file_id)
+        return None
+
+    attachment = {
+        "url": stored_url,
+        "name": safe_name,
+        "mimetype": mimetype,
+    }
+    if is_image:
+        attachment["thumb"] = f.get("thumb_360") or f.get("thumb_160")
+    return attachment
+
+
+def _slack_hosted_fallback(f: dict) -> dict | None:
+    """A link back to the file in Slack, for when re-hosting failed.
+
+    Without this the attachment vanishes from the ticket with no trace, which reads as
+    "the customer sent nothing". Most often this is an install missing files:read.
+    """
+    permalink = f.get("permalink")
+    if not isinstance(permalink, str) or not _is_allowed_slack_file_url(permalink):
+        return None
+    return {
+        "url": permalink,
+        "name": sanitize_attachment_filename(f.get("name")),
+        "mimetype": f.get("mimetype", ""),
+        "unavailable": True,
+    }
 
 
 def extract_slack_files(files: list[dict] | None, team: Team, client: WebClient | None = None) -> list[dict]:
@@ -340,53 +419,29 @@ def extract_slack_files(files: list[dict] | None, team: Team, client: WebClient 
 
     team_id = _get_team_id(team)
     bot_token = getattr(client, "token", None) if client else None
+    # Slack answers an unauthorized download with a 200 sign-in page, which is indistinguishable
+    # from a genuine text/html attachment. So don't ask: we've requested files:read for as long as
+    # we've recorded granted scopes, meaning an install with none recorded definitively lacks it.
+    missing_file_scopes = supporthog_missing_file_scopes(team)
+    can_read_files = SUPPORT_SLACK_FILE_READ_SCOPE not in missing_file_scopes
     logger.info("🖼️ slack_file_extract_started", team_id=team_id, total_files=len(files), has_bot_token=bool(bot_token))
     attachments: list[dict] = []
+    unavailable_count = 0
     for f in files[:MAX_ATTACHMENTS_PER_MESSAGE]:
-        mimetype = f.get("mimetype", "")
-        is_image = mimetype.startswith("image/")
-
-        file_id = f.get("id")
-        source_url = f.get("url_private_download") or f.get("url_private")
-        if not source_url or not bot_token:
-            logger.warning(
-                "🖼️ slack_file_missing_download_info",
-                file_id=file_id,
-                has_source_url=bool(source_url),
-                has_bot_token=bool(bot_token),
-            )
-            continue
-
-        try:
-            file_bytes = _download_slack_image_bytes(source_url, bot_token)
-        except Exception as e:
-            logger.warning("🖼️ slack_file_download_failed", file_id=file_id, error=str(e))
-            continue
-
-        if not file_bytes:
-            logger.warning("🖼️ slack_file_download_rejected", file_id=file_id, source_url=source_url)
-            continue
-
-        # Only images get byte-level validation; other types are stored as-is and
-        # served as opaque downloads by the media endpoint.
-        if is_image and not is_valid_image(file_bytes):
-            logger.warning("🖼️ slack_file_invalid_image_content", file_id=file_id)
-            continue
-
-        safe_name = sanitize_attachment_filename(f.get("name"))
-        stored_url = save_file_to_uploaded_media(team, safe_name, mimetype, file_bytes, validate_images=False)
-        if stored_url:
-            attachment = {
-                "url": stored_url,
-                "name": safe_name,
-                "mimetype": mimetype,
-            }
-            if is_image:
-                attachment["thumb"] = f.get("thumb_360") or f.get("thumb_160")
+        attachment = _rehost_slack_file(f, team, bot_token) if can_read_files else None
+        if attachment is None:
+            attachment = _slack_hosted_fallback(f)
+            unavailable_count += 1
+        if attachment:
             attachments.append(attachment)
-        else:
-            logger.warning("🖼️ slack_file_copy_save_failed", file_id=file_id)
     logger.info("🖼️ slack_file_extract_finished", team_id=team_id, attachment_count=len(attachments))
+    if unavailable_count:
+        logger.warning(
+            "🖼️ slack_file_extract_incomplete",
+            team_id=team_id,
+            unavailable_count=unavailable_count,
+            missing_file_scopes=missing_file_scopes,
+        )
     return attachments
 
 
@@ -428,10 +483,10 @@ def create_or_update_slack_ticket(
     )
 
     # Extract attachments from Slack files, making them publicly accessible
-    images, file_attachments = split_slack_attachments(extract_slack_files(files, team, client))
+    attachments = split_slack_attachments(extract_slack_files(files, team, client))
 
     # Resolve Slack user info for this message author
-    user_info = resolve_slack_user(client, slack_user_id)
+    user_info = resolve_slack_user(client, slack_user_id, workspace=slack_team_id or "")
 
     # Check if this Slack user is a PostHog team member
     posthog_user = resolve_posthog_user_for_slack(user_info.get("email"), team)
@@ -444,7 +499,7 @@ def create_or_update_slack_ticket(
         if uid == slack_user_id and user_info["name"] != "Unknown":
             user_names[uid] = user_info["name"]
         elif uid not in user_names:
-            info = resolve_slack_user(client, uid)
+            info = resolve_slack_user(client, uid, workspace=slack_team_id or "")
             if info["name"] != "Unknown":
                 user_names[uid] = info["name"]
 
@@ -469,7 +524,7 @@ def create_or_update_slack_ticket(
             Ticket.objects.filter(id=ticket.id, team=team).update(slack_team_id=slack_team_id)
 
         # Allow messages with only attachments (no text)
-        if not cleaned_text and not images and not file_attachments:
+        if not cleaned_text and not attachments.images and not attachments.files:
             logger.warning(
                 "🧵 slack_support_ticket_ingest_empty_after_processing",
                 team_id=team_id,
@@ -479,7 +534,9 @@ def create_or_update_slack_ticket(
             )
             return ticket
 
-        content, rich_content = build_content_with_images(cleaned_text, rich_content, images, file_attachments)
+        content, rich_content = build_content_with_images(
+            cleaned_text, rich_content, attachments.images, attachments.files
+        )
 
         Comment.objects.create(
             team=team,
@@ -496,8 +553,8 @@ def create_or_update_slack_ticket(
                 "slack_author_name": user_info["name"],
                 "slack_author_email": user_info.get("email"),
                 "slack_author_avatar": user_info.get("avatar"),
-                "slack_images": images if images else None,
-                "slack_files": file_attachments if file_attachments else None,
+                "slack_images": attachments.images if attachments.images else None,
+                "slack_files": attachments.files if attachments.files else None,
             },
         )
 
@@ -510,7 +567,7 @@ def create_or_update_slack_ticket(
 
     # New ticket from top-level message
     # Allow messages with only attachments (no text)
-    if not cleaned_text and not images and not file_attachments:
+    if not cleaned_text and not attachments.images and not attachments.files:
         logger.warning(
             "🧵 slack_support_ticket_ingest_empty_after_processing",
             team_id=team_id,
@@ -520,7 +577,7 @@ def create_or_update_slack_ticket(
         )
         return None
 
-    content, rich_content = build_content_with_images(cleaned_text, rich_content, images, file_attachments)
+    content, rich_content = build_content_with_images(cleaned_text, rich_content, attachments.images, attachments.files)
 
     # Serialize concurrent ticket creation for the same Slack thread via Redis lock.
     # Without this, two reaction_added events from different users race through the
@@ -578,8 +635,8 @@ def create_or_update_slack_ticket(
             "slack_author_name": user_info["name"],
             "slack_author_email": user_info.get("email"),
             "slack_author_avatar": user_info.get("avatar"),
-            "slack_images": images if images else None,
-            "slack_files": file_attachments if file_attachments else None,
+            "slack_images": attachments.images if attachments.images else None,
+            "slack_files": attachments.files if attachments.files else None,
         },
     )
 
@@ -591,15 +648,7 @@ def create_or_update_slack_ticket(
             "channel": slack_channel_id,
             "thread_ts": thread_ts,
             "text": f"Ticket #{ticket.ticket_number} created.",
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": ticket_created_text(ticket),
-                    },
-                },
-            ],
+            "blocks": ticket_created_blocks(ticket),
         }
         bot_display_name = support_settings.get("slack_bot_display_name")
         bot_icon_url = support_settings.get("slack_bot_icon_url")
@@ -629,12 +678,48 @@ def _configured_support_channels(settings: dict) -> set[str]:
     return ids
 
 
+def _record_last_slack_message(
+    team: Team, *, channel: str, slack_user_id: str, message_ts: str | None, is_bot: bool, slack_team_id: str
+) -> None:
+    """Record the message time on the customer analytics account bound to `channel`.
+
+    Bound means the account carries the channel in its ``slack_channel_id`` property, which is
+    independent of ticketing — so this covers every channel the bot can see, not only the
+    configured support channels. Bots and PostHog teammates aren't customers, so their messages
+    don't count. Failures are captured and swallowed: this must not stop the ticket path.
+    """
+    if is_bot or not message_ts:
+        return
+
+    from products.customer_analytics.backend.facade import api as customer_analytics  # noqa: PLC0415
+
+    try:
+        team_id = _get_team_id(team)
+        account = customer_analytics.get_account_ref_by_slack_channel_id(team_id, channel)
+        if account is None:
+            return
+        slack_user = resolve_slack_user(get_slack_client(team), slack_user_id, workspace=slack_team_id)
+        # An unresolved email may belong to a teammate, so treat it as one.
+        email = slack_user.get("email")
+        if not email or resolve_posthog_user_for_slack(email, team):
+            return
+        customer_analytics.record_last_slack_message_at(
+            team_id=team_id,
+            account_id=account.id,
+            timestamp=datetime.fromtimestamp(float(message_ts), tz=UTC),
+        )
+    except Exception as e:
+        capture_exception(e, {"team_id": getattr(team, "id", None), "slack_channel_id": channel})
+
+
 def handle_support_message(event: dict, team: Team, slack_team_id: str) -> None:
     """
     Handle a Slack 'message' event for configured support channels.
 
     Top-level messages create new tickets.
     Thread replies add messages to existing tickets.
+    Any message from a customer also records the time on the account bound to the channel,
+    whether or not the channel is a support channel.
     """
     channel = event.get("channel")
     if not channel:
@@ -659,6 +744,15 @@ def handle_support_message(event: dict, team: Team, slack_team_id: str) -> None:
     configured_channels = _configured_support_channels(settings_dict)
     thread_ts = event.get("thread_ts")
     message_ts = event.get("ts")
+
+    _record_last_slack_message(
+        team,
+        channel=channel,
+        slack_user_id=slack_user_id,
+        message_ts=message_ts,
+        is_bot=is_bot,
+        slack_team_id=slack_team_id,
+    )
 
     if thread_ts:
         if is_bot:
@@ -702,7 +796,9 @@ def handle_support_message(event: dict, team: Team, slack_team_id: str) -> None:
         # click "Open ticket" (handled by the interactivity endpoint). Heuristics
         # keep us from pestering the whole channel.
         if settings_dict.get("slack_nudge_enabled", True):
-            decision = _should_send_nudge(team, channel, slack_user_id, text, blocks, files, message_ts or "")
+            decision = _should_send_nudge(
+                team, channel, slack_user_id, text, blocks, files, message_ts or "", slack_team_id
+            )
             if decision.send:
                 post_ticket_confirmation_prompt(
                     team=team,
@@ -801,10 +897,10 @@ def nudge_event_properties(
     }
 
 
-def capture_nudge_event(team: Team, event: str, properties: dict[str, Any]) -> None:
-    """Internal product analytics for the nudge funnel, attributed to the team like
-    report_team_action — but through a scoped client, since both call sites run in
-    Celery tasks where the global client's flush can be lost."""
+def capture_support_event(team: Team, event: str, properties: dict[str, Any]) -> None:
+    """Internal product analytics attributed to the team like report_team_action — but through
+    a scoped client, since every call site runs in a Celery task where the global client's
+    flush can be lost."""
     with ph_scoped_capture() as capture:
         capture(
             distinct_id=str(team.uuid),
@@ -812,6 +908,11 @@ def capture_nudge_event(team: Team, event: str, properties: dict[str, Any]) -> N
             properties=properties,
             groups=groups(team=team),
         )
+
+
+def capture_nudge_event(team: Team, event: str, properties: dict[str, Any]) -> None:
+    """Internal product analytics for the nudge funnel."""
+    capture_support_event(team, event, properties)
 
 
 def _is_nudge_classifier_flag_enabled(team: Team) -> bool:
@@ -913,6 +1014,7 @@ def _should_send_nudge(
     blocks: list[dict] | None,
     files: list[dict] | None,
     message_ts: str,
+    slack_team_id: str,
 ) -> NudgeDecision:
     """Heuristics to avoid pestering the channel: nudge only external users on substantive
     messages, skipping anyone recently nudged/dismissed or who @mentioned the bot (which
@@ -936,7 +1038,7 @@ def _should_send_nudge(
     # External users only — internal teammates don't need nudging. Skipped in local
     # dev, where the tester's own account is the only org member and would never nudge.
     if not settings.DEBUG:
-        user_info = resolve_slack_user(client, slack_user_id)
+        user_info = resolve_slack_user(client, slack_user_id, workspace=slack_team_id)
         if resolve_posthog_user_for_slack(user_info.get("email"), team):
             return NudgeDecision(send=False, classifier_verdict="skipped")
 
@@ -1065,8 +1167,14 @@ def _create_ticket_and_backfill(
         post_confirmation=post_confirmation,
     )
     if ticket:
-        _backfill_thread_replies(client, team, ticket, slack_channel_id, thread_ts, after_ts=after_ts)
+        _backfill_thread_replies(
+            client, team, ticket, slack_channel_id, thread_ts, slack_team_id=slack_team_id, after_ts=after_ts
+        )
     return ticket
+
+
+class SlackConfirmationNeedsRetry(Exception):
+    """Transient confirmation failure. The interactivity handler retries this."""
 
 
 def create_ticket_from_confirmation(
@@ -1081,9 +1189,8 @@ def create_ticket_from_confirmation(
     Mirrors the emoji-reaction path: re-fetch the source message, create the ticket, then
     backfill any replies posted while the prompt was pending. Idempotent — a duplicate
     click returns the already-open ticket so the caller can confirm rather than error.
-    Returns None on genuine failure (source message gone, fetch error, empty content), but
-    also when a concurrent duplicate delivery holds the create lock mid-flight — callers
-    should treat None as retryable, since a re-run resolves to the winner's committed ticket.
+    Returns None only for a missing or unusable source message.
+    Raises SlackConfirmationNeedsRetry for Slack fetch errors and create-lock contention.
     """
     existing = Ticket.objects.filter(team=team, slack_channel_id=slack_channel_id, slack_thread_ts=message_ts).first()
     if existing:
@@ -1101,9 +1208,9 @@ def create_ticket_from_confirmation(
             limit=1,
         )
         messages: list[dict] = result.get("messages", [])
-    except Exception:
+    except Exception as exc:
         logger.warning("slack_support_confirmation_fetch_failed", channel=slack_channel_id, message_ts=message_ts)
-        return None
+        raise SlackConfirmationNeedsRetry from exc
 
     if not messages:
         return None
@@ -1120,7 +1227,7 @@ def create_ticket_from_confirmation(
     if not original_msg.get("user") or (not original_text.strip() and not original_msg.get("files")):
         return None
 
-    return _create_ticket_and_backfill(
+    ticket = _create_ticket_and_backfill(
         client=client,
         team=team,
         slack_channel_id=slack_channel_id,
@@ -1131,6 +1238,9 @@ def create_ticket_from_confirmation(
         # The interactivity handler updates the prompt in place into the confirmation.
         post_confirmation=False,
     )
+    if ticket is None:
+        raise SlackConfirmationNeedsRetry
+    return ticket
 
 
 def handle_support_mention(event: dict, team: Team, slack_team_id: str) -> None:
@@ -1229,13 +1339,47 @@ def handle_support_mention(event: dict, team: Team, slack_team_id: str) -> None:
     )
 
 
+def _renew_backfill_lease(claim: InboundClaim | None) -> InboundClaim | None:
+    """Extend the inbound lease. On fencing failure or renew error return None and keep going.
+
+    create_or_update_slack_ticket returns None to losers so they do not backfill.
+    This worker already created the ticket, so aborting here would drop the rest of
+    the thread permanently. Fencing still stops this worker settling the receipt.
+    """
+    if claim is None:
+        return None
+    try:
+        if renew_inbound_lease(claim):
+            return claim
+    except Exception as exc:
+        capture_exception(
+            exc,
+            {"inbound_event_id": str(claim.event.id), "fencing_token": claim.event.fencing_token},
+        )
+        logger.warning(
+            "inbound_event_lease_renew_error",
+            inbound_event_id=str(claim.event.id),
+            fencing_token=claim.event.fencing_token,
+        )
+        return None
+    logger.warning(
+        "inbound_event_lease_renew_rejected",
+        inbound_event_id=str(claim.event.id),
+        fencing_token=claim.event.fencing_token,
+    )
+    return None
+
+
 def _backfill_thread_replies(
     client: WebClient,
     team: Team,
     ticket: Ticket,
     channel: str,
     thread_ts: str,
+    *,
+    slack_team_id: str | None,
     after_ts: str | None = None,
+    claim: InboundClaim | None = None,
 ) -> None:
     """Fetch existing thread replies and add them as comments on the ticket.
 
@@ -1244,12 +1388,31 @@ def _backfill_thread_replies(
     isn't pulled in. Slack ts values are lexicographically ordered, so string comparison is
     safe.
     """
-    try:
-        result = client.conversations_replies(channel=channel, ts=thread_ts, limit=200)
-        replies: list[dict] = result.get("messages", [])
-    except Exception:
-        logger.warning("slack_support_reaction_backfill_failed", channel=channel, thread_ts=thread_ts)
-        return
+    active_claim = claim if claim is not None else get_current_inbound_claim()
+    replies: list[dict] = []
+    cursor: str | None = None
+    for _ in range(BACKFILL_THREAD_MAX_PAGES):
+        kwargs: dict[str, Any] = {"channel": channel, "ts": thread_ts, "limit": 200}
+        if cursor is not None:
+            kwargs["cursor"] = cursor
+        try:
+            result = client.conversations_replies(**kwargs)
+        except Exception:
+            logger.warning("slack_support_reaction_backfill_failed", channel=channel, thread_ts=thread_ts)
+            break
+        replies.extend(result.get("messages") or [])
+        next_cursor = ((result.get("response_metadata") or {}).get("next_cursor")) or None
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+        active_claim = _renew_backfill_lease(active_claim)
+    else:
+        logger.warning(
+            "slack_support_reaction_backfill_page_cap",
+            channel=channel,
+            thread_ts=thread_ts,
+            max_pages=BACKFILL_THREAD_MAX_PAGES,
+        )
 
     thread_replies = [
         r for r in replies if r.get("ts") != thread_ts and (after_ts is None or (r.get("ts") or "") > after_ts)
@@ -1265,6 +1428,8 @@ def _backfill_thread_replies(
         thread_reply_count=len(thread_replies),
     )
 
+    active_claim = _renew_backfill_lease(active_claim)
+
     own_bot_user_id = get_bot_user_id(client)
     user_cache: dict[str, dict] = {}
     posthog_user_cache: dict[str, User | None] = {}
@@ -1272,7 +1437,9 @@ def _backfill_thread_replies(
     customer_message_count = 0
     team_message_count = 0
 
-    for reply in thread_replies:
+    for reply_index, reply in enumerate(thread_replies, start=1):
+        if reply_index % INBOUND_LEASE_RENEW_EVERY_REPLIES == 0:
+            active_claim = _renew_backfill_lease(active_claim)
         reply_is_bot = bool(reply.get("bot_id") or reply.get("subtype") == "bot_message")
         if not _is_ticketable_message(reply, is_bot=reply_is_bot):
             continue
@@ -1289,10 +1456,10 @@ def _backfill_thread_replies(
         if not reply_text.strip() and not reply_files:
             continue
 
-        images, file_attachments = split_slack_attachments(extract_slack_files(reply_files, team, client))
+        attachments = split_slack_attachments(extract_slack_files(reply_files, team, client))
 
         if reply_user not in user_cache:
-            user_cache[reply_user] = resolve_slack_user(client, reply_user)
+            user_cache[reply_user] = resolve_slack_user(client, reply_user, workspace=slack_team_id or "")
         user_info = user_cache[reply_user]
 
         if reply_user not in posthog_user_cache:
@@ -1305,14 +1472,14 @@ def _backfill_thread_replies(
         reply_user_names: dict[str, str] = {}
         for uid in mentioned_ids:
             if uid not in user_cache:
-                user_cache[uid] = resolve_slack_user(client, uid)
+                user_cache[uid] = resolve_slack_user(client, uid, workspace=slack_team_id or "")
             if user_cache[uid]["name"] != "Unknown":
                 reply_user_names[uid] = user_cache[uid]["name"]
 
         cleaned_text, rich_content = slack_to_content_and_rich_content(
             reply_text, reply_blocks, user_names=reply_user_names
         )
-        if not cleaned_text and not images and not file_attachments:
+        if not cleaned_text and not attachments.images and not attachments.files:
             continue
 
         if is_team_member:
@@ -1320,7 +1487,9 @@ def _backfill_thread_replies(
         else:
             customer_message_count += 1
 
-        content, rich_content = build_content_with_images(cleaned_text, rich_content, images, file_attachments)
+        content, rich_content = build_content_with_images(
+            cleaned_text, rich_content, attachments.images, attachments.files
+        )
 
         comments_to_create.append(
             Comment(
@@ -1338,8 +1507,8 @@ def _backfill_thread_replies(
                     "slack_author_name": user_info["name"],
                     "slack_author_email": user_info.get("email"),
                     "slack_author_avatar": user_info.get("avatar"),
-                    "slack_images": images if images else None,
-                    "slack_files": file_attachments if file_attachments else None,
+                    "slack_images": attachments.images if attachments.images else None,
+                    "slack_files": attachments.files if attachments.files else None,
                 },
             )
         )
@@ -1366,6 +1535,184 @@ def _backfill_thread_replies(
         thread_ts=thread_ts,
         ticket_id=str(ticket.id),
         backfilled_count=len(comments_to_create),
+    )
+
+
+# Must stay in step with ticket_deep_link, which writes the URLs this matches. The digit bounds
+# are load-bearing: this runs on any pasted link before the gates below, and int() raises above
+# 4300 digits, so \d+ would let a crafted URL raise and leave a retried event behind. Ten digits
+# covers everything the ticket_number column can hold.
+_TICKET_URL_PATH_RE = re.compile(r"^/project/(?P<project_id>\d{1,10})/support/tickets/(?P<ticket_number>\d{1,10})/?$")
+
+# Anything that puts someone outside this workspace in the room: Slack Connect, an invitation
+# to it, Enterprise Grid cross-workspace sharing, and direct messages. A DM cannot reach us
+# today (link_shared needs im:history/mpim:history, which SupportHog does not request), but
+# the rule belongs in this gate rather than in the scope list, where a later feature could
+# widen it by accident.
+_NON_INTERNAL_CHANNEL_FLAGS = (
+    "is_ext_shared",
+    "is_pending_ext_shared",
+    "is_org_shared",
+    "is_shared",
+    "is_im",
+    "is_mpim",
+)
+
+MAX_UNFURLS_PER_MESSAGE = 5
+
+
+def ticket_number_from_url(url: str, team: Team) -> int | None:
+    """The ticket number in one of this install's own ticket URLs, else None.
+
+    Host and project both have to match. A link to another region or another project is a
+    different ticket, and its number would otherwise resolve against this team to a real but
+    unrelated ticket.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if parsed.netloc.lower() != urlparse(settings.SITE_URL).netloc.lower():
+        return None
+    match = _TICKET_URL_PATH_RE.match(parsed.path)
+    if not match:
+        return None
+    if int(match.group("project_id")) != _get_team_id(team):
+        return None
+    return int(match.group("ticket_number"))
+
+
+def _slack_date(value: datetime) -> str:
+    """Render a timestamp in each reader's own timezone, with an ISO fallback."""
+    return f"<!date^{int(value.timestamp())}^{{date_short_pretty}} at {{time}}|{value.isoformat()}>"
+
+
+def ticket_unfurl(ticket: "Ticket", team: Team) -> dict:
+    """The preview card for a pasted ticket link.
+
+    Status and timings only. No message text, requester or email: the reader is whoever is in
+    the channel, which is a wider audience than the people working the ticket, and a preview
+    nobody asked for is the wrong place to widen who sees a customer's words.
+    """
+    fields = [
+        {"type": "mrkdwn", "text": f"*Status*\n{ticket.get_status_display()}"},
+        {"type": "mrkdwn", "text": f"*Priority*\n{ticket.get_priority_display() if ticket.priority else 'Not set'}"},
+        {"type": "mrkdwn", "text": f"*Created*\n{_slack_date(ticket.created_at)}"},
+        {"type": "mrkdwn", "text": f"*Last updated*\n{_slack_date(ticket.updated_at)}"},
+    ]
+    return {
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*<{ticket_deep_link(ticket, team)}|Ticket #{ticket.ticket_number}>*",
+                },
+            },
+            {"type": "section", "fields": fields},
+        ]
+    }
+
+
+def _is_internal_channel(client: WebClient, channel: str) -> bool:
+    """Whether `channel` is an ordinary channel of this workspace alone.
+
+    Fails closed, twice over: a channel we cannot read is one we cannot prove is internal, and
+    only a payload that positively identifies itself as a channel or private group passes, so
+    an unfamiliar shape is rejected rather than read as "no external flags, so internal". An
+    unfurl is irreversible once it renders for someone outside the organization.
+
+    Known residual: a Slack guest invited straight into the workspace (single- or
+    multi-channel) is a workspace member as far as these flags go, so a channel holding one
+    still counts as internal. Slack offers no per-channel guest signal, and proving every
+    member belongs to the organization would mean paginating the member list on every pasted
+    link. The card carries metadata only and the link itself was already posted by a member,
+    so the incremental exposure is status and timings rather than a ticket.
+    """
+    try:
+        response = client.conversations_info(channel=channel)
+    except Exception:
+        logger.warning("slack_support_unfurl_channel_lookup_failed", slack_channel_id=channel)
+        return False
+    info = response.get("channel") or {}
+    if any(info.get(flag) for flag in _NON_INTERNAL_CHANNEL_FLAGS):
+        return False
+    return bool(info.get("is_channel") or info.get("is_group"))
+
+
+def handle_link_shared(event: dict, team: Team, slack_team_id: str) -> None:
+    """Preview a pasted ticket link, in internal channels only.
+
+    An unfurl is visible to the whole channel and cannot be made partial, so both gates have
+    to hold: the channel is not shared with another organization, and the person who pasted
+    the link is a member of this team's organization. Ticket status is our operational view,
+    not the customer's view of their own request.
+    """
+    settings_dict = team.conversations_settings or {}
+    if not settings_dict.get("slack_enabled"):
+        return
+
+    channel = event.get("channel") or ""
+    if not channel:
+        return
+
+    # Match the URLs before calling Slack. The app's whole host is registered for unfurling, so
+    # every PostHog link anyone pastes arrives here — an insight, a dashboard, a replay — and
+    # conversations_info below is uncached and rate limited per workspace. The cap counts ticket
+    # links, so one pasted after five unrelated links is still previewed.
+    candidates: dict[str, int] = {}
+    for link in event.get("links") or []:
+        if len(candidates) >= MAX_UNFURLS_PER_MESSAGE:
+            break
+        url = link.get("url", "")
+        if url in candidates:
+            continue
+        ticket_number = ticket_number_from_url(url, team)
+        if ticket_number is not None:
+            candidates[url] = ticket_number
+    if not candidates:
+        return
+
+    client = get_slack_client(team)
+    if not _is_internal_channel(client, channel):
+        return
+
+    sharer = resolve_slack_user(client, event.get("user") or "", workspace=slack_team_id)
+    if sharer.get("team_id") != slack_team_id:
+        return
+    sharer_user = resolve_posthog_user_for_slack(sharer.get("email"), team)
+    if sharer_user is None:
+        return
+
+    # Belonging to the organization is not access to the ticket: "ticket" is an access-controlled
+    # resource, so a member can be denied the resource or a single ticket. The card is rendered
+    # here instead of in the app, so nothing downstream would apply that rule, and pasting guessed
+    # URLs would otherwise read out status for tickets the person cannot open.
+    readable = UserAccessControl(sharer_user, team=team).filter_queryset_by_access_level(
+        Ticket.objects.filter(team=team, ticket_number__in=set(candidates.values())), resource="ticket"
+    )
+    tickets = {ticket.ticket_number: ticket for ticket in readable}
+    unfurls = {url: ticket_unfurl(tickets[number], team) for url, number in candidates.items() if number in tickets}
+    if not unfurls:
+        return
+
+    # unfurl_id/source works whether or not the bot is in the channel; channel/ts is the
+    # fallback for a payload that predates it.
+    target = (
+        {"unfurl_id": event["unfurl_id"], "source": event["source"]}
+        if event.get("unfurl_id") and event.get("source")
+        else {"channel": channel, "ts": event.get("message_ts", "")}
+    )
+    try:
+        client.chat_unfurl(unfurls=unfurls, **target)
+    except Exception:
+        logger.warning("slack_support_unfurl_failed", slack_channel_id=channel, count=len(unfurls))
+        return
+
+    capture_support_event(
+        team,
+        "support slack ticket unfurled",
+        {"slack_team_id": slack_team_id, "slack_channel_id": channel, "ticket_count": len(unfurls)},
     )
 
 
@@ -1516,6 +1863,7 @@ def _handle_member_event(
     team: Team,
     *,
     joined: bool,
+    slack_team_id: str,
     client: WebClient | None = None,
     own_bot_user_id: str | None = None,
 ) -> None:
@@ -1565,7 +1913,7 @@ def _handle_member_event(
 
     # Members of the team's own organization are internal teammates, not the external
     # participants these alerts surface — skip them.
-    slack_user = resolve_slack_user(client, user)
+    slack_user = resolve_slack_user(client, user, workspace=slack_team_id)
     if resolve_posthog_user_for_slack(slack_user.get("email"), team):
         return
 
@@ -1599,9 +1947,11 @@ def handle_member_joined_channel(event: dict, team: Team, slack_team_id: str) ->
     client = get_slack_client(team)
     own_bot_user_id = get_bot_user_id_cached(team, client)
     _track_bot_joined_channel(event, team, slack_team_id, own_bot_user_id=own_bot_user_id)
-    _handle_member_event(event, team, joined=True, client=client, own_bot_user_id=own_bot_user_id)
+    _handle_member_event(
+        event, team, joined=True, slack_team_id=slack_team_id, client=client, own_bot_user_id=own_bot_user_id
+    )
 
 
 def handle_member_left_channel(event: dict, team: Team, slack_team_id: str) -> None:
     """Handle a Slack 'member_left_channel' event by alerting the configured channel."""
-    _handle_member_event(event, team, joined=False)
+    _handle_member_event(event, team, joined=False, slack_team_id=slack_team_id)

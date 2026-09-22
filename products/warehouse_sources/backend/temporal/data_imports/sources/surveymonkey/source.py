@@ -1,19 +1,13 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
     SourceFieldSelectConfig,
     SourceFieldSelectConfigOption,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -22,6 +16,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.surveymonkey import (
     SurveyMonkeySourceConfig,
 )
@@ -59,7 +54,7 @@ class SurveyMonkeySource(ResumableSource[SurveyMonkeySourceConfig, SurveyMonkeyR
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.SURVEY_MONKEY,
+            name=ExternalDataSourceType.SURVEYMONKEY,
             category=DataWarehouseSourceCategory.PRODUCTIVITY,
             label="SurveyMonkey",
             caption="""Enter a SurveyMonkey access token to pull your surveys, responses, and collectors into the PostHog Data warehouse.

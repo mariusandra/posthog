@@ -10,14 +10,16 @@ import {
     ProductKey,
     SharingConfigurationSettings,
 } from '~/queries/schema/schema-general'
-import { ActivityTab, AnnotationType, CommentType, OnboardingStepKey, SDKKey } from '~/types'
+import { ActivityTab, OnboardingStepKey, SDKKey } from '~/types'
+
+import type { MetricFormPrefill } from 'products/data_catalog/frontend/common'
 
 import type { BillingSectionId } from './billing/types'
+import type { BatchExportSceneTab } from './data-pipelines/batch-exports/BatchExportScene'
 import { DataPipelinesNewSceneKind } from './data-pipelines/DataPipelinesNewScene'
+import type { DestinationsSceneTab } from './data-pipelines/destinationsSceneLogic'
 import { OutputTab } from './data-warehouse/editor/outputPaneLogic'
 import type { HogFunctionSceneTab } from './hog-functions/HogFunctionScene'
-import type { InboxTabKey } from './inbox/types'
-import type { ModelsSceneTab } from './models/modelsSceneLogic'
 import type { SettingId, SettingLevelId, SettingSectionId } from './settings/types'
 
 /**
@@ -54,8 +56,7 @@ export const urls = {
     dataWarehouseManagedViewsets: (): string => '/data-management/managed-viewsets',
     webScripts: (): string => '/web-scripts',
     webScriptsNew: (): string => '/web-scripts/new',
-    destinations: (): string => '/data-management/destinations',
-    models: (tab?: ModelsSceneTab): string => `/models${tab ? `/${tab}` : ''}`,
+    destinations: (tab?: DestinationsSceneTab): string => `/data-management/destinations${tab ? `?tab=${tab}` : ''}`,
     transformations: (): string => '/data-management/transformations',
     eventFiltering: (): string => '/data-management/event-filtering',
     activity: (tab: ActivityTab | ':tab' = ActivityTab.ExploreEvents): string => `/activity/${tab}`,
@@ -78,6 +79,8 @@ export const urls = {
         connectionId,
         dashboard,
         filters,
+        metricName,
+        metricPrefill,
     }: {
         /** Raw SQL, or a node whose visualization settings (display, chartSettings) should survive the trip */
         query?: string | DataVisualizationNode | DataTableNode
@@ -91,6 +94,10 @@ export const urls = {
         dashboard?: number
         /** Applied on top of the opened query/insight — carries unsaved view-mode filter edits into the editor */
         filters?: HogQLFilters
+        /** Opens the editor bound to this data catalog metric so its query can be updated in place */
+        metricName?: string
+        /** Seeds the editor's "Save as metric" dialog with values already typed in the new metric modal */
+        metricPrefill?: MetricFormPrefill
     } = {}): string => {
         const params = new URLSearchParams()
 
@@ -116,6 +123,17 @@ export const urls = {
             params.set('source', source)
         }
 
+        if (metricName) {
+            params.set('edit_metric', metricName)
+        }
+
+        if (metricPrefill) {
+            const filledPrefill = Object.fromEntries(Object.entries(metricPrefill).filter(([, value]) => !!value))
+            if (Object.keys(filledPrefill).length) {
+                params.set('metric_prefill', JSON.stringify(filledPrefill))
+            }
+        }
+
         if (dashboard) {
             params.set('dashboard', String(dashboard))
         }
@@ -132,10 +150,6 @@ export const urls = {
         const hashString = hashParams.toString()
         return `/sql${queryString ? `?${queryString}` : ''}${hashString ? `#${hashString}` : ''}`
     },
-    annotations: (): string => '/data-management/annotations',
-    annotation: (id: AnnotationType['id'] | ':id'): string => `/data-management/annotations/${id}`,
-    comments: (): string => '/data-management/comments',
-    comment: (id: CommentType['id'] | ':id'): string => `/data-management/comments/${id}`,
     variables: (): string => '/data-management/variables',
     variable: (id: string | ':id'): string => `/data-management/variables/${id}`,
     variableEdit: (id: string | ':id'): string => `/data-management/variables/${id}/edit`,
@@ -153,11 +167,15 @@ export const urls = {
     projectCreateFirst: (): string => '/organization/create-project',
     projectRoot: (): string => '/',
     projectHomepage: (): string => '/home',
-    quickstart: (): string => '/quickstart',
     ai: (chat?: string, ask?: string): string => combineUrl('/ai', { ask, chat }).url,
+    aiTask: (taskId: string): string => combineUrl('/ai', { task: taskId }).url,
     aiHistory: (): string => '/ai/history',
     settings: (section: SettingSectionId | SettingLevelId = 'project', setting?: SettingId): string =>
         combineUrl(`/settings/${section}`, undefined, setting).url,
+    identityProviderConfig: (
+        feature: 'saml' | 'oidc' | 'scim' | 'xaa' | ':feature',
+        configId: string | ':configId'
+    ): string => `/settings/organization-authentication/${feature}/${configId}`,
     featurePreview: (flagKey: string): string => combineUrl('/settings/user-feature-previews', {}, flagKey).url,
     organizationCreationConfirm: (): string => '/organization/confirm-creation',
     toolbarLaunch: (): string => '/toolbar',
@@ -185,8 +203,7 @@ export const urls = {
     twoFactorReset: (userUuid: string, token: string): string => `/reset_2fa/${userUuid}/${token}`,
     preflight: (): string => '/preflight',
     signup: (): string => '/signup',
-    verifyEmail: (userUuid: string = '', token: string = ''): string =>
-        `/verify_email${userUuid ? `/${userUuid}` : ''}${token ? `/${token}` : ''}`,
+    verifyEmail: (userUuid: string = ''): string => `/verify_email${userUuid ? `/${userUuid}` : ''}`,
     vercelConnect: (): string => '/connect/vercel/link',
     vercelLinkError: (): string => '/integrations/vercel/link-error',
     agenticAccountMismatch: (): string => '/agentic/account-mismatch',
@@ -234,6 +251,7 @@ export const urls = {
         `/organization/billing${products && products.length ? `?products=${products.join(',')}` : ''}`,
     organizationBillingSection: (section: BillingSectionId = 'overview'): string =>
         combineUrl(`/organization/billing/${section}`).url,
+    organizationBillingRealTimeUsage: (): string => '/organization/billing/real-time-usage',
     advancedActivityLogs: (): string => '/activity-logs',
     billingAuthorizationStatus: (): string => `/billing/authorization_status`,
     // Self-hosted only
@@ -246,12 +264,14 @@ export const urls = {
     asyncMigrationsFuture: (): string => '/instance/async_migrations/future',
     asyncMigrationsSettings: (): string => '/instance/async_migrations/settings',
     deadLetterQueue: (): string => '/instance/dead_letter_queue',
-    queryPerformance: (): string => '/instance/query_performance',
+    experimentsStaffTools: (): string => '/experiments/staff',
     materializedColumns: (): string => '/data-management/materialized-columns',
     unsubscribe: (): string => '/unsubscribe',
     codeCanvasLink: (channelId: string, dashboardId: string): string => `/code/canvas/${channelId}/${dashboardId}`,
     codeChannelLink: (channelId: string, taskId?: string): string =>
         `/code/channel/${channelId}${taskId ? `/tasks/${taskId}` : ''}`,
+    codeTaskLink: (taskId: string): string => `/code/task/${taskId}`,
+    codeLoopLink: (loopId: string): string => `/code/loop/${loopId}`,
     integration: (slug: string): string => `/integrations/${slug}`,
     integrationsRedirect: (kind: string): string => `/integrations/${kind}/callback`,
     stripeConfirmInstall: (): string => '/integrations/stripe/confirm-install',
@@ -278,13 +298,6 @@ export const urls = {
     debugHog: (): string => '/debug/hog',
 
     moveToPostHogCloud: (): string => '/move-to-cloud',
-    heatmaps: (params?: string): string =>
-        `/heatmaps${params ? `?${params.startsWith('?') ? params.slice(1) : params}` : ''}`,
-    heatmapNew: (params?: string): string =>
-        `/heatmaps/new${params ? `?${params.startsWith('?') ? params.slice(1) : params}` : ''}`,
-    heatmapRecording: (params?: string): string =>
-        `/heatmaps/recording${params ? `?${params.startsWith('?') ? params.slice(1) : params}` : ''}`,
-    heatmap: (id: string | number): string => `/heatmaps/${id}`,
     links: (params?: string): string =>
         `/links${params ? `?${params.startsWith('?') ? params.slice(1) : params}` : ''}`,
     link: (id: string): string => `/link/${id}`,
@@ -292,14 +305,14 @@ export const urls = {
     metrics: (): string => '/metrics',
     sessionAttributionExplorer: (): string => '/web/session-attribution-explorer',
     sessionProfile: (id: string): string => `/sessions/${id}`,
-    wizard: (): string => `/wizard`,
     coupons: (campaign: string): string => `/coupons/${campaign}`,
     startups: (referrer?: string): string => `/startups${referrer ? `/${referrer}` : ''}`,
     agenticAuthorize: (): string => '/agentic/authorize',
     oauthAuthorize: (): string => '/oauth/authorize',
     dataPipelinesNew: (kind?: DataPipelinesNewSceneKind): string => `/pipeline/new/${kind ?? ''}`,
     batchExportNew: (service: string): string => `/pipeline/batch-exports/new/${service}`,
-    batchExport: (id: string): string => `/pipeline/batch-exports/${id}`,
+    batchExport: (id: string, tab?: BatchExportSceneTab): string =>
+        `/pipeline/batch-exports/${id}${tab ? `?tab=${tab}` : ''}`,
     legacyPlugin: (id: string): string => `/pipeline/plugins/${id}`,
     hogFunction: (id: string, tab?: HogFunctionSceneTab): string => `/functions/${id}${tab ? `?tab=${tab}` : ''}`,
     hogFunctionNew: (templateId: string): string => `/functions/new/${templateId}`,
@@ -319,21 +332,9 @@ export const urls = {
             : '/health/alerts',
     // PostHog Code demo surface in the desktop app: /code, /code/<section>.
     code: (section?: string | ':section'): string => `/code${section ? `/${section}` : ''}`,
-    // Inbox 2.0 tab-first routing: /inbox, /inbox/<tab>, /inbox/<tab>/<reportId>.
-    inbox: (tab?: InboxTabKey | ':tab'): string => `/inbox${tab ? `/${tab}` : ''}`,
-    inboxReport: (tab: InboxTabKey | ':tab', reportId: string | ':reportId'): string => `/inbox/${tab}/${reportId}`,
-    // Scout detail surface, full-width over the inbox list (the fleet section lives in the Configuration tab).
-    // An optional finding id deep-links straight to one emitted finding (best-effort: only resolves while
-    // that finding is still in the scout's recent runs window).
-    inboxScout: (skillName: string | ':skillName', findingId?: string | ':findingId'): string => {
-        const segment = findingId ? `/${findingId === ':findingId' ? findingId : encodeURIComponent(findingId)}` : ''
-        return `/inbox/scouts/${skillName}${segment}`
-    },
-    // Scout fleet memory (scratchpad) browse/search surface, reached from the fleet-memory callout.
-    inboxScratchpad: (): string => '/inbox/scouts/scratchpad',
-    // Cross-fleet findings browse/search surface, reached from the scout-findings callout.
-    inboxFindings: (): string => '/inbox/scouts/findings',
     webAnalyticsBotAnalytics: (): string => '/web/bots',
+    webAnalyticsPagePerformance: (): string => '/web/page-performance',
+    webAnalyticsAgents: (): string => '/web/agents',
     webAnalyticsHealth: (): string => '/web/health',
     webAnalyticsRecap: (): string => '/web/recap',
     pipelineStatus: (): string => '/health/pipeline-status',

@@ -4,6 +4,7 @@ import posthog from 'posthog-js'
 import { lemonToast } from '@posthog/lemon-ui'
 
 import api from 'lib/api'
+import { NEW_QUERY_STARTED_ERROR_MESSAGE, UNMOUNTING_ERROR_MESSAGE } from 'lib/utils/kea-logic-builders'
 
 import { resumeKeaLoadersErrors, silenceKeaLoadersErrors } from '~/initKea'
 import { AggregatedSpanRow } from '~/queries/schema/schema-general'
@@ -317,6 +318,89 @@ describe('tracingDataLogic', () => {
             expect(sparklineSpy).toHaveBeenCalledTimes(2)
             sparklineSpy.mockRestore()
         })
+
+        it('re-fetches the sparkline on an explicit refresh with an unchanged scope', async () => {
+            const sparklineSpy = jest.spyOn(api.tracing, 'sparkline').mockResolvedValue({ results: [] })
+            logic = mountWithSpans([])
+            await logic.asyncActions.fetchSparkline()
+            // The refresh button asks for newer data without touching the filters, so the
+            // memoized scope must not stop it from hitting the endpoint again.
+            await expectLogic(logic, () => {
+                logic.actions.refreshQuery()
+            }).toDispatchActions(['fetchSparklineSuccess'])
+            expect(sparklineSpy).toHaveBeenCalledTimes(2)
+            sparklineSpy.mockRestore()
+        })
+    })
+
+    describe('loading state across superseded queries', () => {
+        let toastSpy: jest.SpyInstance
+
+        beforeEach(() => {
+            silenceKeaLoadersErrors()
+            toastSpy = jest.spyOn(lemonToast, 'error').mockReturnValue(undefined as any)
+        })
+
+        afterEach(() => {
+            toastSpy.mockRestore()
+        })
+
+        it.each([
+            {
+                name: 'spans',
+                apiMethod: 'listSpans' as const,
+                start: (l: typeof logic) => l.actions.fetchSpans(),
+                fail: (l: typeof logic, error: string) => l.actions.fetchSpansFailure(error),
+                loadingValue: (l: typeof logic) => l.values.spansLoading,
+            },
+            {
+                name: 'aggregation',
+                apiMethod: 'aggregate' as const,
+                start: (l: typeof logic) => l.actions.fetchAggregation(),
+                fail: (l: typeof logic, error: string) => l.actions.fetchAggregationFailure(error),
+                loadingValue: (l: typeof logic) => l.values.aggregationLoading,
+            },
+        ])(
+            'keeps $name loading on a superseded query but clears it on a real failure',
+            ({ apiMethod, start, fail, loadingValue }) => {
+                // Newer query in flight forever, so loading stays owned by it.
+                const apiSpy = jest.spyOn(api.tracing, apiMethod).mockReturnValue(new Promise(() => {}) as any)
+                logic = mountWithSpans([])
+                start(logic)
+                expect(loadingValue(logic)).toBe(true)
+
+                // The previous request's abort must NOT drop the flag mid-flight.
+                fail(logic, NEW_QUERY_STARTED_ERROR_MESSAGE)
+                expect(loadingValue(logic)).toBe(true)
+
+                // A genuine failure still resets it.
+                fail(logic, 'boom')
+                expect(loadingValue(logic)).toBe(false)
+                apiSpy.mockRestore()
+            }
+        )
+    })
+
+    describe('cancelled requests', () => {
+        // A superseded query and a scene teardown both abort whatever is in flight. Neither is a
+        // fault the user can act on, so neither may reach them as a toast or land in error
+        // telemetry as a failed tracing query.
+        it.each([NEW_QUERY_STARTED_ERROR_MESSAGE, UNMOUNTING_ERROR_MESSAGE])(
+            'does not report "%s" as a query failure',
+            (reason) => {
+                silenceKeaLoadersErrors()
+                const toastSpy = jest.spyOn(lemonToast, 'error').mockReturnValue(undefined as any)
+                const captureSpy = jest.spyOn(posthog, 'capture').mockReturnValue(undefined as any)
+                logic = mountWithSpans([])
+
+                logic.actions.fetchSpansFailure(reason)
+
+                expect(toastSpy).not.toHaveBeenCalled()
+                expect(captureSpy).not.toHaveBeenCalledWith('tracing query failed', expect.anything())
+                toastSpy.mockRestore()
+                captureSpy.mockRestore()
+            }
+        )
     })
 
     describe('keyed instances', () => {
@@ -374,6 +458,74 @@ describe('tracingDataLogic', () => {
                 isolatedData.unmount()
                 isolatedFilters.unmount()
             }
+        })
+    })
+
+    describe('refresh', () => {
+        // The sparkline, count and heatmap skip their fetch while the scope key is unchanged. A
+        // relative range ('-30M') holds that key identical however far the window has moved, so
+        // the refresh button reloaded the list while the chart and the "N traces" label stayed put.
+        // The default range is relative and open-ended ('-1h'), which is the case that broke.
+        it('refetches the count and sparkline when the user refreshes an unchanged relative range', async () => {
+            logic = mountWithSpans([])
+            const listSpansSpy = jest.spyOn(api.tracing, 'listSpans').mockResolvedValue({ results: [], hasMore: false })
+            const countSpy = jest.spyOn(api.tracing, 'count').mockResolvedValue({ count: 1, traceCount: 1 })
+            const sparklineSpy = jest.spyOn(api.tracing, 'sparkline').mockResolvedValue({ results: [] })
+
+            try {
+                await expectLogic(logic, () => {
+                    logic.actions.runQuery()
+                }).toFinishAllListeners()
+                expect(countSpy).toHaveBeenCalled()
+                countSpy.mockClear()
+                sparklineSpy.mockClear()
+
+                // A sort or view-mode toggle re-runs the query without changing scope — still skipped.
+                await expectLogic(logic, () => {
+                    logic.actions.runQuery()
+                }).toFinishAllListeners()
+                expect(countSpy).not.toHaveBeenCalled()
+                expect(sparklineSpy).not.toHaveBeenCalled()
+
+                await expectLogic(logic, () => {
+                    logic.actions.refreshQuery()
+                }).toFinishAllListeners()
+                expect(countSpy).toHaveBeenCalled()
+                expect(sparklineSpy).toHaveBeenCalled()
+            } finally {
+                listSpansSpy.mockRestore()
+                countSpy.mockRestore()
+                sparklineSpy.mockRestore()
+            }
+        })
+    })
+
+    describe('deferred filter refresh', () => {
+        // The trace drawer's attribute buttons call addFilter, which sets skipQuery so the list
+        // doesn't reload behind the open drawer. Losing that gate means every attribute click
+        // would trigger a background re-query the user can't see.
+        it('does not run the query when addFilter defers it', async () => {
+            logic = mountWithSpans()
+            const listSpansSpy = jest.spyOn(api.tracing, 'listSpans').mockResolvedValue({ results: [], hasMore: false })
+
+            await expectLogic(logic, () => {
+                tracingFiltersLogic().actions.addFilter('http.method', 'GET')
+            }).toNotHaveDispatchedActions(['handleFilterChange', 'runQuery'])
+            expect(listSpansSpy).not.toHaveBeenCalled()
+
+            listSpansSpy.mockRestore()
+        })
+
+        it('runs the query once refreshDeferredFilters fires', async () => {
+            logic = mountWithSpans()
+            const listSpansSpy = jest.spyOn(api.tracing, 'listSpans').mockResolvedValue({ results: [], hasMore: false })
+
+            await expectLogic(logic, () => {
+                tracingFiltersLogic().actions.refreshDeferredFilters()
+            }).toDispatchActions(['handleFilterChange', 'runQuery', 'fetchSpansSuccess'])
+            expect(listSpansSpy).toHaveBeenCalled()
+
+            listSpansSpy.mockRestore()
         })
     })
 })

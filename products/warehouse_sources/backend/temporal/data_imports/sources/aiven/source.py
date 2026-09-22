@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.aiven.aiven import (
     aiven_source,
@@ -31,6 +25,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.aiven import AivenSourceConfig
 from products.warehouse_sources.backend.types import ExternalDataSourceType
 
@@ -47,7 +42,7 @@ class AivenSource(SimpleSource[AivenSourceConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.AIVEN,
+            name=ExternalDataSourceType.AIVEN,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="Aiven",
             releaseStatus=ReleaseStatus.ALPHA,

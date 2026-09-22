@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,9 +11,10 @@ from products.review_hog.backend.reviewer.constants import (
     CHUNKING_ONESHOT_MAX_ADDITIONS,
     CHUNKING_REASONING_EFFORT,
     CHUNKING_RUNTIME_ADAPTER,
-    REVIEW_MODEL,
-    REVIEW_REASONING_EFFORT,
-    REVIEW_RUNTIME_ADAPTER,
+    DEFAULT_REVIEW_ARM,
+    FLASH_ARM,
+    REVIEW_MODE_FLASH,
+    ReviewArm,
 )
 from products.review_hog.backend.reviewer.models.github_meta import PRFile, PRMetadata
 from products.review_hog.backend.reviewer.models.issues_review import Issue, IssuePriority, IssuesReview, LineRange
@@ -30,6 +33,7 @@ from products.review_hog.backend.temporal.activities import (
     select_perspectives_activity,
     split_chunks_activity,
 )
+from products.tasks.backend.facade.run_config import ReasoningEffort, RuntimeAdapter
 
 _MODULE = "products.review_hog.backend.temporal.activities"
 
@@ -143,26 +147,86 @@ async def test_split_chunks_activity_routes_llm_chunking_by_oneshot_gate(additio
 
 
 @pytest.mark.asyncio
-async def test_review_chunk_activity_pins_the_review_model_for_the_perspective_review() -> None:
-    # The change's core contract: the perspective-review sandbox turn runs on the pinned REVIEW_* model.
-    # The pin kwargs default to None, so dropping them at this one call site would silently fall back to
-    # the sandbox default with every plumbing-level test still passing — this activity is the only guard.
+@pytest.mark.parametrize("effort", [ReasoningEffort.MEDIUM, ReasoningEffort.XHIGH])
+@pytest.mark.parametrize("blind_spot_check", [False, True])
+async def test_review_chunk_activity_flash_turn_runs_on_the_flash_arm_and_stamps_the_cache(
+    effort: ReasoningEffort, blind_spot_check: bool
+) -> None:
+    expected = replace(FLASH_ARM, reasoning_effort=effort)
     mock_review = AsyncMock(return_value=IssuesReview(issues=[]))
+    mock_persist = MagicMock()
+    mock_prepare = MagicMock(return_value="review-prompt")
     env = ActivityEnvironment()
     with (
         patch(f"{_MODULE}.Heartbeater"),
-        patch(f"{_MODULE}._prepare_review_prompt", return_value="review-prompt"),
+        patch(f"{_MODULE}._prepare_review_prompt", mock_prepare),
+        patch(f"{_MODULE}.load_review_arm", return_value=DEFAULT_REVIEW_ARM),
+        patch(f"{_MODULE}.persist_perspective_results", mock_persist),
+        patch(f"{_MODULE}.run_sandbox_review", mock_review),
+    ):
+        assert (
+            await env.run(
+                review_chunk_activity,
+                _review_input(
+                    review_mode=REVIEW_MODE_FLASH,
+                    flash_reasoning_effort=effort.value,
+                    blind_spot_check=blind_spot_check,
+                ),
+            )
+            is True
+        )
+
+    kwargs = mock_review.call_args.kwargs
+    assert (
+        kwargs["runtime_adapter"],
+        kwargs["model"],
+        kwargs["reasoning_effort"],
+        kwargs["initial_permission_mode"],
+    ) == (
+        expected.runtime_adapter,
+        expected.model,
+        expected.reasoning_effort,
+        expected.initial_permission_mode,
+    )
+    assert mock_prepare.call_args.args[-1] == expected
+    assert mock_persist.call_args.kwargs["review_arm"] == expected
+
+
+@pytest.mark.asyncio
+async def test_review_chunk_activity_runs_on_the_reports_persisted_arm() -> None:
+    # The arm plumbing's core contract: the perspective-review sandbox turn runs on the REPORT's
+    # persisted arm. The pin kwargs default to None, so dropping them at this one call site would
+    # silently fall back to the sandbox default with every plumbing-level test still passing — and a
+    # site that re-reads the module pins instead of the arm would run every Claude-assigned report
+    # on the Codex default while its analytics claim Sonnet. The arm here deliberately differs from
+    # the default pins on every field so either regression fails the kwargs assertion.
+    arm = ReviewArm(
+        runtime_adapter=RuntimeAdapter.CLAUDE,
+        model="claude-sonnet-5",
+        reasoning_effort=ReasoningEffort.XHIGH,
+        initial_permission_mode=None,
+    )
+    mock_review = AsyncMock(return_value=IssuesReview(issues=[]))
+    mock_prepare = MagicMock(return_value="review-prompt")
+    env = ActivityEnvironment()
+    with (
+        patch(f"{_MODULE}.Heartbeater"),
+        patch(f"{_MODULE}._prepare_review_prompt", mock_prepare),
+        patch(f"{_MODULE}.load_review_arm", return_value=arm),
         patch(f"{_MODULE}.persist_perspective_results"),
         patch(f"{_MODULE}.run_sandbox_review", mock_review),
     ):
         assert await env.run(review_chunk_activity, _review_input()) is True
 
+    assert mock_prepare.call_args.args[-1] == arm
+
     kwargs = mock_review.call_args.kwargs
-    assert (kwargs["runtime_adapter"], kwargs["model"], kwargs["reasoning_effort"]) == (
-        REVIEW_RUNTIME_ADAPTER,
-        REVIEW_MODEL,
-        REVIEW_REASONING_EFFORT,
-    )
+    assert (
+        kwargs["runtime_adapter"],
+        kwargs["model"],
+        kwargs["reasoning_effort"],
+        kwargs["initial_permission_mode"],
+    ) == (arm.runtime_adapter, arm.model, arm.reasoning_effort, arm.initial_permission_mode)
     # The sandbox workflow id is branded with the review's workflow id + step, lowercased — dropping
     # the kwarg silently reverts Temporal to anonymous task-processing-<uuid> ids.
     assert kwargs["workflow_id_prefix"] == f"{env.info.workflow_id}:issues-review-p1-c3".lower()
@@ -179,6 +243,7 @@ async def test_blind_spot_unit_scopes_wave_findings_to_its_chunk_and_steps_as_bl
     mock_review = AsyncMock(return_value=IssuesReview(issues=[]))
     with (
         patch(f"{_MODULE}.Heartbeater"),
+        patch(f"{_MODULE}.load_review_arm", return_value=DEFAULT_REVIEW_ARM),
         patch(f"{_MODULE}.load_perspective_results", return_value=done),
         patch(f"{_MODULE}.load_pr_snapshot", return_value=_snapshot()),
         patch(

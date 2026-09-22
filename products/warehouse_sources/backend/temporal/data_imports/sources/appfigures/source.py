@@ -1,19 +1,14 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
 )
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
-)
 from products.warehouse_sources.backend.temporal.data_imports.sources.appfigures.appfigures import (
+    PRODUCTS_PATH,
     AppfiguresResumeConfig,
     appfigures_source,
     check_credentials,
@@ -30,6 +25,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.appfigures import (
     AppfiguresSourceConfig,
 )
@@ -51,7 +47,7 @@ class AppfiguresSource(ResumableSource[AppfiguresSourceConfig, AppfiguresResumeC
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.APPFIGURES,
+            name=ExternalDataSourceType.APPFIGURES,
             category=DataWarehouseSourceCategory.ANALYTICS,
             label="Appfigures",
             releaseStatus=ReleaseStatus.ALPHA,
@@ -59,8 +55,10 @@ class AppfiguresSource(ResumableSource[AppfiguresSourceConfig, AppfiguresResumeC
 
 Create an API client and Personal Access Token at [appfigures.com/developers/keys](https://appfigures.com/developers/keys). When creating the client, grant the data sets you want to sync:
 - `products:read` — Products
-- `public:read` — Reviews
-- `private:read` — Sales and Revenue reports
+- `public:read` — Reviews, Ranks, Ratings report, ASO keywords and stats
+- `private:read` — Sales, Revenue, Subscriptions, Ads, Ad spend, and Payments reports
+
+Stores, Categories, and Countries are reference tables that need no data set granted. The ASO tables only return rows for the apps and countries you track keywords for in Appfigures.
 """,
             iconPath="/static/services/appfigures.png",
             docsUrl="https://posthog.com/docs/cdp/sources/appfigures",
@@ -74,6 +72,15 @@ Create an API client and Personal Access Token at [appfigures.com/developers/key
                         required=True,
                         placeholder="pat_...",
                         secret=True,
+                    ),
+                    SourceFieldInputConfig(
+                        name="aso_countries",
+                        label="ASO keyword countries (optional)",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=False,
+                        placeholder="US, GB, DE",
+                        secret=False,
+                        caption="Country codes to pull tracked keyword positions for, comma-separated. Appfigures takes one country per request, so each code adds a request per app. Only the ASO keywords and ASO stats tables use it. They cover the United States when left blank.",
                     ),
                 ],
             ),
@@ -92,6 +99,9 @@ Create an API client and Personal Access Token at [appfigures.com/developers/key
         return {
             "401 Client Error: Unauthorized for url: https://api.appfigures.com": "Your Appfigures personal access token is invalid or expired. Create a new token in your Appfigures developer settings, then reconnect.",
             "403 Client Error: Forbidden for url: https://api.appfigures.com": "Your Appfigures personal access token is missing the scope needed to sync this data. Grant the required data sets to your API client, then reconnect.",
+            # Appfigures returns this 403 (with a custom reason phrase, not "Forbidden") when the
+            # account no longer owns one or more products the request covers — no retry fixes that.
+            "Some given products are not owned by your account": "Your Appfigures account doesn't own one or more products this sync needs credits for. Check product ownership and available credits in Appfigures, then reconnect.",
         }
 
     def get_schemas(
@@ -130,9 +140,10 @@ Create an API client and Personal Access Token at [appfigures.com/developers/key
     ) -> tuple[bool, str | None]:
         # Probe the endpoint the requested schema actually hits (so per-table scope checks are
         # accurate), or the cheap products catalog at source-create.
-        path = "/products/mine"
+        path = PRODUCTS_PATH
         if schema_name and schema_name in APPFIGURES_ENDPOINTS:
-            path = APPFIGURES_ENDPOINTS[schema_name].path
+            endpoint_config = APPFIGURES_ENDPOINTS[schema_name]
+            path = endpoint_config.probe_path or endpoint_config.path
 
         status = check_credentials(config.personal_access_token, path)
         if status is None:
@@ -167,4 +178,5 @@ Create an API client and Personal Access Token at [appfigures.com/developers/key
             db_incremental_field_last_value=inputs.db_incremental_field_last_value
             if inputs.should_use_incremental_field
             else None,
+            aso_countries=config.aso_countries,
         )

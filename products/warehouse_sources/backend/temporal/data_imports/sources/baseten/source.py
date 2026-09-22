@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.baseten.baseten import (
     BasetenResumeConfig,
@@ -32,6 +26,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.baseten import (
     BasetenSourceConfig,
 )
@@ -49,7 +44,7 @@ class BasetenSource(ResumableSource[BasetenSourceConfig, BasetenResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.BASETEN,
+            name=ExternalDataSourceType.BASETEN,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="Baseten",
             releaseStatus=ReleaseStatus.ALPHA,

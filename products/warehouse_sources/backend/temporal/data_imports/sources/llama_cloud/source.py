@@ -1,8 +1,7 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
@@ -10,22 +9,23 @@ from posthog.schema import (
     SourceFieldSelectConfig,
     SourceFieldSelectConfigOption,
 )
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import (
+    UNVERSIONED_API_VERSION,
+    FieldType,
+    ResumableSource,
 )
-from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
     CanonicalDescriptions,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.llamacloud import (
     LlamaCloudSourceConfig,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.llama_cloud.llama_cloud import (
+    LLAMA_CLOUD_API_VERSION_V2,
     LlamaCloudResumeConfig,
     llama_cloud_source,
     validate_credentials as validate_llama_cloud_credentials,
@@ -41,7 +41,13 @@ from products.warehouse_sources.backend.types import ExternalDataSourceType
 @SourceRegistry.register
 class LlamaCloudSource(ResumableSource[LlamaCloudSourceConfig, LlamaCloudResumeConfig]):
     lists_tables_without_credentials = True  # static endpoint catalog — safe for public docs
-    api_docs_url = "https://docs.cloud.llamaindex.ai"
+    api_docs_url = "https://developers.llamaindex.ai/python/cloud/"
+
+    # LlamaCloud versions its API in the endpoint path (see LLAMA_CLOUD_API_VERSION_V2): this source
+    # already reads the v2-generation endpoints, so the legacy unversioned label and "v2" drive
+    # identical requests. New sources default to "v2"; existing pins keep syncing byte-for-byte.
+    supported_versions = (UNVERSIONED_API_VERSION, LLAMA_CLOUD_API_VERSION_V2)
+    default_version = LLAMA_CLOUD_API_VERSION_V2
 
     @property
     def source_type(self) -> ExternalDataSourceType:
@@ -50,7 +56,7 @@ class LlamaCloudSource(ResumableSource[LlamaCloudSourceConfig, LlamaCloudResumeC
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.LLAMA_CLOUD,
+            name=ExternalDataSourceType.LLAMACLOUD,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="LlamaCloud",
             docsUrl="https://posthog.com/docs/cdp/sources/llama-cloud",

@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.adroll.adroll import (
     AdRollResumeConfig,
@@ -32,6 +26,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.adroll import AdRollSourceConfig
 from products.warehouse_sources.backend.types import ExternalDataSourceType
 
@@ -57,11 +52,11 @@ class AdRollSource(ResumableSource[AdRollSourceConfig, AdRollResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.AD_ROLL,
+            name=ExternalDataSourceType.ADROLL,
             category=DataWarehouseSourceCategory.ADVERTISING,
             keywords=["nextroll"],
             label="AdRoll",
-            caption="""Enter your AdRoll (NextRoll) API credentials to pull your advertising entity data into the PostHog Data warehouse.
+            caption="""Enter your AdRoll (NextRoll) API credentials to pull your advertising entities and delivery metrics into the PostHog Data warehouse.
 
 Create a personal access token and an app in the [NextRoll developer console](https://developers.nextroll.com/) — the app's Client ID is sent as the `apikey` on every request. Note that NextRoll's default quota is 100 API requests per day; contact NextRoll support to raise it for larger accounts.""",
             iconPath="/static/services/adroll.png",
@@ -106,8 +101,7 @@ Create a personal access token and an app in the [NextRoll developer console](ht
         force_refresh: bool = False,
         api_version: str | None = None,
     ) -> list[SourceSchema]:
-        # Entity endpoints have no updated_at filter — full refresh. Metrics
-        # are GraphQL-only and a follow-up.
+        # No endpoint accepts an updated_at filter — full refresh.
         return build_endpoint_schemas(ENDPOINTS, INCREMENTAL_FIELDS, names)
 
     def validate_credentials(

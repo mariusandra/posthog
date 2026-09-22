@@ -2,22 +2,16 @@ from typing import Optional, cast
 
 from requests.exceptions import RequestException
 
-from posthog.schema import (
+from posthog.exceptions_capture import capture_exception
+from posthog.models.integration import ERROR_TOKEN_REFRESH_FAILED, OauthIntegration
+
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldOauthAccountSelectConfig,
     SourceFieldOauthConfig,
     SuggestedTable,
-)
-
-from posthog.exceptions_capture import capture_exception
-from posthog.models.integration import ERROR_TOKEN_REFRESH_FAILED, OauthIntegration
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import (
     MARKETING_ANALYTICS_SUGGESTED_TABLE_TOOLTIP,
@@ -35,6 +29,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.mix
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.redditads import (
     RedditAdsSourceConfig,
 )
@@ -69,12 +64,20 @@ class RedditAdsSource(ResumableSource[RedditAdsSourceConfig, RedditAdsResumeConf
 
     def get_non_retryable_errors(self) -> dict[str, str | None]:
         return {
-            "401 Client Error": None,
+            # Reddit returns 401 once the OAuth grant behind the connected account expires or
+            # is revoked. Every retry replays the same rejected token, and without a message of
+            # its own the schema stops with no sign that reconnecting is what fixes it.
+            "401 Client Error": "Your Reddit Ads connection is no longer valid. Reconnect your Reddit account in the source settings, then re-enable the sync.",
             # Reddit returns 403 when the connected account lacks permission to read the
             # configured ad account's reports (access revoked or insufficient scope). The
             # request can never succeed without the user reconnecting, so stop retrying.
             "403 Client Error": "PostHog is not authorized to access this Reddit Ads account. Please make sure the connected Reddit account has access to the ad account, then reconnect.",
             "404 Client Error": None,
+            # `structured_posts` fans out over `profiles` (see REDDIT_ADS_FANOUT in settings.py), so
+            # this parent fetch runs for that schema too. Reddit rejects it with 400 for ad accounts
+            # that don't have the profiles feature enabled — every retry replays the same request
+            # against the same account, so it can never turn into data.
+            "/profiles?page.size=100": "Reddit Ads rejected the request for this account's profiles. This ad account may not have Reddit's community profiles feature enabled.",
             # Raised by OAuthMixin.get_oauth_integration when the connected Reddit Ads
             # account has been deleted or disconnected. The integration row is gone, so
             # retrying can never recover it — stop and ask the user to reconnect.
@@ -84,7 +87,7 @@ class RedditAdsSource(ResumableSource[RedditAdsSourceConfig, RedditAdsResumeConf
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.REDDIT_ADS,
+            name=ExternalDataSourceType.REDDITADS,
             category=DataWarehouseSourceCategory.ADVERTISING,
             label="Reddit Ads",
             caption="Collect campaign data, ad performance, and advertising metrics from Reddit Ads. Ensure you have granted PostHog access to your Reddit Ads account, learn how to do this in [the documentation](https://posthog.com/docs/cdp/sources/reddit-ads).",
@@ -172,6 +175,14 @@ class RedditAdsSource(ResumableSource[RedditAdsSourceConfig, RedditAdsResumeConf
                     "Reddit rejected the credentials for this integration. Please reconnect your Reddit Ads "
                     "integration and make sure the connected account can access your ad accounts."
                 ) from e
+            if e.api_status_code == 404:
+                # /me/businesses and /businesses/{id}/ad_accounts are both real, static paths, so a 404
+                # here means Reddit found no business or ad account for these credentials, not a bad
+                # request on our end — the user needs a Reddit Ads business account to reconnect with.
+                raise IntegrationAccountListingError(
+                    "Reddit couldn't find any businesses or ad accounts for this integration. Please make "
+                    "sure the connected Reddit account has access to Reddit Ads, then reconnect."
+                ) from e
             if e.api_status_code == 429 or e.api_status_code >= 500:
                 # The session already retried these; Reddit rate-limits ~1 req/s per advertiser and this
                 # listing fires one call per business, so exhausting the retries is expected under load.
@@ -218,6 +229,7 @@ class RedditAdsSource(ResumableSource[RedditAdsSourceConfig, RedditAdsResumeConf
                 supports_incremental=endpoint_config.incremental_fields is not None,
                 supports_append=False,
                 incremental_fields=endpoint_config.incremental_fields or [],
+                should_sync_default=endpoint_config.should_sync_default,
             )
             for endpoint_config in REDDIT_ADS_CONFIG.values()
         ]

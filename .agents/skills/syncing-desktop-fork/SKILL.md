@@ -19,26 +19,34 @@ Two upstream sources are merged into the fork's `desktop` branch, in this order:
 ```sh
 git remote add upstream https://github.com/PostHog/posthog.git 2>/dev/null || true
 git fetch --filter=blob:none upstream master posthog-code/desktop-electron-app
+restore_script=$(mktemp)
+cp products/desktop/scripts/restore-fork-paths.sh "$restore_script"
 desktop_base=$(git rev-parse HEAD)
-git merge --no-edit --no-commit upstream/master
-git restore --source="$desktop_base" --staged --worktree -- .github/workflows
-git commit --no-edit
-git merge --no-edit --no-commit upstream/posthog-code/desktop-electron-app  # skip if the branch no longer exists
-git restore --source="$desktop_base" --staged --worktree -- .github/workflows
-git commit --no-edit
+git merge --no-edit --no-commit --no-ff upstream/master
+bash "$restore_script" "$desktop_base"
+git commit -m "chore(desktop): sync upstream"
+git merge --no-edit --no-commit --no-ff upstream/posthog-code/desktop-electron-app  # skip if the branch no longer exists
+bash "$restore_script" "$desktop_base"
+git commit -m "chore(desktop): sync upstream"
 ```
 
 Sync is one-directional: the PR branch and master flow into the fork, never the reverse — fork-only master-merge resolutions and release plumbing stay on the fork.
+Finish every requested ref after resolving a conflict; do not stop after the first merge.
+Use `git merge-base --is-ancestor <ref> HEAD` to verify each requested ref.
+
 If a merge is already in progress (CI invokes the agent only after a conflicted `git merge`), skip straight to conflict resolution — never `git merge --abort` and never reset the branch.
 
-The fork deliberately owns its entire `.github/workflows/**` tree. The automated sync restores that directory from the pre-merge desktop commit before committing, because its least-privilege `GITHUB_TOKEN` cannot update workflow files. Keep those files unchanged during conflict resolution; port applicable upstream workflow changes separately after human review.
+The fork deliberately owns its entire `.github/workflows/**` and `products/desktop/**` trees.
+Upstream has a different desktop app at the same path; do not import its standalone workspace or replace this fork’s Electron shell.
+The restore helper removes the merged index entries before restoring the saved trees, including paths deleted by the fork but modified upstream. The automated sync restores that directory from the pre-merge desktop commit before committing, because its least-privilege `GITHUB_TOKEN` cannot update workflow files. Keep workflow files unchanged during automated conflict resolution; port applicable upstream workflow changes separately after human review.
 
 ## Resolving conflicts
 
 - Upstream master is the source of truth for everything the desktop branch does not deliberately change. For conflicts in files the desktop branch never touched meaningfully, take upstream's side.
 - `products/desktop/**`, `.github/workflows/**`, and this skill are desktop-owned: keep our side. Port applicable upstream workflow changes separately after human review; never include them in the automated sync commit.
 - For shared frontend files the desktop branch modified (scene-awareness wiring, kea logic changes): merge both intents. Never silently drop an upstream change; if the two sides are genuinely incompatible, prefer upstream behavior for the web app and re-express the desktop need on top of it.
-- Regenerate rather than hand-merge generated files (lockfiles, generated types): for `pnpm-lock.yaml` take upstream's version, then run `pnpm install` if the desktop branch adds dependencies of its own (it currently does not — `products/desktop` uses only catalog and external deps).
+- Regenerate rather than hand-merge generated files (lockfiles, generated types): for `pnpm-lock.yaml` take upstream's version, then run `pnpm install` if the desktop branch adds dependencies of its own (the Electron shell adds its own importer and dependencies).
+  Keep `products/desktop` included in the root `pnpm-workspace.yaml`; upstream excludes its unrelated standalone app, which makes filtered tests silently run nothing unless `--fail-if-no-match` is used.
 - Finish the merge with a normal merge commit. Verify nothing is left over: `git diff --check` is clean, no `<<<<<<<` markers in tracked files, and `.git/MERGE_HEAD` is gone after committing.
 
 ## Adapting incoming changes: tab awareness
@@ -57,15 +65,18 @@ Rules of thumb during sync:
 Only desktop and frontend correctness matter on this fork; backend, e2e, and playwright suites are deliberately not run.
 
 ```sh
-pnpm install --frozen-lockfile --filter=@posthog/desktop
-pnpm --filter=@posthog/desktop test
+pnpm install --frozen-lockfile --filter=@posthog/desktop --filter=@posthog/frontend...
+pnpm --filter=@posthog/desktop --fail-if-no-match test
+pnpm --filter=@posthog/desktop --fail-if-no-match typecheck
+pnpm exec turbo --filter=@posthog/frontend prepare
+pnpm --filter=@posthog/frontend typescript:check
 ```
 
-If the merge touched shared frontend files the desktop branch also modifies, additionally typecheck: `pnpm install --frozen-lockfile && pnpm --filter=@posthog/frontend typescript:check`.
+The workflow always runs the desktop tests, desktop typecheck, and frontend typecheck before pushing.
 Fix failures the merge introduced; if a failure clearly pre-exists on upstream master, note it in the commit message instead of chasing it.
 
 ## After the sync
 
 Push `desktop` to the fork (`origin` in CI).
 The sync workflow then dispatches `desktop-release.yml`, which compares `version` in `products/desktop/package.json` against the existing `desktop-v<version>` release tag and, when the version changed, builds and publishes a new signed macOS DMG and Windows installer as a GitHub release on the fork.
-Bumping that version field is therefore the release trigger.
+If that version is already released, the release workflow bumps its patch version before building.

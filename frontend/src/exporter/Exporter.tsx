@@ -18,8 +18,7 @@ import { teamLogic } from 'scenes/teamLogic'
 
 import { ExporterLogin } from '~/exporter/ExporterLogin'
 import { ExportType, ExportedData } from '~/exporter/types'
-import { isInsightVizNode, isTrendsQuery } from '~/queries/utils'
-import { ChartDisplayType } from '~/types'
+import { isMetricInsightQuery } from '~/queries/utils'
 
 import { exporterViewLogic } from './exporterViewLogic'
 
@@ -29,6 +28,7 @@ const LazyInsightScene = lazyWithRetry(() => import('./scenes/ExporterInsightSce
 const LazyNotebookScene = lazyWithRetry(() => import('./scenes/ExporterNotebookScene'))
 const LazyRecordingScene = lazyWithRetry(() => import('./scenes/ExporterRecordingScene'))
 const LazyInterviewScene = lazyWithRetry(() => import('./scenes/ExporterInterviewScene'))
+const LazyQueryScene = lazyWithRetry(() => import('./scenes/ExporterQueryScene'))
 
 function ExportedSceneSkeleton(): JSX.Element {
     return (
@@ -80,6 +80,9 @@ export function Exporter(props: ExportedData): JSX.Element {
         notebook,
         insights,
         inline_query_results: inlineQueryResults,
+        query,
+        query_results: queryResults,
+        query_title: queryTitle,
         themes,
         accessToken,
         exportToken,
@@ -89,15 +92,12 @@ export function Exporter(props: ExportedData): JSX.Element {
     const { whitelabel, showInspector = false } = exportOptions
     const forcedTheme = useResolvedForcedTheme(exportOptions.theme)
 
-    // A metric insight sizes to a square card rather than filling the viewport, so drop the 100vh floor
+    // A metric insight sizes to a compact card rather than filling the viewport, so drop the 100vh floor
     // that would otherwise leave empty space below it (see Exporter.scss and ExportedInsight.scss).
-    const metric =
-        insight &&
-        isInsightVizNode(insight.query) &&
-        isTrendsQuery(insight.query.source) &&
-        insight.query.source.trendsFilter?.display === ChartDisplayType.Metric
-            ? insight
-            : undefined
+    // Applies to both saved insights and ad-hoc query exports — the image exporter narrows
+    // the screenshot viewport for both.
+    const metricQuery = insight?.query ?? query
+    const metric = isMetricInsightQuery(metricQuery)
 
     const { currentTeam } = useValues(teamLogic)
     const { ref: elementRef, height, width } = useResizeObserver()
@@ -214,6 +214,16 @@ export function Exporter(props: ExportedData): JSX.Element {
                 ) : insight ? (
                     <Suspense fallback={<ExportedSceneSkeleton />}>
                         <LazyInsightScene insight={insight} themes={themes!} exportOptions={exportOptions} />
+                    </Suspense>
+                ) : query ? (
+                    <Suspense fallback={<ExportedSceneSkeleton />}>
+                        <LazyQueryScene
+                            query={query}
+                            queryResults={queryResults}
+                            title={queryTitle}
+                            themes={themes!}
+                            exportOptions={exportOptions}
+                        />
                     </Suspense>
                 ) : dashboard ? (
                     <Suspense fallback={<ExportedSceneSkeleton />}>

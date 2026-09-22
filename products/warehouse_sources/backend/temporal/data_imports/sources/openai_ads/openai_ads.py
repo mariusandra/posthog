@@ -7,7 +7,6 @@ from typing import Any, Optional
 from dateutil import parser
 from requests import Request, Response
 
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.http import make_tracked_session
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source import (
     RESTAPIConfig,
@@ -18,12 +17,28 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.res
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client import RESTClient
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.source_helpers import validate_via_probe
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.sync_window import SyncWindow
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.openai_ads.settings import (
     INSIGHTS_PAGE_SIZE,
     LIST_PAGE_SIZE,
     OPENAI_ADS_BASE_URL,
     OPENAI_ADS_ENDPOINTS,
     OpenAIAdsEndpointConfig,
+)
+
+# Shared with the source's 401 and 403 entries in `get_non_retryable_errors` so a rejected key reads
+# the same whether it surfaces while the source is being set up or during a later sync.
+INVALID_CREDENTIALS_ERROR = (
+    "Your OpenAI Ads API key is invalid or has been revoked. Create a new API key in the Settings "
+    "tab of OpenAI Ads Manager, then reconnect."
+)
+NO_ACCESS_ERROR = (
+    "Your OpenAI Ads API key does not have access to this ad account. Create a key for this ad "
+    "account in the Settings tab of OpenAI Ads Manager, then reconnect."
+)
+UNREACHABLE_ERROR = (
+    "Couldn't reach OpenAI Ads to validate your API key. This is usually temporary, so try again in a moment."
 )
 
 # Floor for the insights window on a full refresh. OpenAI Ads launched to advertisers in 2026, so
@@ -103,17 +118,23 @@ def _headers() -> dict[str, str]:
     return {"Accept": "application/json"}
 
 
-def validate_credentials(api_key: str) -> bool:
+def validate_credentials(api_key: str) -> tuple[bool, str | None]:
     # One cheap probe against the campaigns list confirms the key is genuine. 200 => valid.
     # 403 => a real key the API recognizes but with restricted access; accept it at create time
     # (sync-time 403s are caught by get_non_retryable_errors). 401 => bad key.
-    ok, _status = validate_via_probe(
+    ok, status = validate_via_probe(
         lambda: make_tracked_session(redact_values=(api_key,)),
         f"{OPENAI_ADS_BASE_URL}/v1/campaigns?limit=1",
         headers={"Authorization": f"Bearer {api_key}", **_headers()},
         ok_statuses=(200, 403),
     )
-    return ok
+    if ok:
+        return True, None
+    if status == 401:
+        return False, INVALID_CREDENTIALS_ERROR
+    # Anything else — a timeout, connection error, rate limit, or 5xx — says nothing about the key,
+    # so point at retrying rather than sending the user off to replace a key that works.
+    return False, UNREACHABLE_ERROR
 
 
 def _to_utc_date(value: Any) -> date:
@@ -128,7 +149,7 @@ def _to_utc_date(value: Any) -> date:
     return parser.parse(str(value)).astimezone(UTC).date()
 
 
-def _insights_window(db_incremental_field_last_value: Optional[Any]) -> tuple[str, str]:
+def _insights_window(db_incremental_field_last_value: Optional[Any]) -> SyncWindow[str]:
     """The [since, until] ISO date window for one insights sync.
 
     Incremental runs start at the watermark (the pipeline already rewinds it by the configured
@@ -140,7 +161,7 @@ def _insights_window(db_incremental_field_last_value: Optional[Any]) -> tuple[st
     if db_incremental_field_last_value is not None:
         since = _to_utc_date(db_incremental_field_last_value)
     since = min(since, until)
-    return since.isoformat(), until.isoformat()
+    return SyncWindow(start=since.isoformat(), end=until.isoformat())
 
 
 def _convert_insights_times(row: dict[str, Any]) -> dict[str, Any]:
@@ -235,9 +256,9 @@ def openai_ads_source(
 
     if config.aggregation_level is not None:
         if resume is not None and resume.since and resume.until:
-            since, until = resume.since, resume.until
+            window: SyncWindow[str] = SyncWindow(start=resume.since, end=resume.until)
         else:
-            since, until = _insights_window(db_incremental_field_last_value)
+            window = _insights_window(db_incremental_field_last_value)
         params: dict[str, Any] = {
             "aggregation_level": config.aggregation_level,
             "time_granularity": "daily",
@@ -246,11 +267,13 @@ def openai_ads_source(
             "fields[]": list(config.insights_fields),
             # One JSON-encoded time-range object; the explicit timezone keeps daily buckets (and
             # therefore the bucket ids merge dedupes on) stable across runs.
-            "time_ranges[]": json.dumps({"type": "date_range", "since": since, "until": until, "timezone": "UTC"}),
+            "time_ranges[]": json.dumps(
+                {"type": "date_range", "since": window.start, "until": window.end, "timezone": "UTC"}
+            ),
         }
         data_map = _convert_insights_times
     else:
-        since = until = ""
+        window = SyncWindow(start="", end="")
         # An explicit stable sort prevents page-boundary skips/duplicates while paginating the
         # full campaign list.
         params = {"limit": LIST_PAGE_SIZE, "order": "asc"}
@@ -288,7 +311,7 @@ def openai_ads_source(
         # resumed cursor pairs with the result set it was issued for.
         if state and state.get("cursor"):
             resumable_source_manager.save_state(
-                OpenAIAdsResumeConfig(cursor=state["cursor"], since=since or None, until=until or None)
+                OpenAIAdsResumeConfig(cursor=state["cursor"], since=window.start or None, until=window.end or None)
             )
 
     resource = rest_api_resource(

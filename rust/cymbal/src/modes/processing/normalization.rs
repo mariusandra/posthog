@@ -19,10 +19,15 @@
 //! left untouched, payloads below it (or with an unparseable version) are still
 //! normalized. A `None` cutoff means the SDK has not flipped yet, so everything
 //! is normalized.
+//!
+//! The module also normalizes legacy untagged payloads ([`normalize_legacy_tags`]):
+//! SDKs from before the stacktrace `type` and frame `platform` tags existed need
+//! those tags added before typed parsing.
 
 use std::sync::OnceLock;
 
 use semver::Version;
+use serde_json::Value;
 
 use crate::types::ExceptionList;
 
@@ -124,7 +129,8 @@ fn lib_rules() -> &'static [LibRule] {
         rules.push(LibRule {
             lib: "posthog-python",
             fix: WireOrderFix::EXCEPTION_LIST,
-            canonical_since: None,
+            // posthog-python ships the flip in 7.31.0 (PostHog/posthog-python#728).
+            canonical_since: Some(Version::new(7, 31, 0)),
         });
 
         rules
@@ -260,6 +266,66 @@ pub fn legacy_wire_order(
     Some(legacy)
 }
 
+// Keys only python frames carry on the wire. posthog-python < 3.8.0 sent frames without
+// a platform tag, so any of these keys is what identifies such a frame. The list mirrors
+// the serde field names of `RawPythonFrame` (core/types/langs/python.rs) — keep in sync.
+const LEGACY_PYTHON_FRAME_KEYS: &[&str] = &[
+    "abs_path",
+    "context_line",
+    "module",
+    "pre_context",
+    "post_context",
+];
+
+/// Tags legacy untagged payloads in place, on the raw `$exception_list` JSON before
+/// typed parsing. posthog-python only added the `"type": "raw"` stacktrace tag and the
+/// frame `platform` tag in 3.8.0; `Stacktrace` and `RawFrame` parse both as serde-tagged
+/// enums, so an untagged payload would otherwise fail with a missing-field error and
+/// never become an issue. An untagged stacktrace is tagged raw. An untagged frame in a
+/// raw stacktrace is tagged python only when a python-only key identifies it — other
+/// frame shapes overlap too much to classify safely, so any other untagged frame keeps
+/// failing typed parsing.
+///
+/// This runs once, at the processing-ingest boundary (`TryFrom<AnyEvent>`). Every other
+/// parse site of these types consumes cymbal-serialized JSON, which always carries the
+/// tags.
+pub fn normalize_legacy_tags(exception_list: &mut Value) {
+    let Some(exceptions) = exception_list.as_array_mut() else {
+        return;
+    };
+    for exception in exceptions {
+        let Some(stacktrace) = exception
+            .get_mut("stacktrace")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        if !stacktrace.contains_key("type") {
+            stacktrace.insert("type".to_string(), Value::String("raw".to_string()));
+        }
+        // Only raw stacktraces can carry untagged legacy frames. Resolved frames
+        // legitimately carry keys like `module`, and must not get a platform tag.
+        if stacktrace.get("type").and_then(Value::as_str) != Some("raw") {
+            continue;
+        }
+        let Some(frames) = stacktrace.get_mut("frames").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for frame in frames {
+            let Some(frame) = frame.as_object_mut() else {
+                continue;
+            };
+            if !frame.contains_key("platform")
+                && LEGACY_PYTHON_FRAME_KEYS
+                    .iter()
+                    .any(|key| frame.contains_key(*key))
+            {
+                frame.insert("platform".to_string(), Value::String("python".to_string()));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -329,6 +395,58 @@ mod test {
         // Natively-canonical SDKs have no legacy order.
         assert!(legacy_wire_order(Some("posthog-node"), &canonical).is_none());
         assert!(legacy_wire_order(None, &canonical).is_none());
+    }
+
+    #[test]
+    fn python_cutoff_gates_exception_list_normalization_by_version() {
+        // Python's fix reverses the exception list (root-cause-first ->
+        // outermost-first), not frames — the gate must key on the same fix.
+        let make_list = || -> ExceptionList {
+            vec![
+                exception_with_frames("RootCause", &["main", "boom"]),
+                exception_with_frames("Wrapper", &["main", "wrap"]),
+            ]
+            .into()
+        };
+
+        for version in [Some("7.30.1"), Some("7.30.0"), Some("garbage"), None] {
+            let mut list = make_list();
+            let legacy = normalize_wire_order(&mut list, Some("posthog-python"), version);
+            assert!(legacy.is_some(), "{version:?} should normalize");
+            assert_eq!(list[0].exception_type, "Wrapper", "list reversed");
+            assert_eq!(
+                frame_names(&list[0]),
+                vec!["main", "wrap"],
+                "frames untouched"
+            );
+        }
+
+        // Post-flip senders emit canonical order: outermost wrapper first.
+        let make_canonical_list = || -> ExceptionList {
+            vec![
+                exception_with_frames("Wrapper", &["main", "wrap"]),
+                exception_with_frames("RootCause", &["main", "boom"]),
+            ]
+            .into()
+        };
+
+        for version in ["7.31.0", "7.31.1", "7.32.0", "8.0.0"] {
+            let mut list = make_canonical_list();
+            let legacy = normalize_wire_order(&mut list, Some("posthog-python"), Some(version));
+            assert!(legacy.is_none(), "{version} should pass through");
+            assert_eq!(
+                list[0].exception_type, "Wrapper",
+                "canonical list untouched"
+            );
+        }
+
+        // Legacy hashing still reconstructs the pre-flip (root-cause-first)
+        // list order from the canonical stored order post-cutoff.
+        let canonical = make_canonical_list();
+        let legacy = legacy_wire_order(Some("posthog-python"), &canonical)
+            .expect("reconstruction must ignore the cutoff");
+        assert_eq!(legacy[0].exception_type, "RootCause");
+        assert_eq!(frame_names(&legacy[0]), vec!["main", "boom"]);
     }
 
     #[test]
@@ -608,7 +726,6 @@ mod test {
             junk_drawer: None,
             code_variables: None,
             context: None,
-            release: None,
             module: None,
         };
 
@@ -671,5 +788,82 @@ mod test {
         );
         assert_eq!(parse_lenient("garbage"), None);
         assert_eq!(parse_lenient(""), None);
+    }
+
+    // The shape posthog-python < 3.8.0 emits: no "type" on the stacktrace and no
+    // "platform" on the frames. Written fresh, not copied from captured data.
+    const LEGACY_PYTHON_EXCEPTION_LIST: &str = r#"[
+        {
+            "type": "ConnectionError",
+            "value": "connection refused",
+            "stacktrace": {
+                "frames": [
+                    {
+                        "abs_path": "/app/example/service.py",
+                        "context_line": "    connect()",
+                        "filename": "example/service.py",
+                        "function": "start",
+                        "lineno": 12,
+                        "module": "example.service",
+                        "pre_context": [],
+                        "post_context": [],
+                        "in_app": true
+                    }
+                ]
+            }
+        }
+    ]"#;
+
+    #[test]
+    fn tags_a_legacy_python_exception_list_so_it_parses() {
+        let mut value: Value = serde_json::from_str(LEGACY_PYTHON_EXCEPTION_LIST).unwrap();
+        normalize_legacy_tags(&mut value);
+        let list: ExceptionList = serde_json::from_value(value).unwrap();
+        let Some(Stacktrace::Raw { frames }) = &list[0].stack else {
+            panic!("expected a raw stacktrace");
+        };
+        assert!(matches!(frames.as_slice(), [RawFrame::Python(_)]));
+
+        // Serialization must write the tags back: downstream consumers (resolution,
+        // notifications) re-parse cymbal-serialized stacktraces and rely on them.
+        let serialized = serde_json::to_value(&list).unwrap();
+        assert_eq!(serialized[0]["stacktrace"]["type"], "raw");
+        assert_eq!(
+            serialized[0]["stacktrace"]["frames"][0]["platform"],
+            "python"
+        );
+    }
+
+    #[test]
+    fn leaves_resolved_stacktrace_frames_untouched() {
+        let raw = r#"[
+            {
+                "type": "Error",
+                "value": "boom",
+                "stacktrace": {
+                    "type": "resolved",
+                    "frames": [{"module": "example.service", "function": "start"}]
+                }
+            }
+        ]"#;
+        let mut value: Value = serde_json::from_str(raw).unwrap();
+        normalize_legacy_tags(&mut value);
+        assert_eq!(value[0]["stacktrace"]["frames"][0].get("platform"), None);
+    }
+
+    #[test]
+    fn leaves_untagged_frames_without_python_markers_unclassified() {
+        let raw = r#"[
+            {
+                "type": "Error",
+                "value": "boom",
+                "stacktrace": {
+                    "frames": [{"filename": "app.js", "function": "main", "lineno": 3, "colno": 7}]
+                }
+            }
+        ]"#;
+        let mut value: Value = serde_json::from_str(raw).unwrap();
+        normalize_legacy_tags(&mut value);
+        assert!(serde_json::from_value::<ExceptionList>(value).is_err());
     }
 }

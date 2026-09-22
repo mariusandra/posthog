@@ -4,7 +4,7 @@ import { getSeriesColor } from 'lib/colors'
 import { EXPERIMENT_DEFAULT_DURATION, FunnelLayout, MAX_EXPERIMENT_VARIANTS } from 'lib/constants'
 import { dayjs } from 'lib/dayjs'
 import { uuid } from 'lib/utils/dom'
-import { MathAvailability } from 'scenes/insights/filters/ActionFilter/ActionFilterRow/ActionFilterRow'
+import { MathAvailability } from 'scenes/insights/filters/ActionFilter/ActionFilterRow/types'
 
 import {
     AnyDataWarehouseNode,
@@ -26,11 +26,11 @@ import {
     isExperimentFunnelMetric,
     isExperimentMeanMetric,
     isExperimentRatioMetric,
+    isExperimentExposureNode,
     isExperimentRetentionMetric,
 } from '~/queries/schema/schema-general'
 import { isFunnelsQuery, isNodeWithSource, isTrendsQuery, isValidQueryForExperiment } from '~/queries/utils'
 import {
-    AnyPropertyFilter,
     ChartDisplayType,
     Experiment,
     ExperimentMetricGoal,
@@ -47,17 +47,18 @@ import {
     UniversalFiltersGroupValue,
 } from '~/types'
 
+import { EXPERIMENT_VARIANT_MULTIPLE } from 'products/experiments/frontend/constants'
 import type {
     ExperimentFeatureFlagFiltersApi,
     ExperimentFeatureFlagInputApi,
 } from 'products/experiments/frontend/generated/api.schemas'
 
-import { EXPERIMENT_VARIANT_MULTIPLE } from './constants'
 import {
     EXPOSURE_DEFAULT_EVENT,
     EXPOSURE_FEATURE_FLAG_PROPERTY,
     EXPOSURE_FEATURE_FLAG_RESPONSE_PROPERTY,
     featureFlagVariantProperty,
+    resolvedExposureEvent,
 } from './exposureContract'
 import { SharedMetric } from './SharedMetrics/sharedMetricLogic'
 
@@ -143,7 +144,7 @@ export function ensureIsPercent(value: string | number | undefined): number {
 
 export function percentageDistribution(variantCount: number): number[] {
     const basePercentage = Math.floor(100 / variantCount)
-    const percentages = new Array(variantCount).fill(basePercentage)
+    const percentages = Array.from<number>({ length: variantCount }).fill(basePercentage)
     let remaining = 100 - basePercentage * variantCount
     for (let i = 0; remaining > 0; i++, remaining--) {
         // try to equally distribute `remaining` across variants
@@ -216,142 +217,6 @@ function seriesToFilter(series: AnyEntityNode | ExperimentMetricSource): Univers
 }
 
 /**
- * Mirrors the backend's exposure semantics (`build_common_exposure_conditions`, also behind the
- * replay player's experiment session context): the variant property must be IN the experiment's
- * variant keys. Matching only on the event would include sessions of users who evaluated the flag
- * but were never enrolled, e.g. `$feature_flag_called` with a `false` response on a partial rollout.
- */
-function variantPropertyFilter(propertyKey: string, variantKeys: string[]): AnyPropertyFilter {
-    if (variantKeys.length === 0) {
-        // Variants unknown (flag not loaded) — the variant property being stamped at all is the
-        // closest available enrollment marker.
-        return {
-            key: propertyKey,
-            type: PropertyFilterType.Event,
-            value: PropertyOperator.IsSet,
-            operator: PropertyOperator.IsSet,
-        }
-    }
-    return {
-        key: propertyKey,
-        type: PropertyFilterType.Event,
-        value: variantKeys,
-        operator: PropertyOperator.Exact,
-    }
-}
-
-function createExposureFilter(
-    exposureConfig: ExperimentExposureConfig,
-    featureFlagKey: string,
-    variantKeys: string[]
-): UniversalFiltersGroupValue {
-    const isEvent = isEventExposureConfig(exposureConfig)
-    return {
-        id: isEvent ? exposureConfig.event || 'unknown' : exposureConfig.id,
-        name: isEvent ? exposureConfig.event || 'Unknown Event' : exposureConfig.name || `Action ${exposureConfig.id}`,
-        type: isEvent ? 'events' : 'actions',
-        properties: [
-            ...(exposureConfig.properties || []),
-            variantPropertyFilter(featureFlagVariantProperty(featureFlagKey), variantKeys),
-        ],
-    }
-}
-
-/**
- * Exposure filter for an experiment's recordings: one variant, or every enrolled session (variant
- * property IN the experiment's variants) when `variantKey` is omitted. Exposure-only — metric
- * steps are never added, so a metric event captured without a `$session_id` can't zero out the
- * result.
- */
-export function getViewRecordingFiltersForVariant(
-    experiment: Experiment,
-    variantKey?: string
-): UniversalFiltersGroupValue[] {
-    const variantKeys =
-        variantKey !== undefined ? [variantKey] : getExperimentVariants(experiment).map((variant) => variant.key)
-    const exposureConfig = experiment.exposure_criteria?.exposure_config
-    if (exposureConfig && !(isEventExposureConfig(exposureConfig) && exposureConfig.event === EXPOSURE_DEFAULT_EVENT)) {
-        return [createExposureFilter(exposureConfig, experiment.feature_flag_key, variantKeys)]
-    }
-
-    return [
-        {
-            id: EXPOSURE_DEFAULT_EVENT,
-            name: EXPOSURE_DEFAULT_EVENT,
-            type: 'events',
-            properties: [
-                variantPropertyFilter(EXPOSURE_FEATURE_FLAG_RESPONSE_PROPERTY, variantKeys),
-                {
-                    key: EXPOSURE_FEATURE_FLAG_PROPERTY,
-                    type: PropertyFilterType.Event,
-                    value: experiment.feature_flag_key,
-                    operator: PropertyOperator.Exact,
-                },
-            ],
-        },
-    ]
-}
-
-/**
- * Gets the Filters to ExperimentMetrics, Can't quite use `exposureConfigToFilter` or
- * `metricToFilter` because the format is not quite the same, but we can use `seriesToFilter`
- *
- * TODO: refactor the *ToFilter functions so we can use bits of them.
- */
-export function getViewRecordingFilters(
-    experiment: Experiment,
-    metric: ExperimentMetric,
-    variantKey: string
-): UniversalFiltersGroupValue[] {
-    /**
-     * The exposure criteria is always the first link in the filter chain.
-     */
-    const filters: UniversalFiltersGroupValue[] = getViewRecordingFiltersForVariant(experiment, variantKey)
-
-    /**
-     * for mean metrics, we add the single action/event to the filters
-     */
-    if (
-        isExperimentMeanMetric(metric) &&
-        (metric.source.kind === NodeKind.EventsNode || metric.source.kind === NodeKind.ActionsNode)
-    ) {
-        const meanFilter = seriesToFilter(metric.source)
-        if (meanFilter) {
-            filters.push(meanFilter)
-        }
-    }
-
-    /**
-     * for funnel metrics, we need to add each element in the series as a filter
-     */
-    if (isExperimentFunnelMetric(metric)) {
-        metric.series.forEach((series) => {
-            const funnelMetric = seriesToFilter(series)
-            if (funnelMetric) {
-                filters.push(funnelMetric)
-            }
-        })
-    }
-
-    /**
-     * for ratio metrics, we add both numerator and denominator events to the filters
-     */
-    if (isExperimentRatioMetric(metric)) {
-        const numeratorFilter = seriesToFilter(metric.numerator)
-        const denominatorFilter = seriesToFilter(metric.denominator)
-
-        if (numeratorFilter) {
-            filters.push(numeratorFilter)
-        }
-        if (denominatorFilter) {
-            filters.push(denominatorFilter)
-        }
-    }
-
-    return filters
-}
-
-/**
  * Event/action filters for one metric's sources — the "session reached this metric" part of a
  * recordings query. Data-warehouse sources have no session events and are skipped, so a metric
  * whose every source is a data-warehouse node (or a retention metric, whose steps the recordings
@@ -372,6 +237,48 @@ export function getMetricSessionFilters(metric: ExperimentMetric): UniversalFilt
 }
 
 /**
+ * The distinct events a metric counts. A metric's name is free text ("Rageclicks per user"), so
+ * on its own it doesn't say what a session has to have fired to match.
+ */
+export function getMetricSourceEventNames(metric: ExperimentMetric): string[] {
+    const names = getMetricSessionFilters(metric)
+        // Only entity filters name an event; a nested filter group (which the type allows) doesn't.
+        .flatMap((filter) => ('id' in filter ? [String(filter.name ?? filter.id ?? '')] : []))
+        .filter(Boolean)
+    return [...new Set(names)]
+}
+
+export const NOT_A_FUNNEL_REASON = "This filter reads a funnel's last step, so it needs a funnel metric."
+
+export const FUNNEL_SERVER_SIDE_COMPLETION_REASON =
+    "This filter reads a funnel's last step. This one is captured server-side without a session ID, so recordings can't be matched."
+
+export const FUNNEL_DATA_WAREHOUSE_COMPLETION_REASON =
+    "This filter reads a funnel's last step. This one is measured in the data warehouse, which has no session events to match recordings on."
+
+/**
+ * Why drop-off can't be asked of this metric, or null when it can. An experiment funnel's first
+ * step is always the exposure event (the analysis prepends it), so drop-off reads only the
+ * funnel's last step, and that step alone has to be matchable. The whole-metric linkability
+ * check can't stand in for this, since a funnel stays matchable on its other steps. Mirrors the
+ * `session_buckets` endpoint, which refuses the same shapes rather than counting a completion no
+ * recording can show as zero in every session.
+ */
+export function getFunnelDropoffReason(metric: ExperimentMetric, unlinkableEventNames: Set<string>): string | null {
+    if (!isExperimentFunnelMetric(metric) || metric.series.length === 0) {
+        return NOT_A_FUNNEL_REASON
+    }
+    const completion = metric.series[metric.series.length - 1]
+    if (completion.kind === NodeKind.ExperimentDataWarehouseNode) {
+        return FUNNEL_DATA_WAREHOUSE_COMPLETION_REASON
+    }
+    if (completion.kind === NodeKind.EventsNode && completion.event && unlinkableEventNames.has(completion.event)) {
+        return FUNNEL_SERVER_SIDE_COMPLETION_REASON
+    }
+    return null
+}
+
+/**
  * Whether a recordings event filter can only match zero sessions: the project has never seen the
  * event with a `$session_id` (e.g. it is captured server-side). Action and data warehouse filters
  * pass through unchecked, matching the replay playlist's own posture.
@@ -389,23 +296,77 @@ export function isUnlinkableEventFilter(
     )
 }
 
+export const METRIC_UNLINKABLE_REASON =
+    "This metric's events are captured server-side without a session ID, so recordings can't be matched."
+
+export const RETENTION_UNLINKABLE_REASON =
+    'Retention metrics measure a return visit, which happens in a later session than the one that starts it. No single recording can show both, so these metrics are left out of the filter.'
+
+export const DATA_WAREHOUSE_UNLINKABLE_REASON =
+    'This metric is measured entirely in the data warehouse, which has no session events to match recordings on.'
+
+/**
+ * Why a metric cannot narrow a recordings list, as a value telemetry can count. The prose the
+ * viewer reads is derived from this, so a copy change can never shift what a report measures.
+ */
+export type ExperimentMetricUnlinkableCode = 'server_side_events' | 'retention' | 'data_warehouse'
+
+/**
+ * Why a metric can't narrow a recordings list, or null when it can. A metric is unlinkable when
+ * every one of its sources is a never-session-linked event, or when it yields no session filter at
+ * all (a retention metric, or one measured only in the data warehouse). Either way its filter could
+ * only match zero sessions. Pass an empty `unlinkableEventNames` while the linkability check loads,
+ * which fails open, the posture every linkability consumer shares.
+ */
+export function getMetricUnlinkableCode(
+    metric: ExperimentMetric,
+    unlinkableEventNames: Set<string>
+): ExperimentMetricUnlinkableCode | null {
+    const filters = getMetricSessionFilters(metric)
+    if (filters.length === 0) {
+        return isExperimentRetentionMetric(metric) ? 'retention' : 'data_warehouse'
+    }
+    return filters.every((filter) => isUnlinkableEventFilter(filter, unlinkableEventNames))
+        ? 'server_side_events'
+        : null
+}
+
+const METRIC_UNLINKABLE_REASONS: Record<ExperimentMetricUnlinkableCode, string> = {
+    server_side_events: METRIC_UNLINKABLE_REASON,
+    retention: RETENTION_UNLINKABLE_REASON,
+    data_warehouse: DATA_WAREHOUSE_UNLINKABLE_REASON,
+}
+
+/** The prose for `getMetricUnlinkableCode`, as the tab's own metric dropdown reads it. */
+export function getMetricUnlinkableReason(metric: ExperimentMetric, unlinkableEventNames: Set<string>): string | null {
+    const code = getMetricUnlinkableCode(metric, unlinkableEventNames)
+    return code === null ? null : METRIC_UNLINKABLE_REASONS[code]
+}
+
+/**
+ * The single event an experiment's exposure is counted on, for the session-linkability check.
+ * Null for an action exposure config, which can match several events, so no one name applies.
+ */
+export function getExposureLinkabilityEventName(experiment: Experiment): string | null {
+    const exposureConfig = experiment.exposure_criteria?.exposure_config
+    if (exposureConfig && !(isEventExposureConfig(exposureConfig) && exposureConfig.event === EXPOSURE_DEFAULT_EVENT)) {
+        return isEventExposureConfig(exposureConfig) && exposureConfig.event ? exposureConfig.event : null
+    }
+    return resolvedExposureEvent(experiment)
+}
+
 /**
  * Event names whose session-linkability must be checked before building "View recordings" links:
  * the exposure event plus every plain-event metric step across primary, secondary and shared
- * metrics, mirroring how `getViewRecordingFilters` enumerates them. Action and data warehouse
- * steps pass through unchecked (same as the replay playlist's own check), as do "all events"
- * steps, which have no event name.
+ * metrics. Action and data warehouse steps pass through unchecked (same as the replay playlist's
+ * own check), as do "all events" steps, which have no event name.
  */
 export function getSessionLinkabilityEventNames(experiment: Experiment): string[] {
     const eventNames = new Set<string>()
 
-    const exposureConfig = experiment.exposure_criteria?.exposure_config
-    if (exposureConfig && !(isEventExposureConfig(exposureConfig) && exposureConfig.event === EXPOSURE_DEFAULT_EVENT)) {
-        if (isEventExposureConfig(exposureConfig) && exposureConfig.event) {
-            eventNames.add(exposureConfig.event)
-        }
-    } else {
-        eventNames.add(EXPOSURE_DEFAULT_EVENT)
+    const exposureEventName = getExposureLinkabilityEventName(experiment)
+    if (exposureEventName) {
+        eventNames.add(exposureEventName)
     }
 
     const metrics = [
@@ -430,36 +391,6 @@ export function getSessionLinkabilityEventNames(experiment: Experiment): string[
     }
 
     return Array.from(eventNames)
-}
-
-/**
- * Post-filters `getViewRecordingFilters` output. Recordings are matched through events carrying
- * a `$session_id`, so an event filter the project has never seen with that property (e.g. one
- * captured server-side) would zero out the whole AND-combined recordings query. The exposure
- * filter is always first; when it is itself unlinkable there are no recordings to show at all.
- */
-export function applySessionLinkability(
-    filters: UniversalFiltersGroupValue[],
-    unlinkableEventNames: Set<string>
-): { filters: UniversalFiltersGroupValue[]; droppedMetricEventCount: number; exposureUnlinkable: boolean } {
-    const isUnlinkable = (filter: UniversalFiltersGroupValue): boolean =>
-        isUnlinkableEventFilter(filter, unlinkableEventNames)
-
-    if (filters.length === 0) {
-        return { filters: [], droppedMetricEventCount: 0, exposureUnlinkable: false }
-    }
-
-    const [exposureFilter, ...metricFilters] = filters
-    if (isUnlinkable(exposureFilter)) {
-        return { filters: [], droppedMetricEventCount: 0, exposureUnlinkable: true }
-    }
-
-    const keptMetricFilters = metricFilters.filter((filter) => !isUnlinkable(filter))
-    return {
-        filters: [exposureFilter, ...keptMetricFilters],
-        droppedMetricEventCount: metricFilters.length - keptMetricFilters.length,
-        exposureUnlinkable: false,
-    }
 }
 
 export function getViewRecordingFiltersLegacy(
@@ -950,7 +881,12 @@ const getEventCountSeries = (metric: ExperimentMetric): AnyEntityNode[] => {
 
     const source: ExperimentMetricSource | null = match(metric)
         .when(isExperimentRatioMetric, (ratioMetric) => ratioMetric.numerator)
-        .when(isExperimentRetentionMetric, (retentionMetric) => retentionMetric.start_event)
+        // An exposure-anchored start has no literal event to preview, so show completion-event activity
+        .when(isExperimentRetentionMetric, (retentionMetric) =>
+            isExperimentExposureNode(retentionMetric.start_event)
+                ? retentionMetric.completion_event
+                : retentionMetric.start_event
+        )
         .when(isExperimentMeanMetric, (meanMetric) => meanMetric.source)
         .otherwise(() => null)
 
@@ -1106,10 +1042,22 @@ export function getOrderedMetricsWithResults(
             name: sharedMetric.name,
             sharedMetricId: sharedMetric.saved_metric,
             isSharedMetric: true,
-            // Merge breakdowns from metadata into breakdownFilter
+            /**
+             * Merge per-experiment breakdown attribution from metadata into the query
+             */
+            ...(sharedMetric.metadata?.breakdownAttributionType !== undefined && {
+                breakdownAttributionType: sharedMetric.metadata.breakdownAttributionType,
+                breakdownAttributionValue: sharedMetric.metadata.breakdownAttributionValue,
+            }),
+            /**
+             * Merge breakdowns from metadata into breakdownFilter
+             */
             breakdownFilter: {
                 ...sharedMetric.query?.breakdownFilter,
                 breakdowns: sharedMetric.metadata?.breakdowns || [],
+                ...(sharedMetric.metadata?.breakdown_limit !== undefined && {
+                    breakdown_limit: sharedMetric.metadata.breakdown_limit,
+                }),
             },
         })) as ExperimentMetric[]
 
@@ -1172,6 +1120,95 @@ export type ExperimentWritePayload<T> = Omit<T, 'feature_flag' | 'feature_flag_c
 export type ExperimentUpdatePayload = Omit<Partial<Experiment>, 'feature_flag'> & {
     feature_flag?: ExperimentFeatureFlagInputApi | Experiment['feature_flag']
     update_feature_flag_params?: boolean
+    original_experiment?: Record<string, any>
+}
+
+/** The scalar fields experiment surfaces PATCH, sent as base values so the server can three-way
+ * merge them per field: a stale write only conflicts when the same field changed on both sides. */
+const CONCURRENCY_SCALAR_BASE_FIELDS = [
+    'name',
+    'description',
+    'start_date',
+    'end_date',
+    'exposure_criteria',
+    'stats_config',
+    'running_time_calculation',
+    'holdout_id',
+    'conclusion',
+    'conclusion_comment',
+    'excluded_variants',
+    'only_count_matured_users',
+    'parameters',
+] as const
+
+/** Concurrency context for experiment PATCHes: the version last read plus the state that version
+ * belongs to (metric collections and scalar bases), so the server can merge concurrent edits per
+ * metric uuid / per field and reject only true same-field conflicts with a 409, instead of letting
+ * a stale write clobber them. */
+export function toConcurrencyPayload(
+    unmodified: Experiment | null
+): Pick<ExperimentUpdatePayload, 'version' | 'original_experiment'> {
+    if (!unmodified || typeof unmodified.id !== 'number') {
+        return {}
+    }
+    return {
+        version: unmodified.version ?? 0,
+        original_experiment: {
+            metrics: unmodified.metrics,
+            metrics_secondary: unmodified.metrics_secondary,
+            saved_metrics_ids: (unmodified.saved_metrics || []).map((sharedMetric) => ({
+                id: sharedMetric.saved_metric,
+                metadata: sharedMetric.metadata,
+            })),
+            // Explicit null over undefined: a missing base key makes the server fall back to
+            // rejecting any change to that field, while null means "the field was empty".
+            ...Object.fromEntries(CONCURRENCY_SCALAR_BASE_FIELDS.map((field) => [field, unmodified[field] ?? null])),
+        },
+    }
+}
+
+/** Whether an API error is the experiment concurrency conflict (as opposed to any other 409,
+ * e.g. an approval-required response, which carries no `current_version`). */
+export function isExperimentConflictError(error: any): boolean {
+    return error?.status === 409 && error?.data?.current_version !== undefined
+}
+
+const CONFLICT_UNPRESERVABLE_KEYS = new Set([
+    'metrics',
+    'metrics_secondary',
+    'saved_metrics_ids',
+    'primary_metrics_ordered_uuids',
+    'secondary_metrics_ordered_uuids',
+    'version',
+    'original_experiment',
+    'update_feature_flag_params',
+    'feature_flag',
+])
+
+/** The fields of a 409-rejected update worth keeping in local state: the user's scalar edits.
+ * Collection and bookkeeping fields are dropped — re-applying a stale metric array over the
+ * fresh state would reintroduce exactly the clobbering the conflict prevented. */
+export function conflictPreservedFields(payload: ExperimentUpdatePayload): Partial<Experiment> {
+    return Object.fromEntries(Object.entries(payload).filter(([key]) => !CONFLICT_UNPRESERVABLE_KEYS.has(key)))
+}
+
+/** Flag config the API projects into `parameters` on read. The linked flag owns these keys, so they
+ * are absent from the type but present at runtime on every response. */
+const PROJECTED_FLAG_CONFIG_KEYS = new Set([
+    'feature_flag_variants',
+    'rollout_percentage',
+    'aggregation_group_type_index',
+    'feature_flag_payloads',
+    'ensure_experience_continuity',
+])
+
+/** Drops the projected flag config, so updating an experiment-owned key does not echo the
+ * deprecated flag dialect back to the API. The `feature_flag` sibling of this is
+ * {@link toExperimentWritePayload}. */
+export function withoutProjectedFlagConfig(parameters: Experiment['parameters'] | undefined): Experiment['parameters'] {
+    return Object.fromEntries(
+        Object.entries(parameters ?? {}).filter(([key]) => !PROJECTED_FLAG_CONFIG_KEYS.has(key))
+    ) as Experiment['parameters']
 }
 
 /** Maps UI variants to the flag's write shape, dropping null names the generated type disallows. */
@@ -1243,9 +1280,22 @@ export const metricResults =
                 name: sharedMetric.name,
                 sharedMetricId: sharedMetric.saved_metric,
                 isSharedMetric: true,
+                /**
+                 * Merge per-experiment breakdown attribution from metadata into the query
+                 */
+                ...(sharedMetric.metadata?.breakdownAttributionType !== undefined && {
+                    breakdownAttributionType: sharedMetric.metadata.breakdownAttributionType,
+                    breakdownAttributionValue: sharedMetric.metadata.breakdownAttributionValue,
+                }),
+                /**
+                 * Merge breakdowns from metadata into breakdownFilter
+                 */
                 breakdownFilter: {
                     ...sharedMetric.query?.breakdownFilter,
                     breakdowns: sharedMetric.metadata?.breakdowns || [],
+                    ...(sharedMetric.metadata?.breakdown_limit !== undefined && {
+                        breakdown_limit: sharedMetric.metadata.breakdown_limit,
+                    }),
                 },
             })) as ExperimentMetric[]
 

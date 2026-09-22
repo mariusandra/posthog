@@ -143,6 +143,39 @@ export class ToolInputValidationError extends Error {
     }
 }
 
+export type ExecCommandErrorReason =
+    | 'unknown_command'
+    | 'batched_command'
+    | 'unknown_tool'
+    | 'deprecated_tool'
+    | 'gated_tool'
+    | 'missing_scope'
+    | 'invalid_json'
+    | 'usage'
+    | 'invalid_regex'
+    | 'unknown_learn_topic'
+    | 'needs_confirmation'
+    | 'skills_gate'
+
+/**
+ * Thrown by the `exec` dispatcher when it rejects a command before any inner
+ * tool runs. Typed so these classify as agent mistakes rather than falling
+ * through to the `internal` bucket ops alerts on.
+ *
+ * `message` goes back to the agent verbatim so it can self-correct, but is
+ * never captured into analytics — it can echo the caller's tool name or a JSON
+ * parser fragment. `$mcp_error_message` is derived from the `reason` enum.
+ */
+export class ExecCommandError extends Error {
+    public readonly reason: ExecCommandErrorReason
+
+    constructor(message: string, reason: ExecCommandErrorReason) {
+        super(message)
+        this.name = 'ExecCommandError'
+        this.reason = reason
+    }
+}
+
 export interface PostHogApiErrorOptions {
     status: number
     statusText: string
@@ -182,8 +215,20 @@ export class PostHogApiError extends Error {
     }
 }
 
+/** The request path without the upstream host. The host is not something an
+ *  agent can act on, and reading one makes a 4xx look like an infrastructure
+ *  fault; `client.ts` already logs the full URL server-side. */
+function requestPath(url: string): string {
+    try {
+        const parsed = new URL(url)
+        return `${parsed.pathname}${parsed.search}`
+    } catch {
+        return url
+    }
+}
+
 function buildDefaultApiErrorMessage(options: PostHogApiErrorOptions): string {
-    return `Request failed:\nURL: ${options.method} ${options.url}\nStatus Code: ${options.status} (${options.statusText})\nError Message: ${options.body}`
+    return `Request failed:\nPath: ${options.method} ${requestPath(options.url)}\nStatus Code: ${options.status} (${options.statusText})\nError Message: ${options.body}`
 }
 
 export interface PostHogRateLimitErrorOptions {
@@ -404,25 +449,16 @@ export function findRecoverableApiError(error: unknown): PostHogApiError | PostH
 export function handleToolError(error: any, tool?: string, distinctId?: string, sessionUuid?: string): CallToolResult {
     const toolName = tool || 'unknown'
 
-    // Recoverable: agent can fix it via switch-project / projects-get. Skip
-    // exception capture (this is expected user state, not a bug) and return the
-    // typed error's pre-formatted multi-line message verbatim.
-    if (error instanceof MissingProjectContextError || error instanceof MissingOrganizationContextError) {
-        return {
-            content: [
-                {
-                    type: 'text',
-                    text: `Error: [${toolName}]: ${error.message}`,
-                },
-            ],
-            isError: true,
-        }
-    }
-
-    // Recoverable: input rejected by the tool's schema before any handler ran —
-    // an agent slip-up, not a bug. The message already names the offending
-    // field(s); skip exception capture like the API 4xx branch below.
-    if (error instanceof ToolInputValidationError) {
+    // Recoverable: expected agent or user state, not a bug — no project picked,
+    // input the schema rejected, a mistyped exec command. Each of these classes
+    // pre-formats a message the agent can self-correct from, so return it verbatim
+    // and skip exception capture, which would mint an issue per slip-up.
+    if (
+        error instanceof MissingProjectContextError ||
+        error instanceof MissingOrganizationContextError ||
+        error instanceof ToolInputValidationError ||
+        error instanceof ExecCommandError
+    ) {
         return {
             content: [
                 {

@@ -7,9 +7,9 @@ import requests
 from structlog.types import FilteringBoundLogger
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.http import make_tracked_session
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.stytch.settings import (
     STYTCH_ENDPOINTS,
     StytchEndpointConfig,
@@ -24,6 +24,18 @@ PAGE_SIZE = 500
 MEMBER_SEARCH_ORG_CHUNK_SIZE = 100
 REQUEST_TIMEOUT_SECONDS = 60
 MAX_RETRIES = 5
+# Stytch surfaces its own search-query timeout as a 400 with this `error_type` (query complexity
+# can push search latency up to ~9s per Stytch's docs) rather than a 5xx, but it's the same
+# transient, self-recovering condition as one — worth the same in-process backoff, not a
+# permanent client error.
+TRANSIENT_ERROR_TYPES = {"search_timeout"}
+# A Stytch project is either a consumer project or a B2B project, and the two product lines have
+# disjoint API surfaces. Whichever tables belong to the other product line answer with one of these
+# error types on every request, so they can never sync against the connected project.
+PRODUCT_LINE_MISMATCH_MESSAGES: dict[str, str] = {
+    "invalid_consumer_endpoint": "The users and sessions tables only exist for Stytch consumer projects, and this is a B2B project. Sync the organizations and members tables instead.",
+    "invalid_b2b_endpoint": "The organizations and members tables only exist for Stytch B2B projects, and this is a consumer project. Sync the users and sessions tables instead.",
+}
 
 
 class StytchRetryableError(Exception):
@@ -125,6 +137,12 @@ def _request(
             error_type = response.json().get("error_type", "unknown")
         except Exception:
             error_type = "unknown"
+
+        if error_type in TRANSIENT_ERROR_TYPES:
+            raise StytchRetryableError(
+                f"Stytch API error (retryable): status={response.status_code}, error_type={error_type}, url={url}"
+            )
+
         logger.error(f"Stytch API error: status={response.status_code}, error_type={error_type}, url={url}")
         raise StytchAPIError(f"Stytch API error: status={response.status_code}, error_type={error_type}, url={url}")
 
@@ -170,7 +188,7 @@ def check_endpoint_access(project_id: str, secret: str, path: str) -> str | None
         error_type = response.json().get("error_type", "unknown")
     except Exception:
         error_type = "unknown"
-    return f"Not available for this Stytch project ({error_type})"
+    return PRODUCT_LINE_MISMATCH_MESSAGES.get(error_type) or f"Not available for this Stytch project ({error_type})"
 
 
 def _iter_search_pages(

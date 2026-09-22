@@ -1,11 +1,16 @@
 import { Decorator, Meta, StoryObj } from '@storybook/react'
+import { BindLogic } from 'kea'
 import { useEffect, useRef } from 'react'
 
 import { App } from 'scenes/App'
 import { urls } from 'scenes/urls'
 
 import { mswDecorator } from '~/mocks/browser'
+import type { DataWarehouseSavedQuery } from '~/types'
 import { AccessControlLevel, AccessControlResourceType } from '~/types'
+
+import { QueryInfo } from './output-pane-tabs/QueryInfo'
+import { sqlEditorLogic } from './sqlEditorLogic'
 
 // The SQL editor scene gates on warehouse-objects access; grant it on the storybook app context
 // before the story mounts and restore the original on unmount so story order can't leak.
@@ -80,6 +85,23 @@ const AVAILABLE_SOURCES = {
     },
 }
 
+// A managed warehouse's name is long enough to outgrow the database-tree sidebar, which is what made
+// the connection selector's label wrap and spill over the toolbar (support ticket 65030).
+// ManagedWarehouseConnection below is the visual-regression guard for that truncation.
+const MANAGED_WAREHOUSE_CONNECTION_ID = '01931b3a-0000-0000-0000-000000000001'
+const MANAGED_WAREHOUSE_CONNECTIONS = [
+    {
+        id: MANAGED_WAREHOUSE_CONNECTION_ID,
+        prefix: 'managed_warehouse',
+        engine: 'duckdb',
+        source_type: 'Postgres',
+        access_method: 'direct',
+        supports_hogql: true,
+        is_builtin_managed_warehouse: true,
+        description: null,
+    },
+]
+
 const meta: Meta = {
     component: App,
     title: 'Scenes-App/Data Warehouse/SQL Editor',
@@ -122,3 +144,179 @@ export default meta
 
 type Story = StoryObj<{}>
 export const TopToolsPerServer: Story = {}
+
+// Selecting the managed warehouse puts its long name in the sidebar's connection selector, where it
+// has to ellipsize on one line rather than wrap or overflow into the Run button's toolbar.
+export const ManagedWarehouseConnection: Story = {
+    parameters: {
+        msw: {
+            mocks: {
+                get: {
+                    '/api/projects/:team_id/external_data_sources/connections': () => [
+                        200,
+                        MANAGED_WAREHOUSE_CONNECTIONS,
+                    ],
+                    '/api/projects/:team_id/external_data_sources/direct_connection_options': () => [200, []],
+                },
+            },
+        },
+        // The `c` hash param preselects the connection, so the selector renders the long label
+        // instead of the default "PostHog (ClickHouse)".
+        pageUrl: urls.sqlEditor({ query: SAMPLE_SQL, connectionId: MANAGED_WAREHOUSE_CONNECTION_ID }),
+    },
+}
+
+const SETTINGS_VIEW = {
+    id: 'settings-view',
+    name: 'revenue_summary',
+    is_materialized: true,
+    user_access_level: AccessControlLevel.Editor,
+    sync_frequency: '1hour',
+    query: { kind: 'HogQLQuery', query: 'SELECT 1' },
+} as DataWarehouseSavedQuery
+
+export const MaterializationSettings: StoryObj = {
+    // This story renders the info pane on its own, so the editor the meta waits for never mounts.
+    parameters: {
+        testOptions: {
+            waitForSelector: '[data-attr="sql-editor-sidebar-query-info-pane"]',
+            viewport: { width: 1600, height: 900 },
+        },
+    },
+    render: () => (
+        <BindLogic logic={sqlEditorLogic} props={{ tabId: 'settings-preview' }}>
+            <QueryInfo tabId="settings-preview" view={SETTINGS_VIEW} tabbed />
+        </BindLogic>
+    ),
+    decorators: [
+        mswDecorator({
+            get: {
+                '/api/environments/:team_id/warehouse_saved_queries/:id/': [200, SETTINGS_VIEW],
+                '/api/projects/:team_id/data_modeling_jobs/': [200, { results: [], count: 0, next: null }],
+                '/api/environments/:team_id/data_modeling_nodes/lineage/': [
+                    200,
+                    {
+                        nodes: [
+                            {
+                                id: 'source',
+                                name: 'orders',
+                                type: 'table',
+                                dag: 'dag-1',
+                                upstream_count: 0,
+                                downstream_count: 1,
+                            },
+                            {
+                                id: 'summary',
+                                name: 'revenue_summary',
+                                type: 'matview',
+                                saved_query_id: 'settings-view',
+                                dag: 'dag-1',
+                                upstream_count: 1,
+                                downstream_count: 0,
+                            },
+                        ],
+                        edges: [
+                            { id: 'edge-1', source_id: 'source', target_id: 'summary', dag: 'dag-1', properties: {} },
+                        ],
+                    },
+                ],
+            },
+        }),
+    ],
+}
+
+export const LazySchema: Story = {
+    parameters: {
+        msw: {
+            mocks: {
+                get: {
+                    '/api/projects/:team_id/warehouse_expressions/': { results: [] },
+                    '/api/projects/:team_id/warehouse_saved_queries/': {
+                        results: [
+                            {
+                                id: 'saved-view',
+                                name: 'saved_events',
+                                status: 'Completed',
+                                columns: [],
+                                managed_viewset_kind: null,
+                            },
+                        ],
+                    },
+                    '/api/projects/:team_id/query_tab_state/user/': { tabs: [] },
+                },
+                post: {
+                    '/api/environments/:team_id/query/DatabaseSchemaQuery/': async ({
+                        request,
+                    }: {
+                        request: Request
+                    }) => {
+                        const { query } = (await request.json()) as {
+                            query: { kind: string; includeFields?: boolean; tables?: string[] }
+                        }
+                        const tables = {
+                            events: {
+                                id: 'events',
+                                name: 'events',
+                                type: 'posthog',
+                                fields: {
+                                    uuid: { name: 'uuid', hogql_value: 'uuid', type: 'string', schema_valid: true },
+                                    saved: {
+                                        name: 'saved',
+                                        hogql_value: 'saved',
+                                        type: 'view',
+                                        schema_valid: true,
+                                        table: 'saved_events',
+                                        fields: ['event', 'person'],
+                                    },
+                                    person: {
+                                        name: 'person',
+                                        hogql_value: 'person',
+                                        type: 'lazy_table',
+                                        schema_valid: true,
+                                        table: 'persons',
+                                    },
+                                },
+                            },
+                            saved_events: {
+                                id: 'saved-view',
+                                name: 'saved_events',
+                                type: 'view',
+                                fields: {
+                                    event: { name: 'event', hogql_value: 'event', type: 'string', schema_valid: true },
+                                    person: {
+                                        name: 'person',
+                                        hogql_value: 'person',
+                                        type: 'lazy_table',
+                                        schema_valid: true,
+                                        table: 'persons',
+                                    },
+                                },
+                            },
+                            persons: {
+                                id: 'persons',
+                                name: 'persons',
+                                type: 'posthog',
+                                fields: {
+                                    id: { name: 'id', hogql_value: 'id', type: 'string', schema_valid: true },
+                                },
+                            },
+                        }
+                        return [
+                            200,
+                            {
+                                tables: Object.fromEntries(
+                                    Object.entries(tables)
+                                        .filter(([name]) => !query.tables || query.tables.includes(name))
+                                        .map(([name, table]) => [
+                                            name,
+                                            { ...table, fields: query.includeFields === false ? {} : table.fields },
+                                        ])
+                                ),
+                            },
+                        ]
+                    },
+                },
+            },
+        },
+    },
+}

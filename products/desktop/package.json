@@ -8,7 +8,7 @@
     "scripts": {
         "build": "node build.mjs",
         "typecheck": "tsc --noEmit",
-        "test": "node --test \"src/**/*.test.ts\"",
+        "test": "node --test \"src/**/*.test.ts\" \"scripts/*.test.ts\"",
         "start": "node scripts/prepare-electron.mjs && node build.mjs && electron .",
         "start:no-build": "electron .",
         "package": "node build.mjs && node scripts/check-frontend-dist.mjs && electron-builder --publish never"

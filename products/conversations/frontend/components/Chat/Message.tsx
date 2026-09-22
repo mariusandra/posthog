@@ -3,20 +3,25 @@ import { useRef, useState } from 'react'
 
 import {
     IconCopy,
-    IconLock,
+    IconPencil,
     IconThumbsDown,
     IconThumbsDownFilled,
     IconThumbsUp,
     IconThumbsUpFilled,
+    IconTrash,
     IconWarning,
 } from '@posthog/icons'
-import { LemonButton, LemonInput, ProfilePicture, Tooltip } from '@posthog/lemon-ui'
+import { LemonButton, LemonInput, LemonTag, Link, ProfilePicture, Tooltip } from '@posthog/lemon-ui'
 
 import { TZLabel } from 'lib/components/TZLabel'
 import { copyToClipboard } from 'lib/utils/copyToClipboard'
+import { urls } from 'scenes/urls'
 
-import type { AiReplyFeedbackRating, ChatMessage, MessageDeliveryStatus } from '../../types'
+import type { AITriageSource, AiReplyFeedbackRating, ChatMessage, MessageDeliveryStatus } from '../../types'
 import { SupportMarkdown, SupportRichContentPreview } from '../Editor'
+import { richContentToHtml } from '../Editor/richContentToHtml'
+import { aiDraftAction } from './aiDraftAction'
+import { TeamOnlyBadge } from './TeamOnlyBadge'
 
 export interface MessageProps {
     message: ChatMessage
@@ -24,7 +29,35 @@ export interface MessageProps {
     deliveryStatus?: MessageDeliveryStatus
     showAiReplyFeedback?: boolean
     aiReplyFeedbackRating?: AiReplyFeedbackRating | null
+    aiReplyFeedbackDisabledReason?: string
     onSubmitAiReplyFeedback?: (rating: AiReplyFeedbackRating, feedbackText?: string) => void
+    onEdit?: () => void
+    onDelete?: () => void
+    fullEmailLoading?: boolean
+    onViewFullEmail?: () => void
+    aiSources?: AITriageSource[]
+    aiDraftApplying?: boolean
+    onApplyAiDraft?: () => void
+}
+
+function citationDisplay(ref: string, sources: AITriageSource[]): { title: string; to?: string; external?: boolean } {
+    const source = sources.find((item) => item.ref === ref)
+    if (source?.source_id) {
+        return { title: source.title || ref, to: urls.businessKnowledgeSource(source.source_id) }
+    }
+    if (source?.url) {
+        return { title: source.title || ref, to: source.url, external: true }
+    }
+    if (ref.startsWith('https://') || ref.startsWith('http://')) {
+        try {
+            const parsed = new URL(ref)
+            return { title: `${parsed.host}${parsed.pathname}`.replace(/\/$/, '') || ref, to: ref, external: true }
+        } catch {
+            return { title: ref }
+        }
+    }
+    // A non-URL ref that no source resolved is a knowledge chunk id; the raw UUID is noise.
+    return { title: source?.title || 'Knowledge source' }
 }
 
 export function Message({
@@ -33,10 +66,21 @@ export function Message({
     deliveryStatus,
     showAiReplyFeedback = false,
     aiReplyFeedbackRating = null,
+    aiReplyFeedbackDisabledReason,
     onSubmitAiReplyFeedback,
+    onEdit,
+    onDelete,
+    fullEmailLoading = false,
+    onViewFullEmail,
+    aiSources = [],
+    aiDraftApplying = false,
+    onApplyAiDraft,
 }: MessageProps): JSX.Element {
-    const profileType = message.authorType === 'AI' ? 'bot' : 'person'
+    const isAgent = message.authorType === 'AI'
+    const profileType = isAgent ? 'bot' : 'person'
     const isPrivate = message.isPrivate
+    const draftAction = aiDraftAction(message)
+    const citations = (message.citations ?? []).filter((item) => item.trim())
     const [feedbackText, setFeedbackText] = useState('')
     const [feedbackTextSubmitted, setFeedbackTextSubmitted] = useState(false)
     const wasRatedOnMount = useRef(!!aiReplyFeedbackRating)
@@ -48,14 +92,20 @@ export function Message({
         !!onSubmitAiReplyFeedback
 
     function submitRating(rating: AiReplyFeedbackRating): void {
-        if (aiReplyFeedbackRating || !onSubmitAiReplyFeedback) {
+        if (aiReplyFeedbackDisabledReason || aiReplyFeedbackRating || !onSubmitAiReplyFeedback) {
             return
         }
         onSubmitAiReplyFeedback(rating)
     }
 
+    function copyMessage(): void {
+        // Generated on demand rather than per render, since only a copy needs it.
+        const html = richContentToHtml(message.richContent as JSONContent | null)
+        void copyToClipboard(message.content, 'Message', { html: html ?? undefined })
+    }
+
     function submitBadFeedbackText(): void {
-        if (!feedbackText.trim() || !onSubmitAiReplyFeedback) {
+        if (aiReplyFeedbackDisabledReason || !feedbackText.trim() || !onSubmitAiReplyFeedback) {
             return
         }
         onSubmitAiReplyFeedback('bad', feedbackText.trim())
@@ -64,61 +114,162 @@ export function Message({
 
     return (
         <div className={`flex ${isCustomer ? 'mr-10' : 'flex-row-reverse ml-10'} mb-4`}>
-            <div className="flex gap-2">
+            <div className="flex gap-2 min-w-0">
                 <div className="flex flex-col min-w-0 items-start">
-                    <div className="flex items-center justify-between w-full gap-2 mb-1">
+                    {/* The agent's byline takes the AI colour too, so the name, the badge and the
+                        bubble all say the same thing. `ProfilePicture` puts `className` on the avatar,
+                        where the robot glyph picks the colour up, and renders the name as a sibling —
+                        so the name is coloured from this row rather than through the component. */}
+                    <div
+                        className={`flex items-center justify-between w-full gap-2 mb-1 min-w-0 ${
+                            isAgent ? '[&_.profile-name]:text-ai' : ''
+                        }`}
+                    >
                         <ProfilePicture
                             size="sm"
                             user={message.createdBy}
                             name={message.authorName}
                             type={profileType}
                             showName={true}
+                            className={isAgent ? 'text-ai' : undefined}
                         />
-                        <div className="flex items-center gap-1.5">
-                            {isPrivate && (
-                                <Tooltip title="Only visible to your team">
-                                    <span className="inline-flex items-center gap-0.5 text-xs text-warning-dark bg-warning-highlight px-1.5 py-0.5 rounded">
-                                        <IconLock className="text-xs" />
-                                        Private note
-                                    </span>
-                                </Tooltip>
+                        <div className="flex items-center gap-1.5 flex-wrap justify-end min-w-0">
+                            {isPrivate && <TeamOnlyBadge label="Private note" tone={isAgent ? 'agent' : 'teammate'} />}
+                            {isAgent && message.confidence != null && (
+                                <LemonTag size="small">{(message.confidence * 100).toFixed(0)}% confidence</LemonTag>
                             )}
                             <span className="text-xs text-muted-alt">
                                 <TZLabel time={message.createdAt} />
+                                {(message.version ?? 0) > 0 ? ' (edited)' : null}
                             </span>
                         </div>
                     </div>
                     <div className="max-w-full min-w-80">
+                        {/* A note the customer can't see is set apart by hue, and which hue says who
+                            wrote it: the assistant's notes take the AI colour the rest of the app
+                            uses for our own agents, a teammate's keep the warning amber. Scanning a
+                            long thread, "a colleague left me this" and "software left me this" are
+                            different enough to be worth telling apart before either is read. The
+                            byline and the lock badge above follow the same colour, so one note is
+                            one signal rather than three competing ones. */}
                         <div
                             className={`border py-2 px-3 rounded-lg ${
                                 isPrivate
-                                    ? 'bg-warning-highlight border-warning'
+                                    ? isAgent
+                                        ? // The fills are the app's existing AI pair; the border is
+                                          // held back to 60% because `border-ai` at full strength
+                                          // outshouts the amber it sits next to, and the assistant
+                                          // leaves one of these on nearly every ticket.
+                                          'bg-ai/08 dark:bg-ai/20 border-ai/60'
+                                        : 'bg-warning-highlight border-warning'
                                     : isCustomer
                                       ? 'bg-surface-secondary'
                                       : 'bg-surface-primary'
                             } [&_img]:max-h-64 [&_.SupportEditor__image]:max-h-64`}
                         >
                             {isPrivate && (
-                                <div className="flex items-center justify-end">
+                                <div className="flex items-center justify-end gap-2">
+                                    {onEdit && (
+                                        <Tooltip title="Edit note">
+                                            <LemonButton
+                                                size="xsmall"
+                                                icon={<IconPencil />}
+                                                noPadding
+                                                onClick={onEdit}
+                                            />
+                                        </Tooltip>
+                                    )}
+                                    {onDelete && (
+                                        <Tooltip title="Delete note">
+                                            <LemonButton
+                                                size="xsmall"
+                                                icon={<IconTrash />}
+                                                noPadding
+                                                status="danger"
+                                                onClick={onDelete}
+                                            />
+                                        </Tooltip>
+                                    )}
                                     <Tooltip title="Copy message">
                                         <LemonButton
                                             size="xsmall"
                                             icon={<IconCopy />}
                                             noPadding
-                                            onClick={() => void copyToClipboard(message.content, 'Message')}
+                                            onClick={copyMessage}
                                         />
                                     </Tooltip>
                                 </div>
                             )}
+                            {/* Every message here is untrusted: customers write them, imports carry them,
+                                and agents generate them from customer text. An inline remote image would
+                                fetch on open, leaking the reader's IP or probing hosts their browser can
+                                reach. PostHog-hosted images (attachments included) still render inline;
+                                anything else becomes a click-to-open link. */}
                             {message.richContent ? (
                                 <SupportRichContentPreview
                                     content={message.richContent as JSONContent}
                                     className="text-sm"
+                                    fallbackContent={message.content}
+                                    fallbackDisableImages={message.fromZendesk}
                                 />
                             ) : (
-                                <SupportMarkdown className="text-sm" disableImages={message.fromZendesk}>
+                                <SupportMarkdown className="text-sm" disableImages>
                                     {message.content}
                                 </SupportMarkdown>
+                            )}
+                            {message.hasFullEmailContent && onViewFullEmail && (
+                                <div className="mt-2">
+                                    <LemonButton
+                                        type="tertiary"
+                                        size="xsmall"
+                                        onClick={onViewFullEmail}
+                                        loading={fullEmailLoading}
+                                        data-attr="support-ticket-view-full-email"
+                                    >
+                                        View full email
+                                    </LemonButton>
+                                </div>
+                            )}
+                            {draftAction && onApplyAiDraft && (
+                                <div className="mt-2">
+                                    <LemonButton
+                                        type="secondary"
+                                        size="xsmall"
+                                        loading={aiDraftApplying}
+                                        disabledReason={aiDraftApplying ? 'Inserting draft' : undefined}
+                                        onClick={onApplyAiDraft}
+                                        // pinned: autocapture / Playwright key. Do not rename.
+                                        data-attr={
+                                            draftAction === 'question'
+                                                ? 'ai-draft-use-question'
+                                                : 'ai-draft-use-as-reply'
+                                        }
+                                    >
+                                        {draftAction === 'question' ? 'Use question' : 'Use as reply'}
+                                    </LemonButton>
+                                </div>
+                            )}
+                            {citations.length > 0 && (
+                                <ol className="mt-2 mb-0 pl-4 text-xs text-muted-alt space-y-0.5">
+                                    {citations.map((ref, index) => {
+                                        const display = citationDisplay(ref, aiSources)
+                                        return (
+                                            <li key={`${ref}-${index}`}>
+                                                {display.to ? (
+                                                    <Link
+                                                        to={display.to}
+                                                        target={display.external ? '_blank' : undefined}
+                                                        className="break-all"
+                                                    >
+                                                        {display.title}
+                                                    </Link>
+                                                ) : (
+                                                    <span className="break-all">{display.title}</span>
+                                                )}
+                                            </li>
+                                        )
+                                    })}
+                                </ol>
                             )}
                         </div>
                         {showAiReplyFeedback && (
@@ -137,7 +288,8 @@ export function Message({
                                             size="xsmall"
                                             tooltip="Good reply"
                                             disabledReason={
-                                                aiReplyFeedbackRating ? 'Feedback already recorded' : undefined
+                                                aiReplyFeedbackDisabledReason ??
+                                                (aiReplyFeedbackRating ? 'Feedback already recorded' : undefined)
                                             }
                                             onClick={() => submitRating('good')}
                                             data-attr="ai-reply-feedback-good"
@@ -156,7 +308,8 @@ export function Message({
                                             size="xsmall"
                                             tooltip="Bad reply"
                                             disabledReason={
-                                                aiReplyFeedbackRating ? 'Feedback already recorded' : undefined
+                                                aiReplyFeedbackDisabledReason ??
+                                                (aiReplyFeedbackRating ? 'Feedback already recorded' : undefined)
                                             }
                                             onClick={() => submitRating('bad')}
                                             data-attr="ai-reply-feedback-bad"
@@ -172,6 +325,7 @@ export function Message({
                                             value={feedbackText}
                                             onChange={setFeedbackText}
                                             onPressEnter={submitBadFeedbackText}
+                                            disabledReason={aiReplyFeedbackDisabledReason}
                                             autoFocus
                                         />
                                         <LemonButton
@@ -179,7 +333,8 @@ export function Message({
                                             size="small"
                                             onClick={submitBadFeedbackText}
                                             disabledReason={
-                                                !feedbackText.trim() ? 'Please type a few words' : undefined
+                                                aiReplyFeedbackDisabledReason ??
+                                                (!feedbackText.trim() ? 'Please type a few words' : undefined)
                                             }
                                         >
                                             Submit

@@ -1,8 +1,8 @@
 from typing import Any
 
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.cohere.settings import (
     COHERE_ENDPOINTS,
+    RETIRED_ENDPOINTS,
     CohereEndpointConfig,
     CoherePagination,
 )
@@ -18,9 +18,16 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.res
     SinglePagePaginator,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.source_helpers import validate_via_probe
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceResponse
+
+# Cohere versions its API in the URL path. Every list endpoint this source reads is served at
+# /v1/; Cohere's v2 generation covers the inference surface only (/v2/chat, /v2/embed, /v2/rerank),
+# which this source does not touch. The source-level version label is bound to this constant so a
+# declared version can never drift from the path the requests actually use.
+COHERE_API_VERSION_V1 = "v1"
 
 # Cohere serves a single global API host; there are no regional variants.
-COHERE_BASE_URL = "https://api.cohere.com/v1"
+COHERE_BASE_URL = f"https://api.cohere.com/{COHERE_API_VERSION_V1}"
 
 
 def _headers() -> dict[str, str]:
@@ -53,6 +60,10 @@ def cohere_source(
     team_id: int,
     job_id: str,
 ) -> SourceResponse:
+    retired_reason = RETIRED_ENDPOINTS.get(endpoint)
+    if retired_reason is not None:
+        raise ValueError(retired_reason)
+
     config = COHERE_ENDPOINTS[endpoint]
     partitioned = config.partition_key is not None
 
@@ -75,10 +86,13 @@ def cohere_source(
                     "path": config.path,
                     "params": params,
                     "data_selector": config.data_key,
-                    # A successful response that omits the envelope key is a shape mismatch, not empty
-                    # data. Every Cohere schema is full-refresh-only, so silently treating a missing
-                    # key as an empty page would clear the existing warehouse table; fail loud instead.
+                    # A response that carries other keys but omits the envelope key is a shape mismatch,
+                    # not empty data. Every Cohere schema is full-refresh-only, so silently treating that
+                    # as an empty page would clear the existing warehouse table; fail loud instead.
                     "data_selector_required": True,
+                    # Cohere returns a bare ``{}`` for an empty collection (e.g. an account with no
+                    # datasets) rather than ``{"datasets": []}``, so an empty body is a valid 0-row page.
+                    "data_selector_empty_ok": True,
                 },
             }
         ],

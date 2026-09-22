@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.clockify.clockify import (
     ClockifyResumeConfig,
@@ -32,6 +26,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.clockify import (
     ClockifySourceConfig,
 )
@@ -49,7 +44,7 @@ class ClockifySource(ResumableSource[ClockifySourceConfig, ClockifyResumeConfig]
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.CLOCKIFY,
+            name=ExternalDataSourceType.CLOCKIFY,
             category=DataWarehouseSourceCategory.PRODUCTIVITY,
             label="Clockify",
             releaseStatus=ReleaseStatus.ALPHA,
@@ -114,7 +109,10 @@ The key is user-scoped — it can read exactly what your Clockify user can. Use 
         if validate_clockify_credentials(config.api_key):
             return True, None
 
-        return False, "Invalid Clockify API key"
+        return (
+            False,
+            "Your Clockify API key is invalid or has been revoked. Generate a new key in your Clockify profile settings, then reconnect.",
+        )
 
     def get_resumable_source_manager(self, inputs: SourceInputs) -> ResumableSourceManager[ClockifyResumeConfig]:
         return ResumableSourceManager[ClockifyResumeConfig](inputs, ClockifyResumeConfig)

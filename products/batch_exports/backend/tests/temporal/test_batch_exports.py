@@ -9,7 +9,13 @@ from django.test import override_settings
 
 from posthog.temporal.tests.utils.events import generate_test_events_in_clickhouse
 
-from products.batch_exports.backend.temporal.batch_exports import generate_query_ranges, get_data_interval, iter_records
+from products.batch_exports.backend.service import BackfillDetails
+from products.batch_exports.backend.temporal.batch_exports import (
+    DataInterval,
+    get_data_interval,
+    iter_records,
+    reads_native_events_source,
+)
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.django_db]
 
@@ -45,11 +51,13 @@ def assert_records_match_events(records, events):
                 assert value == expected[key]
 
 
-async def test_iter_records(clickhouse_client):
+@pytest.mark.parametrize("use_native_schema", [False, True])
+@pytest.mark.parametrize("interval_minutes", [5, 60])
+async def test_iter_records(clickhouse_client, use_native_schema, interval_minutes):
     """Test the rows returned by iter_records."""
     team_id = randint(1, 1000000)
     data_interval_end = dt.datetime.now(tz=dt.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    data_interval_start = data_interval_end - dt.timedelta(hours=1)
+    data_interval_start = data_interval_end - dt.timedelta(minutes=interval_minutes)
 
     (events, _, _) = await generate_test_events_in_clickhouse(
         client=clickhouse_client,
@@ -70,6 +78,7 @@ async def test_iter_records(clickhouse_client):
             team_id,
             data_interval_start.isoformat(),
             data_interval_end.isoformat(),
+            use_new_events_schema=use_native_schema,
         )
         for record in record_batch.to_pylist()
     ]
@@ -102,6 +111,7 @@ async def test_iter_records_handles_duplicates(clickhouse_client):
             team_id,
             data_interval_start.isoformat(),
             data_interval_end.isoformat(),
+            use_new_events_schema=False,
         )
         for record in record_batch.to_pylist()
     ]
@@ -137,6 +147,7 @@ async def test_iter_records_can_exclude_events(clickhouse_client):
             data_interval_start.isoformat(),
             data_interval_end.isoformat(),
             exclude_events=exclude_events,
+            use_new_events_schema=False,
         )
         for record in record_batch.to_pylist()
     ]
@@ -172,6 +183,7 @@ async def test_iter_records_can_include_events(clickhouse_client):
             data_interval_start.isoformat(),
             data_interval_end.isoformat(),
             include_events=include_events,
+            use_new_events_schema=False,
         )
         for record in record_batch.to_pylist()
     ]
@@ -211,6 +223,7 @@ async def test_iter_records_ignores_timestamp_predicates(clickhouse_client):
             team_id,
             inserted_at.isoformat(),
             data_interval_end.isoformat(),
+            use_new_events_schema=False,
         )
         for record in record_batch.to_pylist()
     ]
@@ -225,6 +238,7 @@ async def test_iter_records_ignores_timestamp_predicates(clickhouse_client):
                 team_id,
                 inserted_at.isoformat(),
                 data_interval_end.isoformat(),
+                use_new_events_schema=False,
             )
             for record in record_batch.to_pylist()
         ]
@@ -263,6 +277,7 @@ async def test_iter_records_can_flatten_properties(clickhouse_client):
                 {"expression": "JSONExtractString(properties, '$os')", "alias": "os"},
                 {"expression": "JSONExtractInt(properties, 'custom-property')", "alias": "custom_prop"},
             ],
+            use_new_events_schema=False,
         )
         for record in record_batch.to_pylist()
     ]
@@ -308,6 +323,7 @@ async def test_iter_records_uses_extra_query_parameters(clickhouse_client):
                 {"expression": "JSONExtractInt(properties, %(hogql_val_0)s)", "alias": "custom_prop"},
             ],
             extra_query_parameters={"hogql_val_0": "custom"},
+            use_new_events_schema=False,
         )
         for record in record_batch.to_pylist()
     ]
@@ -325,23 +341,23 @@ async def test_iter_records_uses_extra_query_parameters(clickhouse_client):
         (
             "hour",
             "2023-08-01T00:00:00+00:00",
-            (
-                dt.datetime(2023, 7, 31, 23, 0, 0, tzinfo=dt.UTC),
-                dt.datetime(2023, 8, 1, 0, 0, 0, tzinfo=dt.UTC),
+            DataInterval(
+                start=dt.datetime(2023, 7, 31, 23, 0, 0, tzinfo=dt.UTC),
+                end=dt.datetime(2023, 8, 1, 0, 0, 0, tzinfo=dt.UTC),
             ),
         ),
         (
             "day",
             "2023-08-01T00:00:00+00:00",
-            (
-                dt.datetime(2023, 7, 31, 0, 0, 0, tzinfo=dt.UTC),
-                dt.datetime(2023, 8, 1, 0, 0, 0, tzinfo=dt.UTC),
+            DataInterval(
+                start=dt.datetime(2023, 7, 31, 0, 0, 0, tzinfo=dt.UTC),
+                end=dt.datetime(2023, 8, 1, 0, 0, 0, tzinfo=dt.UTC),
             ),
         ),
     ],
 )
 def test_get_data_interval(interval, data_interval_end, expected):
-    """Test get_data_interval returns the expected data interval tuple."""
+    """Test get_data_interval returns the expected data interval."""
     result = get_data_interval(interval, data_interval_end)
     assert result == expected
 
@@ -371,125 +387,52 @@ def test_get_data_interval_dst_transition(interval, data_interval_end, expected_
     or 25h apart (fall back). get_data_interval must produce a matching window
     so intervals don't overlap or have gaps.
     """
-    start, end = get_data_interval(interval, data_interval_end, timezone="US/Eastern")
-    actual_duration_hours = (end - start).total_seconds() / 3600
+    data_interval = get_data_interval(interval, data_interval_end, timezone="US/Eastern")
+    actual_duration_hours = (data_interval.end - data_interval.start).total_seconds() / 3600
 
     assert actual_duration_hours == expected_duration_hours, (
         f"Expected {expected_duration_hours}h interval for DST transition day, got {actual_duration_hours}h"
     )
 
 
+@pytest.mark.parametrize("delta", [dt.timedelta(0), dt.timedelta(hours=1)])
+def test_data_interval_accepts_ordered_bounds(delta: dt.timedelta) -> None:
+    end = dt.datetime(2023, 8, 1, tzinfo=dt.UTC)
+    interval = DataInterval(start=end - delta, end=end)
+    assert interval.end - interval.start == delta
+
+
+def test_data_interval_rejects_reversed_bounds() -> None:
+    end = dt.datetime(2023, 8, 1, tzinfo=dt.UTC)
+    with pytest.raises(ValueError, match="start"):
+        DataInterval(start=end + dt.timedelta(seconds=1), end=end)
+
+
 @pytest.mark.parametrize(
-    "remaining_range,done_ranges,expected",
+    "start_ago,end_ago,is_backfill,backfill_ago,expected",
     [
-        # Case 1: One done range at the beginning
-        (
-            (dt.datetime(2023, 7, 31, 12, 0, 0, tzinfo=dt.UTC), dt.datetime(2023, 7, 31, 13, 0, 0, tzinfo=dt.UTC)),
-            [(dt.datetime(2023, 7, 31, 12, 0, 0, tzinfo=dt.UTC), dt.datetime(2023, 7, 31, 12, 30, 0, tzinfo=dt.UTC))],
-            [
-                (
-                    dt.datetime(2023, 7, 31, 12, 30, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 13, 0, 0, tzinfo=dt.UTC),
-                )
-            ],
-        ),
-        # Case 2: Single done range equal to full range.
-        (
-            (dt.datetime(2023, 7, 31, 12, 0, 0, tzinfo=dt.UTC), dt.datetime(2023, 7, 31, 13, 0, 0, tzinfo=dt.UTC)),
-            [(dt.datetime(2023, 7, 31, 12, 0, 0, tzinfo=dt.UTC), dt.datetime(2023, 7, 31, 13, 0, 0, tzinfo=dt.UTC))],
-            [],
-        ),
-        # Case 3: Disconnected done ranges cover full range.
-        (
-            (dt.datetime(2023, 7, 31, 12, 0, 0, tzinfo=dt.UTC), dt.datetime(2023, 7, 31, 13, 0, 0, tzinfo=dt.UTC)),
-            [
-                (dt.datetime(2023, 7, 31, 12, 0, 0, tzinfo=dt.UTC), dt.datetime(2023, 7, 31, 12, 30, 0, tzinfo=dt.UTC)),
-                (
-                    dt.datetime(2023, 7, 31, 12, 30, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 12, 45, 0, tzinfo=dt.UTC),
-                ),
-                (
-                    dt.datetime(2023, 7, 31, 12, 45, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 13, 0, 0, tzinfo=dt.UTC),
-                ),
-            ],
-            [],
-        ),
-        # Case 4: Disconnect done ranges within full range.
-        (
-            (dt.datetime(2023, 7, 31, 12, 0, 0, tzinfo=dt.UTC), dt.datetime(2023, 7, 31, 13, 0, 0, tzinfo=dt.UTC)),
-            [
-                (
-                    dt.datetime(2023, 7, 31, 12, 30, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 12, 45, 0, tzinfo=dt.UTC),
-                ),
-                (
-                    dt.datetime(2023, 7, 31, 12, 50, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 12, 55, 0, tzinfo=dt.UTC),
-                ),
-            ],
-            [
-                (
-                    dt.datetime(2023, 7, 31, 12, 0, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 12, 30, 0, tzinfo=dt.UTC),
-                ),
-                (
-                    dt.datetime(2023, 7, 31, 12, 45, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 12, 50, 0, tzinfo=dt.UTC),
-                ),
-                (
-                    dt.datetime(2023, 7, 31, 12, 55, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 13, 0, 0, tzinfo=dt.UTC),
-                ),
-            ],
-        ),
-        # Case 5: Empty done ranges.
-        (
-            (dt.datetime(2023, 7, 31, 12, 0, 0, tzinfo=dt.UTC), dt.datetime(2023, 7, 31, 13, 0, 0, tzinfo=dt.UTC)),
-            [],
-            [
-                (
-                    dt.datetime(2023, 7, 31, 12, 0, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 13, 0, 0, tzinfo=dt.UTC),
-                ),
-            ],
-        ),
-        # Case 6: Disconnect done ranges within full range and one last done range connected to the end.
-        (
-            (dt.datetime(2023, 7, 31, 12, 0, 0, tzinfo=dt.UTC), dt.datetime(2023, 7, 31, 13, 0, 0, tzinfo=dt.UTC)),
-            [
-                (
-                    dt.datetime(2023, 7, 31, 12, 15, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 12, 25, 0, tzinfo=dt.UTC),
-                ),
-                (
-                    dt.datetime(2023, 7, 31, 12, 30, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 12, 45, 0, tzinfo=dt.UTC),
-                ),
-                (
-                    dt.datetime(2023, 7, 31, 12, 50, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 13, 0, 0, tzinfo=dt.UTC),
-                ),
-            ],
-            [
-                (
-                    dt.datetime(2023, 7, 31, 12, 0, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 12, 15, 0, tzinfo=dt.UTC),
-                ),
-                (
-                    dt.datetime(2023, 7, 31, 12, 25, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 12, 30, 0, tzinfo=dt.UTC),
-                ),
-                (
-                    dt.datetime(2023, 7, 31, 12, 45, 0, tzinfo=dt.UTC),
-                    dt.datetime(2023, 7, 31, 12, 50, 0, tzinfo=dt.UTC),
-                ),
-            ],
-        ),
+        (dt.timedelta(hours=2), dt.timedelta(hours=1), False, None, False),
+        (dt.timedelta(days=61), dt.timedelta(days=60), False, None, False),
+        (dt.timedelta(days=61), dt.timedelta(days=60), True, dt.timedelta(days=61), True),
+        (dt.timedelta(hours=2), dt.timedelta(hours=1), True, dt.timedelta(hours=2), False),
     ],
-    ids=["1", "2", "3", "4", "5", "6"],
+    ids=["scheduled-recent", "scheduled-old", "backfill-old", "backfill-recent"],
 )
-def test_generate_query_ranges(remaining_range, done_ranges, expected):
-    """Test get_data_interval returns the expected data interval tuple."""
-    result = list(generate_query_ranges(remaining_range, done_ranges))
-    assert result == expected
+def test_reads_native_events_source_tracks_query_routing(start_ago, end_ago, is_backfill, backfill_ago, expected):
+    now = dt.datetime.now(tz=dt.UTC)
+    start, end = now - start_ago, now - end_ago
+    backfill_details = (
+        BackfillDetails(backfill_id=None, start_at=(now - backfill_ago).isoformat(), end_at=end.isoformat())
+        if backfill_ago is not None
+        else None
+    )
+    arguments = {
+        "team_id": 1,
+        "interval_start": start.isoformat(),
+        "interval_end": end.isoformat(),
+        "is_backfill": is_backfill,
+        "backfill_details": backfill_details,
+    }
+
+    assert reads_native_events_source(use_new_events_schema=True, **arguments) is expected
+    assert reads_native_events_source(use_new_events_schema=False, **arguments) is False

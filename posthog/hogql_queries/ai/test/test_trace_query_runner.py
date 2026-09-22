@@ -1,10 +1,10 @@
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, TypedDict
 from uuid import UUID
 
 import pytest
-from freezegun import freeze_time
+import time_machine
 from posthog.test.base import BaseTest, ClickhouseTestMixin, _create_event, _create_person, snapshot_clickhouse_queries
 from unittest.mock import patch
 
@@ -20,6 +20,7 @@ from posthog.schema import (
 
 from posthog.hogql_queries.ai.trace_query_runner import TraceQueryRunner
 from posthog.models import PropertyDefinition, Team
+from posthog.models.ai_events.test_util import bulk_create_ai_events
 
 from products.event_definitions.backend.models.property_definition import PropertyType
 
@@ -444,7 +445,7 @@ class TestTraceQueryRunner(ClickhouseTestMixin, BaseTest):
             response.results[0].events[0].properties.items(),
         )
 
-    @freeze_time("2025-01-01T00:00:00Z")
+    @time_machine.travel("2025-01-01T00:00:00Z", tick=False)
     def test_person_properties(self):
         """Test that person data is not loaded server-side (frontend handles it via lazy loader)."""
         _create_person(distinct_ids=["person1"], team=self.team, properties={"email": "test@posthog.com"})
@@ -461,7 +462,7 @@ class TestTraceQueryRunner(ClickhouseTestMixin, BaseTest):
         self.assertEqual(response.results[0].distinctId, "person1")
         self.assertIsNone(response.results[0].person)
 
-    @freeze_time("2025-01-01T00:00:00Z")
+    @time_machine.travel("2025-01-01T00:00:00Z", tick=False)
     def test_distinct_id_prefers_trace_event(self):
         """When a $ai_trace event exists, its distinct_id should be used even if
         other events in the trace have an earlier timestamp with a different distinct_id."""
@@ -491,7 +492,7 @@ class TestTraceQueryRunner(ClickhouseTestMixin, BaseTest):
         self.assertEqual(len(response.results), 1)
         self.assertEqual(response.results[0].distinctId, "real-user-id")
 
-    @freeze_time("2025-01-01T00:00:00Z")
+    @time_machine.travel("2025-01-01T00:00:00Z", tick=False)
     def test_distinct_id_falls_back_without_trace_event(self):
         """When no $ai_trace event exists, the distinct_id from the earliest event should be used."""
         _create_person(distinct_ids=["person1"], team=self.team)
@@ -510,7 +511,7 @@ class TestTraceQueryRunner(ClickhouseTestMixin, BaseTest):
         self.assertEqual(len(response.results), 1)
         self.assertEqual(response.results[0].distinctId, "person1")
 
-    @freeze_time("2025-01-16T00:00:00Z")
+    @time_machine.travel("2025-01-16T00:00:00Z", tick=False)
     def test_date_range(self):
         """Test that date range filtering works correctly."""
         _create_person(distinct_ids=["person1"], team=self.team)
@@ -574,6 +575,33 @@ class TestTraceQueryRunner(ClickhouseTestMixin, BaseTest):
         ).calculate()
         self.assertEqual(len(response.results), 1)
         self.assertEqual(len(response.results[0].events), 2)
+
+    def test_capture_range_includes_long_running_trace(self):
+        _create_person(distinct_ids=["person1"], team=self.team)
+        # Trace anchored at date_from with spans spread over days; every span must land in the
+        # tree even though the later ones fall well past the backward capture buffer (#43310).
+        # The multi-day offset covers a chat resumed after the first day, which a sub-day forward
+        # bound truncates.
+        forward_offsets_minutes = [0, 45, 180, 720, 3 * 24 * 60]
+        for offset in forward_offsets_minutes:
+            _create_ai_generation_event(
+                distinct_id="person1",
+                trace_id="trace1",
+                team=self.team,
+                timestamp=datetime(2024, 12, 1, 0, 0) + timedelta(minutes=offset),
+            )
+
+        # The frontend anchors date_from/date_to on the trace's first event timestamp.
+        response = TraceQueryRunner(
+            team=self.team,
+            query=TraceQuery(
+                traceId="trace1",
+                dateRange=DateRange(date_from="2024-12-01T00:00:00Z", date_to="2024-12-01T00:00:00Z"),
+            ),
+        ).calculate()
+
+        self.assertEqual(len(response.results), 1)
+        self.assertEqual(len(response.results[0].events), len(forward_offsets_minutes))
 
     def test_overlap_semantics_trace_started_before_window(self):
         _create_person(distinct_ids=["person1"], team=self.team)
@@ -873,6 +901,198 @@ class TestTraceQueryRunner(ClickhouseTestMixin, BaseTest):
         ).calculate()
         self.assertEqual(len(response.results), 1)
         self.assertEqual(len(response.results[0].events), 1)
+
+    def test_deduplicates_ai_events_rows_for_the_same_generation(self):
+        trace_id = str(uuid.uuid4())
+        generation_uuid = str(uuid.uuid4())
+        timestamp = datetime(2024, 12, 1, 0, 0, tzinfo=UTC)
+        generation_properties = {
+            "$ai_trace_id": trace_id,
+            "$ai_parent_id": trace_id,
+            "$ai_latency": 3.9,
+            "$ai_input_tokens": 582,
+            "$ai_output_tokens": 353,
+            "$ai_input_cost_usd": 0.4,
+            "$ai_output_cost_usd": 0.6,
+            "$ai_total_cost_usd": 1.0,
+            "$ai_input": [{"role": "user", "content": "Foo"}],
+        }
+
+        # At-least-once delivery lands one logical generation twice. The events table absorbs
+        # this (uuid is in its sorting key), but ai_events is a plain MergeTree that never
+        # dedupes, so scalar totals must be deduplicated before aggregation.
+        bulk_create_ai_events(
+            [
+                {
+                    "event": "$ai_trace",
+                    "team": self.team,
+                    "distinct_id": "person1",
+                    "timestamp": timestamp,
+                    "properties": {"$ai_trace_id": trace_id, "$ai_trace_name": "runnable"},
+                },
+                {
+                    "event": "$ai_generation",
+                    "team": self.team,
+                    "distinct_id": "person1",
+                    "timestamp": timestamp,
+                    "event_uuid": generation_uuid,
+                    "properties": generation_properties,
+                },
+                {
+                    "event": "$ai_generation",
+                    "team": self.team,
+                    "distinct_id": "person1",
+                    "timestamp": timestamp,
+                    "event_uuid": generation_uuid,
+                    "properties": generation_properties,
+                },
+            ]
+        )
+
+        response = TraceQueryRunner(
+            team=self.team,
+            query=TraceQuery(
+                traceId=trace_id,
+                dateRange=DateRange(date_from="2024-12-01T00:00:00Z", date_to="2024-12-01T00:10:00Z"),
+            ),
+        ).calculate()
+
+        self.assertEqual(len(response.results), 1)
+        trace = response.results[0]
+        self.assertEqual(len(trace.events), 1)
+        self.assertEqual(trace.inputTokens, 582)
+        self.assertEqual(trace.outputTokens, 353)
+        self.assertEqual(trace.totalCost, 1.0)
+        self.assertEqual(trace.totalLatency, 3.9)
+        self.assertEqual(trace.events[0].properties.get("$ai_input"), [{"role": "user", "content": "Foo"}])
+
+    def test_bound_events_to_date_range_holds_events_and_totals_to_date_to(self):
+        trace_id = str(uuid.uuid4())
+        start = datetime(2024, 12, 1, 0, 0, tzinfo=UTC)
+
+        def generation(timestamp: datetime, latency: float, tokens: int, cost: float) -> dict[str, Any]:
+            return {
+                "event": "$ai_generation",
+                "team": self.team,
+                "distinct_id": "person1",
+                "timestamp": timestamp,
+                "properties": {
+                    "$ai_trace_id": trace_id,
+                    "$ai_parent_id": trace_id,
+                    "$ai_latency": latency,
+                    "$ai_input_tokens": tokens,
+                    "$ai_output_tokens": tokens,
+                    "$ai_total_cost_usd": cost,
+                },
+            }
+
+        # The later generation sits past date_to but inside the 7 day forward capture buffer, so it
+        # is only excluded if the exact upper bound is applied.
+        bulk_create_ai_events(
+            [
+                generation(start, latency=1.5, tokens=10, cost=0.02),
+                generation(start + timedelta(hours=2), latency=3.0, tokens=7, cost=0.05),
+            ]
+        )
+
+        query = TraceQuery(
+            traceId=trace_id,
+            dateRange=DateRange(date_from="2024-12-01T00:00:00Z", date_to="2024-12-01T00:10:00Z"),
+        )
+
+        unbounded = TraceQueryRunner(team=self.team, query=query).calculate().results[0]
+        self.assertEqual(len(unbounded.events), 2)
+        self.assertEqual(unbounded.totalLatency, 4.5)
+        self.assertEqual(unbounded.totalCost, 0.07)
+        self.assertEqual(unbounded.inputTokens, 17)
+        self.assertEqual(unbounded.outputTokens, 17)
+
+        bounded = TraceQueryRunner(team=self.team, query=query, bound_events_to_date_range=True).calculate().results[0]
+        self.assertEqual(len(bounded.events), 1)
+        self.assertEqual(bounded.totalLatency, 1.5)
+        self.assertEqual(bounded.totalCost, 0.02)
+        self.assertEqual(bounded.inputTokens, 10)
+        self.assertEqual(bounded.outputTokens, 10)
+
+    def test_bound_events_to_date_range_keeps_sub_second_events(self):
+        trace_id = str(uuid.uuid4())
+        # A cutoff rounded down to the whole second would drop this event.
+        bulk_create_ai_events(
+            [
+                {
+                    "event": "$ai_generation",
+                    "team": self.team,
+                    "distinct_id": "person1",
+                    "timestamp": datetime(2024, 12, 1, 0, 10, 0, 250000, tzinfo=UTC),
+                    "properties": {"$ai_trace_id": trace_id, "$ai_parent_id": trace_id, "$ai_latency": 1.0},
+                }
+            ]
+        )
+
+        trace = (
+            TraceQueryRunner(
+                team=self.team,
+                query=TraceQuery(
+                    traceId=trace_id,
+                    dateRange=DateRange(date_from="2024-12-01T00:00:00Z", date_to="2024-12-01T00:10:00.500000Z"),
+                ),
+                bound_events_to_date_range=True,
+            )
+            .calculate()
+            .results[0]
+        )
+        self.assertEqual(len(trace.events), 1)
+
+    def test_sums_distinguish_reported_zero_from_no_report(self):
+        zero_trace_id = str(uuid.uuid4())
+        unpriced_trace_id = str(uuid.uuid4())
+        timestamp = datetime(2024, 12, 1, 0, 0, tzinfo=UTC)
+        _create_ai_generation_event(
+            distinct_id="person1",
+            trace_id=zero_trace_id,
+            team=self.team,
+            timestamp=timestamp,
+            properties={
+                "$ai_input_tokens": 0,
+                "$ai_output_tokens": 0,
+                "$ai_input_cost_usd": 0,
+                "$ai_output_cost_usd": 0,
+                "$ai_total_cost_usd": 0,
+            },
+        )
+        # A generation whose provider never reported usage carries no token or
+        # cost properties at all.
+        _create_event(
+            event="$ai_generation",
+            distinct_id="person1",
+            team=self.team,
+            timestamp=timestamp,
+            properties={
+                "$ai_trace_id": unpriced_trace_id,
+                "$ai_latency": 1,
+                "$ai_input": [{"role": "user", "content": "Foo"}],
+                "$ai_output_choices": [{"role": "assistant", "content": "Bar"}],
+            },
+        )
+
+        date_range = DateRange(date_from="2024-12-01T00:00:00Z", date_to="2024-12-01T00:10:00Z")
+        zero_trace = (
+            TraceQueryRunner(team=self.team, query=TraceQuery(traceId=zero_trace_id, dateRange=date_range))
+            .calculate()
+            .results[0]
+        )
+        unpriced_trace = (
+            TraceQueryRunner(team=self.team, query=TraceQuery(traceId=unpriced_trace_id, dateRange=date_range))
+            .calculate()
+            .results[0]
+        )
+
+        self.assertEqual(zero_trace.totalCost, 0)
+        self.assertEqual(zero_trace.inputCost, 0)
+        self.assertEqual(zero_trace.inputTokens, 0)
+        self.assertIsNone(unpriced_trace.totalCost)
+        self.assertIsNone(unpriced_trace.inputCost)
+        self.assertIsNone(unpriced_trace.inputTokens)
 
     def test_trace_name_from_trace_event(self):
         """Test that trace_name comes from $ai_trace events when they exist."""
@@ -1380,6 +1600,48 @@ class TestTraceQueryRunner(ClickhouseTestMixin, BaseTest):
         # Should NOT double-count the children of Span A
         self.assertEqual(response.results[0].totalLatency, 450.0)
 
+    def test_latency_root_trace_event_reports_wall_clock(self):
+        """
+        Test the root $ai_trace latency wins over the sum of its children.
+
+        Tree structure:
+        Trace "trace_root_latency" (1.806s wall clock)
+        └── Generation ($ai_parent_id=trace_id, 0.917s, contained in the trace)
+
+        Expected: the root value 1.806s, rounded to 1.81, not 1.806 + 0.917
+        """
+        _create_person(distinct_ids=["person1"], team=self.team)
+        trace_id = "trace_root_latency"
+
+        _create_ai_trace_event(
+            trace_id=trace_id,
+            trace_name="root-latency-trace",
+            input_state={},
+            output_state={},
+            team=self.team,
+            distinct_id="person1",
+            timestamp=datetime(2024, 12, 1, 0, 0),
+            properties={"$ai_latency": 1.806},
+        )
+        _create_ai_generation_event(
+            distinct_id="person1",
+            trace_id=trace_id,
+            team=self.team,
+            timestamp=datetime(2024, 12, 1, 0, 1),
+            properties={"$ai_latency": 0.917, "$ai_parent_id": trace_id},
+        )
+
+        response = TraceQueryRunner(
+            team=self.team,
+            query=TraceQuery(
+                traceId=trace_id,
+                dateRange=DateRange(date_from="2024-12-01T00:00:00Z", date_to="2024-12-01T01:00:00Z"),
+            ),
+        ).calculate()
+
+        self.assertEqual(len(response.results), 1)
+        self.assertEqual(response.results[0].totalLatency, 1.81)
+
     def test_latency_no_span_id_automatic_leaves(self):
         """
         Test events without $ai_span_id are automatic leaves.
@@ -1590,7 +1852,7 @@ class TestTraceQueryRunner(ClickhouseTestMixin, BaseTest):
         # Should sum: Span A (100) + Generation B (200) = 300, exclude Generation A1
         self.assertEqual(response.results[0].totalLatency, 300.0)
 
-    @freeze_time("2025-01-15T12:00:00Z")
+    @time_machine.travel("2025-01-15T12:00:00Z", tick=False)
     def test_fallback_to_events_when_ai_events_empty(self):
         """When ai_events has no data, the fallback to events returns correct results with proper numeric types."""
         trace_id = "fallback-test-trace"

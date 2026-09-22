@@ -1,10 +1,10 @@
 import dataclasses
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any, Optional, cast
 
 from requests import Response
 
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.cloudbeds.settings import (
     CLOUDBEDS_ENDPOINTS,
     CloudbedsEndpointConfig,
@@ -22,8 +22,22 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.res
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.typing import EndpointResource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.source_helpers import validate_via_probe
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceResponse
 
-CLOUDBEDS_BASE_URL = "https://api.cloudbeds.com/api/v1.2"
+# Supported PMS API versions. Cloudbeds serves each version at the same host under a
+# `/api/<version>` path segment where the segment is the version label verbatim, so the URL is
+# built by interpolation rather than a per-version map (every supported label is covered by
+# construction). Response shapes, pagination, and Bearer auth are identical across versions.
+CLOUDBEDS_API_VERSION_V1_2 = "v1.2"
+CLOUDBEDS_API_VERSION_V1_3 = "v1.3"
+
+CLOUDBEDS_API_HOST = "https://api.cloudbeds.com/api"
+
+
+def cloudbeds_base_url(api_version: str) -> str:
+    return f"{CLOUDBEDS_API_HOST}/{api_version}"
+
+
 # List endpoints accept pageSize up to 100 (the default); the largest page minimises round trips
 # against Cloudbeds' 5 req/sec property-credential rate limit.
 PAGE_SIZE = 100
@@ -83,22 +97,46 @@ def _flatten_map(config: CloudbedsEndpointConfig) -> Callable[[dict[str, Any]], 
     return flatten
 
 
+def _keyed_map(config: CloudbedsEndpointConfig) -> Callable[[dict[str, Any]], list[dict[str, Any]]]:
+    """Explode a ``data`` object keyed by property ID (getUsers) into one row per nested item,
+    copying the key into ``keyed_by_field``. This is the map-shaped counterpart of ``_flatten_map``."""
+    key_field = cast("str", config.keyed_by_field)
+
+    def explode(container: dict[str, Any]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for key, items in container.items():
+            if not isinstance(items, list):
+                continue
+            rows.extend({**item, key_field: key} for item in items)
+        return rows
+
+    return explode
+
+
 def cloudbeds_source(
     api_key: str,
     endpoint: str,
     team_id: int,
     job_id: str,
     resumable_source_manager: ResumableSourceManager[CloudbedsResumeConfig],
+    api_version: str,
     property_id: str | None = None,
     db_incremental_field_last_value: Optional[Any] = None,
 ) -> SourceResponse:
     config = CLOUDBEDS_ENDPOINTS[endpoint]
 
-    # Group (multi-property) credentials require propertyID to scope reads; single-property
+    # Group (multi-property) credentials require the property ID to scope reads; single-property
     # credentials can omit it. Sent on every request (the paginator only touches pageNumber).
     params: dict[str, Any] = {}
     if property_id:
-        params["propertyID"] = property_id
+        params[config.property_param] = property_id
+
+    if config.stay_window_days is not None:
+        # The window is required, and it decides which rate plans the response covers: rates that do
+        # not apply to any night in it are left out.
+        today = datetime.now(UTC).date()
+        params["startDate"] = today.isoformat()
+        params["endDate"] = (today + timedelta(days=config.stay_window_days)).isoformat()
 
     paginator: BasePaginator
     if config.paginated:
@@ -121,10 +159,12 @@ def cloudbeds_source(
     }
     if config.flatten_field:
         endpoint_config["data_map"] = _flatten_map(config)
+    elif config.keyed_by_field:
+        endpoint_config["data_map"] = _keyed_map(config)
 
     rest_config: RESTAPIConfig = {
         "client": {
-            "base_url": CLOUDBEDS_BASE_URL,
+            "base_url": cloudbeds_base_url(api_version),
             "headers": _headers(),
             "auth": {"type": "bearer", "token": api_key},
             "paginator": paginator,
@@ -163,14 +203,14 @@ def cloudbeds_source(
     )
 
 
-def validate_credentials(api_key: str, property_id: str | None = None) -> tuple[bool, str | None]:
+def validate_credentials(api_key: str, api_version: str, property_id: str | None = None) -> tuple[bool, str | None]:
     """Probe a single endpoint to validate the API key or OAuth access token.
 
     One probe validates the token itself; per-endpoint OAuth scopes surface at sync time via
     get_non_retryable_errors. 401/403 map to an invalid-key message; any other non-200 reports the
     status; an unreachable probe reports a generic connection failure.
     """
-    url = f"{CLOUDBEDS_BASE_URL}{DEFAULT_PROBE_PATH}"
+    url = f"{cloudbeds_base_url(api_version)}{DEFAULT_PROBE_PATH}"
     if property_id:
         url = f"{url}?propertyID={property_id}"
 

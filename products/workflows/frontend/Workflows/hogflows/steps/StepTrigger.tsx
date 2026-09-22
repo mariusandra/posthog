@@ -1,6 +1,6 @@
 import { Node } from '@xyflow/react'
 import { useActions, useValues } from 'kea'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import {
     IconBolt,
@@ -14,20 +14,27 @@ import {
     IconWebhooks,
 } from '@posthog/icons'
 import {
+    LemonBanner,
     LemonButton,
+    LemonCheckbox,
     LemonCollapse,
     LemonDivider,
     LemonDropdown,
     LemonInput,
+    LemonInputSelect,
     LemonLabel,
+    LemonSegmentedButton,
     LemonSelect,
     Spinner,
     Tooltip,
 } from '@posthog/lemon-ui'
 
+import { AccountAssignmentFilter } from 'lib/components/AccountAssignmentFilter/AccountAssignmentFilter'
+import type { AssignmentStatus } from 'lib/components/AccountAssignmentFilter/accountAssignmentFilterTypes'
 import { CodeSnippet } from 'lib/components/CodeSnippet'
 import { PropertyFilters } from 'lib/components/PropertyFilters/PropertyFilters'
 import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import { FEATURE_FLAGS } from 'lib/constants'
 import { IconAdsClick } from 'lib/lemon-ui/icons'
 import { LemonField } from 'lib/lemon-ui/LemonField'
 import { LemonRadio } from 'lib/lemon-ui/LemonRadio'
@@ -37,20 +44,27 @@ import { createFuse } from 'lib/utils/fuseSearch'
 import { humanFriendlyNumber } from 'lib/utils/numbers'
 import { COHORTS_ONLY_SUPPORT_IN_PICKER_PROPS } from 'scenes/feature-flags/cohortPickerProps'
 import { TestAccountFilter } from 'scenes/insights/filters/TestAccountFilter/TestAccountFilter'
+import { teamLogic } from 'scenes/teamLogic'
 
+import { tagsModel } from '~/models/tagsModel'
 import { PropertyFilterType } from '~/types'
 
+import { accountsColumnConfigLogic } from 'products/customer_analytics/frontend/components/Accounts/accountsColumnConfigLogic'
+import { ACCOUNT_CUSTOM_PROPERTY_OPERATOR_ALLOWLIST } from 'products/customer_analytics/frontend/components/Accounts/accountsPropertyFilters'
 // Side-effect imports: register product-specific trigger types
 import 'products/workflows/frontend/Workflows/hogflows/registry/triggers'
 
 import { workflowLogic } from '../../workflowLogic'
-import { HogFlowEventFilters, WORKFLOW_OPERATOR_ALLOWLIST } from '../filters/HogFlowFilters'
-import { getRegisteredTriggerTypes } from '../registry/triggers/triggerTypeRegistry'
+import { HogFlowEventFilters, HogFlowPropertyFilters, WORKFLOW_OPERATOR_ALLOWLIST } from '../filters/HogFlowFilters'
+import { TriggerFrequencyOption, getRegisteredTriggerTypes } from '../registry/triggers/triggerTypeRegistry'
 import { HogFlowAction } from '../types'
-import { batchTriggerLogic, getAudienceDedupeKey } from './batchTriggerLogic'
+import { createAccountAssignmentFilterUpdate, parseAccountAssignmentFilter } from './accountAssignmentFilter'
+import { batchTriggerLogic, getAudienceDedupeKey, hogFlowSendsEmail } from './batchTriggerLogic'
+import { HogFlowDuration, MAX_CONVERSION_WINDOW_FOR_DURATION_UNIT } from './components/HogFlowDuration'
 import { HogFlowFunctionConfiguration } from './components/HogFlowFunctionConfiguration'
 import { RecurringSchedulePicker } from './components/RecurringSchedulePicker'
 import { ScheduleStatusBadge } from './components/ScheduleStatusBadge'
+import { TriggerVolumeEstimate } from './components/TriggerVolumeEstimate'
 
 type TriggerAction = Extract<HogFlowAction, { type: 'trigger' }>
 type EventTriggerConfig = {
@@ -73,9 +87,9 @@ type TriggerOptionItem = {
 }
 
 function getTriggerDisplayType(type: string, config: any): string {
-    if (type !== 'event') {
-        return type
-    }
+    // Several tiles can share one config type (`event`, `internal-event`), so the tile is whichever
+    // one claims this config, not the type itself. Types owned by a single tile fall through to the
+    // type, which is that tile's value.
     const match = getRegisteredTriggerTypes().find((t) => t.matchConfig?.(config))
     return match ? match.value : type
 }
@@ -204,7 +218,7 @@ function TriggerTypeDropdownItem({
 }
 
 export function StepTriggerConfiguration({ node }: { node: Node<TriggerAction> }): JSX.Element {
-    const { setWorkflowActionConfig } = useActions(workflowLogic)
+    const { setWorkflowActionConfig, setWorkflowValue } = useActions(workflowLogic)
     const { actionValidationErrorsById } = useValues(workflowLogic)
     const { featureFlags } = useValues(featureFlagLogic)
 
@@ -281,6 +295,11 @@ export function StepTriggerConfiguration({ node }: { node: Node<TriggerAction> }
     const registeredMatch = getRegisteredTriggerTypes().find((t) => t.matchConfig?.(node.data.config))
 
     const handleSelect = (value: string): void => {
+        // The frequency hash lives on the workflow, not the trigger config, and hashes are
+        // trigger-specific ({person.id} vs event-keyed) — a stale one silently disables masking.
+        if (value !== displayType) {
+            setWorkflowValue('trigger_masking', null)
+        }
         const registered = getRegisteredTriggerTypes().find((t) => t.value === value)
         if (registered) {
             setWorkflowActionConfig(node.id, registered.buildConfig())
@@ -332,7 +351,21 @@ export function StepTriggerConfiguration({ node }: { node: Node<TriggerAction> }
                 {type === 'schedule' && <ScheduleStatusBadge />}
             </div>
             {registeredMatch?.ConfigComponent ? (
-                <registeredMatch.ConfigComponent node={node} />
+                <>
+                    <registeredMatch.ConfigComponent node={node} />
+                    {featureFlags[FEATURE_FLAGS.WORKFLOWS_TRIGGER_VOLUME_ESTIMATE] ? (
+                        <TriggerVolumeEstimate action={node.data} />
+                    ) : null}
+                    {registeredMatch.frequencyOptions ? (
+                        <>
+                            <LemonDivider />
+                            <FrequencySection
+                                options={registeredMatch.frequencyOptions}
+                                description={registeredMatch.frequencyDescription}
+                            />
+                        </>
+                    ) : null}
+                </>
             ) : node.data.config.type === 'event' ? (
                 <StepTriggerConfigurationEvents action={node.data} config={node.data.config} />
             ) : node.data.config.type === 'webhook' ? (
@@ -354,6 +387,7 @@ export function StepTriggerConfiguration({ node }: { node: Node<TriggerAction> }
             ) : node.data.config.type === 'tracking_pixel' ? (
                 <StepTriggerConfigurationTrackingPixel action={node.data} config={node.data.config} />
             ) : null}
+            <SendingRateLimitSection />
         </div>
     )
 }
@@ -367,6 +401,7 @@ function StepTriggerConfigurationEvents({
 }): JSX.Element {
     const { setWorkflowActionConfig } = useActions(workflowLogic)
     const { actionValidationErrorsById } = useValues(workflowLogic)
+    const { featureFlags } = useValues(featureFlagLogic)
     const validationResult = actionValidationErrorsById[action.id]
     const filterTestAccounts = config.filters?.filter_test_accounts ?? false
 
@@ -382,12 +417,35 @@ function StepTriggerConfigurationEvents({
                     setFilters={(filters) =>
                         setWorkflowActionConfig(action.id, {
                             type: 'event',
-                            filters: { ...filters, filter_test_accounts: filterTestAccounts },
+                            // The event filter only returns events/actions, so carry the global
+                            // property array through or an event edit drops it.
+                            filters: {
+                                ...filters,
+                                properties: config.filters?.properties,
+                                filter_test_accounts: filterTestAccounts,
+                            },
                         })
                     }
                     filtersKey={`workflow-trigger-${action.id}`}
                     typeKey="workflow-trigger"
                     buttonCopy="Add trigger event"
+                />
+            </LemonField.Pure>
+
+            <LemonField.Pure
+                label="Additional filters"
+                info="These filters apply to every trigger event above. Use them for conditions shared across all events, such as a SQL expression."
+            >
+                <HogFlowPropertyFilters
+                    filters={config.filters ?? {}}
+                    setFilters={(filters) =>
+                        setWorkflowActionConfig(action.id, {
+                            type: 'event',
+                            filters: { ...config.filters, properties: filters?.properties ?? [] },
+                        })
+                    }
+                    filtersKey={`workflow-trigger-${action.id}`}
+                    buttonCopy="Add filter"
                 />
             </LemonField.Pure>
 
@@ -400,6 +458,10 @@ function StepTriggerConfigurationEvents({
                     })
                 }
             />
+
+            {featureFlags[FEATURE_FLAGS.WORKFLOWS_TRIGGER_VOLUME_ESTIMATE] ? (
+                <TriggerVolumeEstimate action={action} />
+            ) : null}
 
             <LemonDivider />
             <FrequencySection />
@@ -490,8 +552,10 @@ function StepTriggerConfigurationManual(): JSX.Element {
 
 function StepTriggerAffectedUsers({ actionId, filters }: { actionId: string; filters: any }): JSX.Element | null {
     const { workflow } = useValues(workflowLogic)
-    const dedupeKey = getAudienceDedupeKey(workflow)
-    const logic = batchTriggerLogic({ id: actionId, filters, dedupeKey })
+    const isAccountAudience = filters?.audience_type === 'accounts'
+    // Account audiences carry no person, so email dedup never applies to them.
+    const dedupeKey = isAccountAudience ? undefined : getAudienceDedupeKey(workflow)
+    const logic = batchTriggerLogic({ id: actionId, filters, dedupeKey, sendsEmail: hogFlowSendsEmail(workflow) })
     const { blastRadiusLoading, blastRadius, blastRadiusError } = useValues(logic)
 
     if (blastRadiusLoading) {
@@ -527,12 +591,16 @@ function StepTriggerAffectedUsers({ actionId, filters }: { actionId: string; fil
         return (
             <div className="text-muted">
                 <div className={exceeded ? 'text-danger font-semibold' : 'text-muted'}>
-                    approximately {humanFriendlyNumber(affected)} of {humanFriendlyNumber(total)} persons.
+                    approximately {humanFriendlyNumber(affected)} of {humanFriendlyNumber(total)}{' '}
+                    {isAccountAudience ? 'accounts' : 'persons'}.
                 </div>
                 {exceeded && limit != null && (
                     <div className="text-danger text-xs">
-                        Batch size exceeds the limit of {humanFriendlyNumber(limit)} users. Add filters to narrow your
-                        audience. This limit will be loosened in the future.
+                        Your audience is above this project's batch limit of {humanFriendlyNumber(limit)}{' '}
+                        {isAccountAudience ? 'accounts' : 'users'}. Add filters to narrow it.
+                        {hogFlowSendsEmail(workflow)
+                            ? ' The limit rises as the project builds a clean sending history.'
+                            : ''}
                     </div>
                 )}
             </div>
@@ -552,6 +620,79 @@ function BatchScheduleSection(): JSX.Element {
     )
 }
 
+type BatchTriggerFilters = Extract<HogFlowAction['config'], { type: 'batch' }>['filters']
+
+function StepTriggerBatchAccountFilters({
+    actionId,
+    filters,
+}: {
+    actionId: string
+    filters: BatchTriggerFilters
+}): JSX.Element {
+    const { partialSetWorkflowActionConfig } = useActions(workflowLogic)
+    const { tags: tagsAvailable } = useValues(tagsModel)
+    const { customPropertyTaxonomicOptions } = useValues(accountsColumnConfigLogic)
+
+    const setFilters = (update: Partial<BatchTriggerFilters>): void => {
+        partialSetWorkflowActionConfig(actionId, { filters: { ...filters, ...update } })
+    }
+
+    const { status: assignmentStatus, assignedToUserIds } = parseAccountAssignmentFilter(filters)
+
+    const setAssignmentFilter = (status: AssignmentStatus, userIds: number[]): void => {
+        setFilters(createAccountAssignmentFilterUpdate(status, userIds))
+    }
+
+    return (
+        <div className="flex flex-col gap-2">
+            <LemonBanner type="info" className="w-full">
+                Account audiences run one workflow per account, without a person. Steps that read person properties
+                won't fill in. Use the "Get account" step to read account data.
+            </LemonBanner>
+            <div className="flex flex-wrap gap-2 items-center">
+                <LemonInputSelect
+                    mode="multiple"
+                    allowCustomValues
+                    size="small"
+                    className="min-w-48"
+                    value={filters.tag_names ?? []}
+                    options={(tagsAvailable || []).map((tag: string) => ({ key: tag, label: tag }))}
+                    onChange={(tag_names) => setFilters({ tag_names })}
+                    placeholder="Filter by tags"
+                    data-attr="workflows-batch-account-tags-filter"
+                />
+                <AccountAssignmentFilter
+                    assignedToUserIds={assignedToUserIds}
+                    status={assignmentStatus}
+                    onAssignedToUserIdsChange={(userIds) => setAssignmentFilter('assigned', userIds)}
+                    onStatusChange={(status) => setAssignmentFilter(status, assignedToUserIds)}
+                    dataAttrs={{
+                        trigger: 'workflows-batch-account-assigned-filter',
+                        unassigned: 'workflows-batch-account-unassigned-filter',
+                        assigned: 'workflows-batch-account-assigned-status-filter',
+                        all: 'workflows-batch-account-all-assignment-filter',
+                    }}
+                />
+            </div>
+            {customPropertyTaxonomicOptions.length > 0 && (
+                <PropertyFilters
+                    pageKey={`workflows-batch-trigger-account-filters-${actionId}`}
+                    propertyFilters={filters.properties}
+                    addText="Add condition"
+                    sendAllKeyUpdates
+                    onChange={(properties) => setFilters({ properties })}
+                    taxonomicGroupTypes={[TaxonomicFilterGroupType.AccountCustomProperties]}
+                    taxonomicFilterOptionsFromProp={{
+                        [TaxonomicFilterGroupType.AccountCustomProperties]: customPropertyTaxonomicOptions,
+                    }}
+                    hasRowOperator={false}
+                    operatorAllowlist={ACCOUNT_CUSTOM_PROPERTY_OPERATOR_ALLOWLIST}
+                />
+            )}
+        </div>
+    )
+}
+
 function StepTriggerConfigurationBatch({
     action,
     config,
@@ -560,45 +701,73 @@ function StepTriggerConfigurationBatch({
     config: Extract<HogFlowAction['config'], { type: 'batch' }>
 }): JSX.Element {
     const { partialSetWorkflowActionConfig } = useActions(workflowLogic)
+    const { featureFlags } = useValues(featureFlagLogic)
+    const { currentTeam } = useValues(teamLogic)
+
+    const accountAudienceAvailable =
+        !!featureFlags[FEATURE_FLAGS.CUSTOMER_ANALYTICS_CSP] &&
+        currentTeam?.customer_analytics_config?.account_group_type_index != null
+    const isAccountAudience = config.filters.audience_type === 'accounts'
 
     return (
         <div className="flex flex-col gap-2 my-2 w-full">
+            {(accountAudienceAvailable || isAccountAudience) && (
+                <LemonSegmentedButton
+                    size="small"
+                    value={isAccountAudience ? 'accounts' : 'persons'}
+                    onChange={(audience_type) =>
+                        // Person and account filters are mutually invalid, so switching resets them.
+                        partialSetWorkflowActionConfig(action.id, {
+                            filters: { audience_type, properties: [] },
+                        })
+                    }
+                    options={[
+                        { value: 'persons' as const, label: 'People' },
+                        { value: 'accounts' as const, label: 'Accounts' },
+                    ]}
+                    data-attr="workflows-batch-audience-type"
+                />
+            )}
             <div>
                 <span className="font-semibold">This batch will include</span>{' '}
                 <StepTriggerAffectedUsers actionId={action.id} filters={config.filters} />
             </div>
-            <div>
-                <PropertyFilters
-                    pageKey={`workflows-batch-trigger-property-filters-${action.id}`}
-                    propertyFilters={config.filters.properties}
-                    addText="Add condition"
-                    orFiltering
-                    sendAllKeyUpdates
-                    allowRelativeDateOptions
-                    {...COHORTS_ONLY_SUPPORT_IN_PICKER_PROPS}
-                    hideBehavioralCohorts
-                    logicalRowDivider
-                    onChange={(properties) =>
-                        partialSetWorkflowActionConfig(action.id, {
-                            filters: {
-                                properties,
-                            },
-                        })
-                    }
-                    taxonomicGroupTypes={[
-                        TaxonomicFilterGroupType.PersonProperties,
-                        TaxonomicFilterGroupType.Cohorts,
-                        TaxonomicFilterGroupType.Metadata,
-                    ]}
-                    taxonomicFilterOptionsFromProp={{
-                        [TaxonomicFilterGroupType.Metadata]: [
-                            { name: 'distinct_id', propertyFilterType: PropertyFilterType.Person },
-                        ],
-                    }}
-                    hasRowOperator={false}
-                    operatorAllowlist={WORKFLOW_OPERATOR_ALLOWLIST}
-                />
-            </div>
+            {isAccountAudience ? (
+                <StepTriggerBatchAccountFilters actionId={action.id} filters={config.filters} />
+            ) : (
+                <div>
+                    <PropertyFilters
+                        pageKey={`workflows-batch-trigger-property-filters-${action.id}`}
+                        propertyFilters={config.filters.properties}
+                        addText="Add condition"
+                        orFiltering
+                        sendAllKeyUpdates
+                        allowRelativeDateOptions
+                        {...COHORTS_ONLY_SUPPORT_IN_PICKER_PROPS}
+                        hideBehavioralCohorts
+                        logicalRowDivider
+                        onChange={(properties) =>
+                            partialSetWorkflowActionConfig(action.id, {
+                                filters: {
+                                    properties,
+                                },
+                            })
+                        }
+                        taxonomicGroupTypes={[
+                            TaxonomicFilterGroupType.PersonProperties,
+                            TaxonomicFilterGroupType.Cohorts,
+                            TaxonomicFilterGroupType.Metadata,
+                        ]}
+                        taxonomicFilterOptionsFromProp={{
+                            [TaxonomicFilterGroupType.Metadata]: [
+                                { name: 'distinct_id', propertyFilterType: PropertyFilterType.Person },
+                            ],
+                        }}
+                        hasRowOperator={false}
+                        operatorAllowlist={WORKFLOW_OPERATOR_ALLOWLIST}
+                    />
+                </div>
+            )}
 
             <BatchScheduleSection />
         </div>
@@ -687,10 +856,10 @@ function StepTriggerConfigurationTrackingPixel({
 const MASKING_HASH_PER_PERSON_PER_DAY = "{concat(toString(person.id), '-', formatDateTime(now(), '%Y-%m-%d'))}"
 const CALENDAR_DAY_TTL = 24 * 60 * 60
 
-const FREQUENCY_OPTIONS = [
+const FREQUENCY_OPTIONS: TriggerFrequencyOption[] = [
     { value: null, label: 'Every time the trigger fires' },
     { value: '{person.id}', label: 'One time' },
-    { value: MASKING_HASH_PER_PERSON_PER_DAY, label: 'Once per calendar day' },
+    { value: MASKING_HASH_PER_PERSON_PER_DAY, label: 'Once per calendar day', fixedTtl: CALENDAR_DAY_TTL },
 ]
 
 const TTL_OPTIONS = [
@@ -726,9 +895,17 @@ function TTLSelect({
     )
 }
 
-function FrequencySection(): JSX.Element {
+function FrequencySection({
+    options = FREQUENCY_OPTIONS,
+    description = 'Limit how often users can enter this workflow',
+}: {
+    options?: TriggerFrequencyOption[]
+    description?: string
+}): JSX.Element {
     const { setWorkflowValue } = useActions(workflowLogic)
     const { workflow } = useValues(workflowLogic)
+
+    const selectedOption = options.find((option) => option.value === (workflow.trigger_masking?.hash ?? null))
 
     return (
         <div className="flex flex-col w-full py-2">
@@ -736,30 +913,27 @@ function FrequencySection(): JSX.Element {
                 <IconClock className="text-lg" />
                 <span className="text-md font-semibold">Frequency</span>
             </span>
-            <p>Limit how often users can enter this workflow</p>
+            <p>{description}</p>
 
             <LemonField.Pure>
                 <div className="flex flex-wrap gap-1 items-center">
                     <LemonSelect
-                        options={FREQUENCY_OPTIONS}
+                        options={options.map(({ value, label }) => ({ value, label }))}
                         value={workflow.trigger_masking?.hash ?? null}
-                        onChange={(val) =>
+                        onChange={(val) => {
+                            const option = options.find((candidate) => candidate.value === val)
                             setWorkflowValue(
                                 'trigger_masking',
                                 val
                                     ? {
                                           hash: val,
-                                          ttl:
-                                              val === MASKING_HASH_PER_PERSON_PER_DAY
-                                                  ? CALENDAR_DAY_TTL
-                                                  : (workflow.trigger_masking?.ttl ?? 60 * 30),
+                                          ttl: option?.fixedTtl ?? workflow.trigger_masking?.ttl ?? 60 * 30,
                                       }
                                     : null
                             )
-                        }
+                        }}
                     />
-                    {workflow.trigger_masking?.hash &&
-                    workflow.trigger_masking.hash !== MASKING_HASH_PER_PERSON_PER_DAY ? (
+                    {workflow.trigger_masking?.hash && !selectedOption?.fixedTtl ? (
                         <TTLSelect
                             value={workflow.trigger_masking.ttl}
                             onChange={(val) =>
@@ -773,11 +947,31 @@ function FrequencySection(): JSX.Element {
     )
 }
 
+const DEFAULT_CONVERSION_WINDOW = '90d'
+// The worker measures a legacy window_minutes at most this long, so a longer stored value is shown
+// as what it actually measures rather than as a number the API would now reject.
+const LEGACY_CONVERSION_WINDOW_CEILING_MINUTES = 90 * 24 * 60
+
+function conversionWindowFromMinutes(minutes: number): string {
+    const capped = Math.min(minutes, LEGACY_CONVERSION_WINDOW_CEILING_MINUTES)
+    if (capped % (24 * 60) === 0) {
+        return `${capped / (24 * 60)}d`
+    }
+    if (capped % 60 === 0) {
+        return `${capped / 60}h`
+    }
+    return `${capped}m`
+}
+
 function ConversionGoalSection(): JSX.Element {
     const { setWorkflowValue } = useActions(workflowLogic)
     const { workflow } = useValues(workflowLogic)
 
     const conversionEventFilters = workflow.conversion?.events?.[0]?.filters ?? {}
+    const legacyWindowMinutes = workflow.conversion?.window_minutes
+    const conversionWindow =
+        workflow.conversion?.window ??
+        (legacyWindowMinutes ? conversionWindowFromMinutes(legacyWindowMinutes) : DEFAULT_CONVERSION_WINDOW)
 
     return (
         <div className="flex flex-col py-2 w-full">
@@ -827,8 +1021,122 @@ function ConversionGoalSection(): JSX.Element {
                         buttonCopy="Add event"
                     />
                 </div>
+
+                <div className="flex flex-col gap-1 items-start">
+                    <span className="flex gap-1 items-center">
+                        <LemonLabel>Conversion window</LemonLabel>
+                        <Tooltip title="A person who meets the goal after this window is not counted as converted. The window runs from the moment they enter the workflow.">
+                            <IconInfo className="text-secondary" />
+                        </Tooltip>
+                    </span>
+                    <HogFlowDuration
+                        value={conversionWindow}
+                        onChange={(next) => {
+                            // Dropping window_minutes keeps the two forms from arriving together, which
+                            // the API rejects. A cleared amount arrives as a bare unit such as "d", so
+                            // omitting window restores the default instead of failing the save.
+                            const { window_minutes, window, ...conversion } = workflow.conversion ?? {}
+                            setWorkflowValue(
+                                'conversion',
+                                /\d/.test(next) ? { ...conversion, window: next } : conversion
+                            )
+                        }}
+                        maxValueForUnit={MAX_CONVERSION_WINDOW_FOR_DURATION_UNIT}
+                    />
+                </div>
             </div>
         </div>
+    )
+}
+
+function SendingRateLimitSection(): JSX.Element | null {
+    const { setWorkflowValue } = useActions(workflowLogic)
+    const { workflow } = useValues(workflowLogic)
+
+    const rateLimit = workflow.email_sending_rate_limit ?? null
+    // Mirror the count locally so clearing the field doesn't snap back to the committed value
+    // mid-edit; reconcile when the stored value changes externally (toggle, another editor).
+    const [displayCount, setDisplayCount] = useState<number | undefined>(rateLimit?.count)
+    useEffect(() => {
+        setDisplayCount(rateLimit?.count)
+    }, [rateLimit?.count])
+
+    const hasEmailAction = workflow.actions.some((action) => action.type === 'function_email')
+    // Stay visible while a limit is set even without an email step, so it can still be removed.
+    if (!hasEmailAction && !rateLimit) {
+        return null
+    }
+
+    return (
+        <>
+            <LemonDivider />
+            <div className="flex flex-col w-full py-2 gap-2">
+                <span className="flex gap-1 items-center">
+                    <IconClock className="text-lg" />
+                    <span className="text-md font-semibold">Email sending rate limit (optional)</span>
+                    <Tooltip title="Sending a large volume too quickly can hurt deliverability. Emails over the limit are delayed until capacity frees up, not dropped.">
+                        <IconInfo className="text-secondary" />
+                    </Tooltip>
+                </span>
+                <p className="mb-0">Spread this workflow's emails out over time instead of sending all at once.</p>
+                <LemonCheckbox
+                    checked={!!rateLimit}
+                    onChange={(checked) =>
+                        setWorkflowValue('email_sending_rate_limit', checked ? { count: 100, period: 'minute' } : null)
+                    }
+                    label="Limit sending rate"
+                    data-attr="workflow-email-rate-limit-toggle"
+                />
+                {rateLimit ? (
+                    <div className="flex items-center gap-2">
+                        <span>Send at most</span>
+                        <LemonInput
+                            type="number"
+                            size="small"
+                            className="w-24"
+                            min={1}
+                            // Mirror the API's accepted range (min_value=1, max_value=1_000_000) so an
+                            // out-of-range entry is clamped here instead of failing the workflow save.
+                            max={1_000_000}
+                            aria-label="Maximum emails per period"
+                            value={displayCount ?? NaN}
+                            onChange={(count) => {
+                                if (count == null || !Number.isFinite(count)) {
+                                    setDisplayCount(undefined)
+                                    return
+                                }
+                                const next = Math.min(1_000_000, Math.max(1, Math.floor(count)))
+                                setDisplayCount(next)
+                                setWorkflowValue('email_sending_rate_limit', { ...rateLimit, count: next })
+                            }}
+                            onBlur={() =>
+                                displayCount === undefined
+                                    ? setDisplayCount(rateLimit.count)
+                                    : setWorkflowValue('email_sending_rate_limit', {
+                                          ...rateLimit,
+                                          count: displayCount,
+                                      })
+                            }
+                            data-attr="workflow-email-rate-limit-count"
+                        />
+                        <span>emails per</span>
+                        <LemonSelect
+                            size="small"
+                            aria-label="Rate limit period"
+                            value={rateLimit.period}
+                            options={[
+                                { value: 'minute' as const, label: 'minute' },
+                                { value: 'hour' as const, label: 'hour' },
+                            ]}
+                            onChange={(period) =>
+                                setWorkflowValue('email_sending_rate_limit', { ...rateLimit, period })
+                            }
+                            data-attr="workflow-email-rate-limit-period"
+                        />
+                    </div>
+                ) : null}
+            </div>
+        </>
     )
 }
 

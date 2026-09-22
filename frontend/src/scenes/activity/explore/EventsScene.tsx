@@ -11,11 +11,16 @@ import { Query } from '~/queries/Query/Query'
 import { ProductKey } from '~/queries/schema/schema-general'
 import { ActivityTab } from '~/types'
 
+import { useAttachedContext } from 'products/posthog_ai/frontend/api/logics'
+
+import { buildExploreAgentContext } from '../activityAgentContext'
 import { eventsSceneLogic } from './eventsSceneLogic'
 
 export function EventsScene({ tabId }: { tabId?: string } = {}): JSX.Element {
     const { query } = useValues(eventsSceneLogic({ tabId }))
     const { setQuery } = useActions(eventsSceneLogic({ tabId }))
+
+    useAttachedContext(buildExploreAgentContext(ActivityTab.ExploreEvents, query))
 
     return (
         <SceneContent>
@@ -37,6 +42,8 @@ export function EventsScene({ tabId }: { tabId?: string } = {}): JSX.Element {
                     showOpenEditorButton: true,
                     extraDataTableQueryFeatures: [QueryFeature.highlightExceptionEventRows],
                     dataTableMaxPaginationLimit: 200,
+                    // A live-data explorer over captured events, so it keeps the hidden ones selectable.
+                    includeHiddenEvents: true,
                 }}
             />
         </SceneContent>

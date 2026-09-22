@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.appsignal.appsignal import (
     AppsignalResumeConfig,
@@ -30,6 +24,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.appsignal import (
     AppsignalSourceConfig,
 )
@@ -61,10 +56,10 @@ class AppsignalSource(ResumableSource[AppsignalSourceConfig, AppsignalResumeConf
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.APPSIGNAL,
+            name=ExternalDataSourceType.APPSIGNAL,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="AppSignal",
-            caption="""Enter your AppSignal personal API token and app ID to pull your AppSignal error and performance data into the PostHog Data warehouse.
+            caption="""Enter your AppSignal personal API token and app ID to pull your AppSignal errors, performance data, logs, metrics and traces into the PostHog Data warehouse.
 
 Your personal API token is in your [AppSignal personal settings](https://appsignal.com/users/edit) under "API key". The app ID is the identifier in your app's AppSignal URL: `https://appsignal.com/<organization>/sites/<app ID>`.""",
             iconPath="/static/services/appsignal.png",

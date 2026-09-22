@@ -1,11 +1,13 @@
 from posthog.test.base import BaseTest, ClickhouseTestMixin
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from django.test import override_settings
+
 from langchain_core.messages import (
     AIMessage as LangchainAIMessage,
     HumanMessage as LangchainHumanMessage,
 )
-from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables import RunnableBinding, RunnableConfig
 from parameterized import parameterized
 
 from posthog.schema import (
@@ -21,6 +23,7 @@ from posthog.models import Team, User
 
 from ee.hogai.chat_agent.mode_manager import ChatAgentModeManager
 from ee.hogai.context import AssistantContextManager
+from ee.hogai.llm import MaxChatAnthropic
 from ee.hogai.tool_errors import MaxToolError, MaxToolFatalError, MaxToolRetryableError, MaxToolTransientError
 from ee.hogai.tools.read_taxonomy.core import ReadEvents
 from ee.hogai.utils.tests import FakeChatAnthropic, FakeChatOpenAI
@@ -333,8 +336,8 @@ class TestAgentNode(ClickhouseTestMixin, BaseTest):
     @patch("ee.hogai.utils.conversation_summarizer.AnthropicConversationSummarizer.summarize")
     async def test_conversation_summarization_flow(self, mock_summarize, mock_calculate_tokens, mock_model):
         """Test that conversation is summarized when it gets too long"""
-        # Return a token count higher than CONVERSATION_WINDOW_SIZE (100,000)
-        mock_calculate_tokens.return_value = 150_000
+        # Return a token count higher than CONVERSATION_WINDOW_SIZE
+        mock_calculate_tokens.return_value = 450_000
         mock_summarize.return_value = "This is a summary of the conversation so far."
 
         mock_model_instance = FakeChatOpenAI(responses=[LangchainAIMessage(content="Response after summary")])
@@ -369,8 +372,8 @@ class TestAgentNode(ClickhouseTestMixin, BaseTest):
     @patch("ee.hogai.utils.conversation_summarizer.AnthropicConversationSummarizer.summarize")
     async def test_conversation_summarization_on_first_turn(self, mock_summarize, mock_calculate_tokens, mock_model):
         """Test that on first turn, the last message is excluded from summarization"""
-        # Return a token count higher than CONVERSATION_WINDOW_SIZE (100,000)
-        mock_calculate_tokens.return_value = 150_000
+        # Return a token count higher than CONVERSATION_WINDOW_SIZE
+        mock_calculate_tokens.return_value = 450_000
         mock_summarize.return_value = "Summary without last message"
 
         mock_model_instance = FakeChatOpenAI(responses=[LangchainAIMessage(content="Response")])
@@ -401,7 +404,7 @@ class TestAgentNode(ClickhouseTestMixin, BaseTest):
         self, mock_summarize, mock_calculate_tokens, mock_model
     ):
         """Test that mode reminder is inserted after summary when modes feature flag is enabled"""
-        mock_calculate_tokens.return_value = 150_000
+        mock_calculate_tokens.return_value = 450_000
         mock_summarize.return_value = "Summary of conversation"
 
         mock_model_instance = FakeChatOpenAI(responses=[LangchainAIMessage(content="Response")])
@@ -658,7 +661,7 @@ class TestAgentNode(ClickhouseTestMixin, BaseTest):
         from ee.hogai.utils.types.base import ReplaceMessages
 
         # Trigger summarization flow which returns ReplaceMessages
-        mock_calculate_tokens.return_value = 150_000
+        mock_calculate_tokens.return_value = 450_000
         mock_summarize.return_value = "Conversation summary"
         mock_model.return_value = FakeChatOpenAI(responses=[LangchainAIMessage(content="Response")])
 
@@ -1157,3 +1160,46 @@ class TestRootNodeTools(BaseTest):
             from pydantic import ValidationError as PydanticValidationError
 
             self.assertIsInstance(captured_error, PydanticValidationError)
+
+
+@patch.dict("os.environ", {"ANTHROPIC_API_KEY": "direct-api-key"})
+class TestAgentNodeModelRouting(BaseTest):
+    def _root_model(self) -> MaxChatAnthropic:
+        node = _create_agent_node(self.team, self.user)
+        model = node._get_model(AssistantState(messages=[HumanMessage(content="Hello")]), [])
+        assert isinstance(model, RunnableBinding)
+        assert isinstance(model.bound, MaxChatAnthropic)
+        return model.bound
+
+    @override_settings(
+        AI_GATEWAY_URL="https://ai-gateway.test/v1",
+        AI_GATEWAY_API_KEY="phs_gateway",
+        LLM_GATEWAY_URL="http://llm-gateway.test",
+        LLM_GATEWAY_API_KEY="legacy-key",
+    )
+    @patch("ee.hogai.core.agent_modes.executables.get_llm_gateway_variant", return_value="gateway-bedrock")
+    def test_root_model_routes_through_the_ai_gateway_when_configured(self, mock_variant):
+        root_model = self._root_model()
+
+        self.assertEqual(root_model.anthropic_api_url, "https://ai-gateway.test")
+        self.assertIsNone(root_model.default_headers)
+        assert isinstance(root_model.ai_gateway_fallback, MaxChatAnthropic)
+        self.assertEqual(root_model.ai_gateway_fallback.model, "claude-sonnet-4-6")
+        self.assertTrue(root_model.billable)
+        mock_variant.assert_not_called()
+
+    @override_settings(
+        AI_GATEWAY_URL="",
+        AI_GATEWAY_API_KEY="",
+        LLM_GATEWAY_URL="http://llm-gateway.test",
+        LLM_GATEWAY_API_KEY="legacy-key",
+    )
+    @patch("ee.hogai.core.agent_modes.executables.get_llm_gateway_variant", return_value="gateway-bedrock")
+    def test_root_model_keeps_the_legacy_gateway_arm_without_ai_gateway_config(self, _mock_variant):
+        root_model = self._root_model()
+
+        self.assertIsNone(root_model.ai_gateway_fallback)
+        self.assertEqual(root_model.anthropic_api_url, "http://llm-gateway.test/django")
+        assert root_model.default_headers is not None
+        self.assertEqual(root_model.default_headers["X-PostHog-Provider"], "bedrock")
+        self.assertTrue(root_model.bypass_proxy)

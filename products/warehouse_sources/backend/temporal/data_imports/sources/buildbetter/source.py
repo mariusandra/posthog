@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.buildbetter.buildbetter import (
     BuildBetterResumeConfig,
@@ -32,6 +26,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.buildbetter import (
     BuildBetterSourceConfig,
 )
@@ -61,7 +56,15 @@ class BuildBetterSource(ResumableSource[BuildBetterSourceConfig, BuildBetterResu
             "401 Client Error": "BuildBetter authentication failed. Please check your API key.",
             "403 Client Error": "BuildBetter access forbidden. Please check your API key permissions.",
             "Authentication hook unauthorized this request": "BuildBetter authentication failed. Please check your API key.",
+            "webhook authentication request failed": "BuildBetter authentication failed. Please check your API key.",
         }
+
+    def get_retryable_errors(self) -> set[str]:
+        # `execute`'s own tenacity retry already retries a 5xx or 429 (raised as
+        # BuildBetterRetryableError) up to 5 attempts; once that budget exhausts, Temporal retries
+        # the whole activity from the saved pagination checkpoint, so the failure is transient and
+        # self-recovering rather than tracked-exception-worthy.
+        return {"BuildBetter: server error", "BuildBetter: rate limited"}
 
     def get_schemas(
         self,
@@ -108,11 +111,11 @@ class BuildBetterSource(ResumableSource[BuildBetterSourceConfig, BuildBetterResu
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.BUILD_BETTER,
+            name=ExternalDataSourceType.BUILDBETTER,
             category=DataWarehouseSourceCategory.PRODUCTIVITY,
             label="BuildBetter",
             releaseStatus=ReleaseStatus.GA,
-            caption="Connect your BuildBetter workspace to sync interviews, extractions, persons, and companies.",
+            caption="Connect your BuildBetter workspace to sync interviews, transcripts, extractions, documents, persons, and companies.",
             iconPath="/static/services/buildbetter.png",
             fields=cast(
                 list[FieldType],

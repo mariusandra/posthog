@@ -12,6 +12,7 @@ from posthog.hogql.database.database import Database
 from posthog.hogql.query import HogQLQueryExecutor
 
 from products.data_tools.backend.models.join import DataWarehouseJoin
+from products.data_warehouse.backend.presentation.views.view_link import NO_MATCHING_ROWS_MSG
 from products.warehouse_sources.backend.facade.models import (
     DataWarehouseCredential,
     DataWarehouseTable,
@@ -325,8 +326,8 @@ class TestViewLinkQuery(APIBaseTest):
         # Test that listing joins uses efficient querying
 
         with self.assertNumQueries(
-            FuzzyInt(18, 19)
-        ):  # depends when team revenue analytisc config cache is hit in a test
+            FuzzyInt(19, 21)
+        ):  # depends when the team revenue analytics config cache and instance-setting caches are hit in a test
             response = self.client.get(f"/api/environments/{self.team.id}/warehouse_view_links/")
 
         self.assertEqual(response.status_code, 200)
@@ -360,6 +361,29 @@ def _mock_execute_hogql_side_effect(*args, **kwargs):
         explain=executor.explain,
         metadata=executor.metadata,
     )
+
+
+def _mock_execute_hogql_with_stats_side_effect(*args, **kwargs):
+    """Like the plain side effect, but returns numeric counts for the match-rate stats query."""
+    query_response = _mock_execute_hogql_side_effect(*args, **kwargs)
+    if "countIf" in (query_response.hogql or ""):
+        query_response.results = [(10000, 8200)]
+    return query_response
+
+
+def _mock_execute_hogql_no_matching_rows_side_effect(*args, **kwargs):
+    """Like the plain side effect, but the sampled join finds no matching rows."""
+    query_response = _mock_execute_hogql_side_effect(*args, **kwargs)
+    if "countIf" not in (query_response.hogql or ""):
+        query_response.results = []
+    return query_response
+
+
+def _mock_execute_hogql_stats_error_side_effect(*args, **kwargs):
+    query_response = _mock_execute_hogql_side_effect(*args, **kwargs)
+    if "countIf" in (query_response.hogql or ""):
+        raise Exception("stats query failed")
+    return query_response
 
 
 class TestViewLinkValidation(APIBaseTest):
@@ -439,8 +463,65 @@ class TestViewLinkValidation(APIBaseTest):
                 self.assertIsNone(data["msg"])
                 self.assertHogQLEqual(
                     data["hogql"],
-                    f"SELECT validation.{payload['joining_table_key']} FROM {payload['source_table_name']} LIMIT 10",
+                    f"SELECT DISTINCT source_key, joining_key FROM (SELECT {payload['source_table_key']} AS source_key, validation.{payload['joining_table_key']} AS joining_key FROM {payload['source_table_name']} LIMIT 1000) LIMIT 5",
                 )
+
+    @patch(f"{PATH}.execute_hogql_query", side_effect=_mock_execute_hogql_no_matching_rows_side_effect)
+    def test_validate_warns_when_no_sampled_rows_match(self, _):
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/warehouse_view_links/validate/",
+            {
+                "source_table_name": "events",
+                "source_table_key": "uuid",
+                "joining_table_name": "persons",
+                "joining_table_key": "id",
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        data = response.json()
+        self.assertTrue(data["is_valid"])
+        self.assertEqual(data["msg"], NO_MATCHING_ROWS_MSG)
+
+    @patch(f"{PATH}.execute_hogql_query", side_effect=_mock_execute_hogql_with_stats_side_effect)
+    def test_validate_returns_columns_and_match_stats(self, _):
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/warehouse_view_links/validate/",
+            {
+                "source_table_name": "events",
+                "source_table_key": "uuid",
+                "joining_table_name": "persons",
+                "joining_table_key": "id",
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        data = response.json()
+        self.assertTrue(data["is_valid"])
+        self.assertEqual(data["results"], [["foo", "bar"]])
+        self.assertEqual(data["columns"], ["source_key", "joining_key"])
+        self.assertEqual(data["total_rows"], 10000)
+        self.assertEqual(data["matched_rows"], 8200)
+        self.assertEqual(data["match_rate"], 0.82)
+
+    @patch(f"{PATH}.execute_hogql_query", side_effect=_mock_execute_hogql_stats_error_side_effect)
+    def test_validate_stats_failure_does_not_break_validation(self, _):
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/warehouse_view_links/validate/",
+            {
+                "source_table_name": "events",
+                "source_table_key": "uuid",
+                "joining_table_name": "persons",
+                "joining_table_key": "id",
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.content)
+        data = response.json()
+        self.assertTrue(data["is_valid"])
+        self.assertIsNone(data["total_rows"])
+        self.assertIsNone(data["matched_rows"])
+        self.assertIsNone(data["match_rate"])
 
     @patch(f"{PATH}.execute_hogql_query", side_effect=_mock_execute_hogql_side_effect)
     def test_system_table_success(self, _):
@@ -460,7 +541,7 @@ class TestViewLinkValidation(APIBaseTest):
         self.assertIsNone(data["msg"])
         self.assertHogQLEqual(
             data["hogql"],
-            "SELECT validation.id FROM groups LIMIT 10",
+            "SELECT DISTINCT source_key, joining_key FROM (SELECT index AS source_key, validation.id AS joining_key FROM groups LIMIT 1000) LIMIT 5",
         )
 
     @patch(f"{PATH}.execute_hogql_query", side_effect=_mock_execute_hogql_side_effect)
@@ -483,7 +564,7 @@ class TestViewLinkValidation(APIBaseTest):
         self.assertIsNone(data["msg"])
         self.assertHogQLEqual(
             data["hogql"],
-            "SELECT validation.distinct_id FROM `postgres.foo.bar` AS postgres__foo__bar LIMIT 10",
+            "SELECT DISTINCT source_key, joining_key FROM (SELECT id AS source_key, validation.distinct_id AS joining_key FROM `postgres.foo.bar` AS postgres__foo__bar LIMIT 1000) LIMIT 5",
         )
 
     @patch(f"{PATH}.execute_hogql_query", side_effect=_mock_execute_hogql_side_effect)
@@ -504,7 +585,7 @@ class TestViewLinkValidation(APIBaseTest):
         self.assertIsNone(data["msg"])
         self.assertHogQLEqual(
             data["hogql"],
-            "SELECT validation.id FROM events LIMIT 10",
+            "SELECT DISTINCT source_key, joining_key FROM (SELECT upper(distinct_id) AS source_key, validation.id AS joining_key FROM events LIMIT 1000) LIMIT 5",
         )
 
     @patch(f"{PATH}.execute_hogql_query", side_effect=_mock_execute_hogql_side_effect)
@@ -525,7 +606,7 @@ class TestViewLinkValidation(APIBaseTest):
         self.assertIsNone(data["msg"])
         self.assertHogQLEqual(
             data["hogql"],
-            "SELECT validation.id FROM events LIMIT 10",
+            "SELECT DISTINCT source_key, joining_key FROM (SELECT toString(distinct_id) AS source_key, validation.id AS joining_key FROM events LIMIT 1000) LIMIT 5",
         )
 
     @patch(f"{PATH}.execute_hogql_query", side_effect=_mock_execute_hogql_side_effect)
@@ -546,7 +627,7 @@ class TestViewLinkValidation(APIBaseTest):
         self.assertIsNone(data["msg"])
         self.assertHogQLEqual(
             data["hogql"],
-            "SELECT validation.id FROM events LIMIT 10",
+            "SELECT DISTINCT source_key, joining_key FROM (SELECT toString(ifNull(distinct_id, '')) AS source_key, validation.id AS joining_key FROM events LIMIT 1000) LIMIT 5",
         )
 
     def test_nonexistent_field(self):
@@ -564,9 +645,12 @@ class TestViewLinkValidation(APIBaseTest):
         data = response.json()
         self.assertEqual(data["attr"], None)
         self.assertEqual(data["code"], "QueryError")
-        self.assertEqual(data["detail"], "Field not found: nonexistent_field")
+        self.assertEqual(data["detail"], "Unable to resolve field: nonexistent_field")
         self.assertEqual(data["type"], "query_error")
-        self.assertEqual(data["hogql"], "SELECT validation.id FROM events LIMIT 10")
+        self.assertEqual(
+            data["hogql"],
+            "SELECT DISTINCT source_key, joining_key FROM (SELECT nonexistent_field AS source_key, validation.id AS joining_key FROM events LIMIT 1000) LIMIT 5",
+        )
 
     def test_invalid_source_table(self):
         response = self.client.post(
@@ -707,7 +791,10 @@ class TestViewLinkValidation(APIBaseTest):
         self.assertEqual(data["attr"], None)
         self.assertEqual(data["code"], "CHQueryErrorIllegalTypeOfArgument")
         self.assertEqual(data["type"], "query_error")
-        self.assertEqual(data["hogql"], "SELECT validation.id FROM events LIMIT 10")
+        self.assertEqual(
+            data["hogql"],
+            "SELECT DISTINCT source_key, joining_key FROM (SELECT timestamp AS source_key, validation.id AS joining_key FROM events LIMIT 1000) LIMIT 5",
+        )
 
     @patch(f"{PATH}.execute_hogql_query", side_effect=_mock_execute_hogql_side_effect)
     def test_ambiguous_keys(self, _):
@@ -730,7 +817,7 @@ class TestViewLinkValidation(APIBaseTest):
         self.assertIsNone(data["msg"])
         self.assertHogQLEqual(
             data["hogql"],
-            "SELECT validation.email FROM `postgres.test.foo` AS postgres__test__foo LIMIT 10",
+            "SELECT DISTINCT source_key, joining_key FROM (SELECT email AS source_key, validation.email AS joining_key FROM `postgres.test.foo` AS postgres__test__foo LIMIT 1000) LIMIT 5",
         )
 
     @patch(f"{PATH}.execute_hogql_query", side_effect=_mock_execute_hogql_side_effect)
@@ -752,5 +839,5 @@ class TestViewLinkValidation(APIBaseTest):
         self.assertIsNone(data["msg"])
         self.assertHogQLEqual(
             data["hogql"],
-            "SELECT validation.distinct_id FROM `postgres.test.user` AS postgres__test__user LIMIT 10",
+            "SELECT DISTINCT source_key, joining_key FROM (SELECT lower(email) AS source_key, validation.distinct_id AS joining_key FROM `postgres.test.user` AS postgres__test__user LIMIT 1000) LIMIT 5",
         )

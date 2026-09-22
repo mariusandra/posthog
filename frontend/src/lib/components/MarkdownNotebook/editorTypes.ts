@@ -31,7 +31,9 @@ export type RestoreTextSelectionRequest = {
     textRanges: RestoreTextRange[]
 }
 
-export type RestoreSelectionRequest = RestoreInlineSelectionRequest | RestoreTextSelectionRequest
+export type RestoreSelectionRequest = (RestoreInlineSelectionRequest | RestoreTextSelectionRequest) & {
+    preserveViewport?: boolean
+}
 
 export type InsertCommand = {
     key: string
@@ -40,6 +42,9 @@ export type InsertCommand = {
     description?: string
     aliases?: string[]
     icon?: ReactNode
+    /** Short tag drawn after the label, for calling out a cell people have not met yet. Not
+     * searchable: a badge is about the menu, not about what the cell does. */
+    badge?: string
     closeOnRun?: boolean
     disabled?: boolean
     run: (targetNodeId: string) => void
@@ -58,6 +63,9 @@ export type InsertMenuState = {
     mode?: 'tools' | 'ai'
     detached?: boolean
     removeNodeOnClose?: boolean
+    /** Set with `removeNodeOnClose`: the block pushed onto its own card to make room for the
+     * inserted one. Closing the menu without inserting rejoins it to the card it came from. */
+    rejoinNodeIdOnClose?: string
     source?: 'slash' | 'selection'
     selectedMarkdown?: string
     selectedRefId?: string

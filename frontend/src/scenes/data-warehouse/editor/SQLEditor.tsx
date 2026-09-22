@@ -3,17 +3,18 @@ import { BindLogic, useActions, useValues } from 'kea'
 import type { editor as importedEditor } from 'monaco-editor'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
-import { IconBook, IconChevronDown, IconDownload, IconX } from '@posthog/icons'
+import { IconBook, IconChevronDown, IconDownload, IconNotebook, IconX } from '@posthog/icons'
 import { LemonModal, Spinner } from '@posthog/lemon-ui'
 
 import { AccessControlAction } from 'lib/components/AccessControlAction'
-import { FEATURE_FLAGS } from 'lib/constants'
+import { useDebouncedValue } from 'lib/hooks/useDebouncedValue'
 import { useOnMountEffect } from 'lib/hooks/useOnMountEffect'
 import { LemonButton } from 'lib/lemon-ui/LemonButton'
 import { LemonMenuOverlay } from 'lib/lemon-ui/LemonMenu/LemonMenu'
 import { TreeDataItem } from 'lib/lemon-ui/LemonTree/LemonTree'
 import { useAttachedLogic } from 'lib/logic/scenes/useAttachedLogic'
 import { getAccessControlDisabledReason } from 'lib/utils/accessControlUtils'
+import { urls } from 'scenes/urls'
 
 import { AccessControlObjectModal } from '~/layout/navigation-3000/sidepanel/panels/access_control/AccessControlObjectModal'
 import { DatabaseTree } from '~/layout/panel-layout/DatabaseTree/DatabaseTree'
@@ -31,11 +32,16 @@ import {
 } from '~/queries/nodes/DataVisualization/dataVisualizationLogic'
 import { displayLogic } from '~/queries/nodes/DataVisualization/displayLogic'
 import { applyDataVisualizationQueryUpdate } from '~/queries/nodes/DataVisualization/queryUpdateUtils'
+import { ProductKey } from '~/queries/schema/schema-general'
 import { AccessControlLevel, AccessControlResourceType } from '~/types'
 
+import { MaterializationLoading } from 'products/data_warehouse/frontend/shared/components/MaterializationLoading'
+import { MaterializationRunActions } from 'products/data_warehouse/frontend/shared/components/MaterializationRunActions'
 import { useAttachedContext } from 'products/posthog_ai/frontend/api/logics'
 
+import { ExpressionModal } from '../ExpressionModal'
 import { dataWarehouseViewsLogic } from '../saved_queries/dataWarehouseViewsLogic'
+import { materializationJobsLogic } from '../saved_queries/materializationJobsLogic'
 import { ViewLinkModal } from '../ViewLinkModal'
 import { connectionSelectorLogic } from './connectionSelectorLogic'
 import { editorSceneLogic } from './editorSceneLogic'
@@ -47,7 +53,7 @@ import { outputPaneLogic } from './outputPaneLogic'
 import { QueryHistoryModal } from './QueryHistoryModal'
 import { QueryWindow } from './QueryWindow'
 import { sqlEditorLogic } from './sqlEditorLogic'
-import { SQLEditorMode } from './sqlEditorModes'
+import { SQLEditorMode, isEmbeddedSQLEditorMode } from './sqlEditorModes'
 
 export enum SQLEditorPanel {
     Full = 'full',
@@ -56,6 +62,7 @@ export enum SQLEditorPanel {
 }
 
 const VARIABLE_QUERY_SYNC_DEBOUNCE_MS = 150
+const MAX_TOOL_CONTEXT_DEBOUNCE_MS = 150
 
 interface SQLEditorProps {
     tabId?: string
@@ -64,6 +71,8 @@ interface SQLEditorProps {
     defaultShowDatabaseTree?: boolean
     /** Extra top-level sections for the database tree, owned by the embedder — see QueryDatabase. */
     extraTreeSections?: TreeDataItem[]
+    /** Which product embeds this editor. Only used to attribute analytics events to a host. */
+    hostProduct?: ProductKey
     panel?: SQLEditorPanel
     showOutputToolbar?: boolean
     onRunQuery?: () => void
@@ -73,8 +82,12 @@ interface SQLEditorProps {
     /** With onRunQuery: flips the run button to Cancel while runQueryLoading. */
     onCancelQuery?: () => void
     cancelQueryLoading?: boolean
+    /** Drop the toolbar's run button, for hosts that offer the run affordance themselves. */
+    hideRunButton?: boolean
     onShareTab?: () => void
     queryPaneDefaultHeight?: number
+    /** Floor for a dragged query pane. Notebook cells pass a smaller one than the scene. */
+    queryPaneMinHeight?: number
     /** Whether the query pane's code editor may grab focus on mount. Defaults to true. */
     autoFocusQueryPane?: boolean
 }
@@ -85,6 +98,7 @@ export function SQLEditor({
     showDatabaseTree,
     defaultShowDatabaseTree = true,
     extraTreeSections,
+    hostProduct,
     panel = SQLEditorPanel.Full,
     showOutputToolbar = true,
     onRunQuery,
@@ -93,13 +107,16 @@ export function SQLEditor({
     runQueryTooltip,
     onCancelQuery,
     cancelQueryLoading,
+    hideRunButton,
     onShareTab,
     queryPaneDefaultHeight,
+    queryPaneMinHeight,
     autoFocusQueryPane,
 }: SQLEditorProps): JSX.Element {
     const ref = useRef(null)
     const navigatorRef = useRef(null)
     const queryPaneRef = useRef(null)
+    const biEditorRef = useRef(null)
     const sidebarRef = useRef(null)
     const databaseTreeRef = useRef(null)
     const [hasShownDatabaseTree, setHasShownDatabaseTree] = useState(defaultShowDatabaseTree)
@@ -111,41 +128,54 @@ export function SQLEditor({
     const showDatabaseTreePanel = showQueryPanel && shouldShowDatabaseTree
     const showFullSceneModals = mode === SQLEditorMode.FullScene
 
-    const editorSizingLogicProps = useMemo(
-        () => ({
+    const editorSizingLogicProps = useMemo(() => {
+        // The scene keeps one shared set of pane sizes across its tabs. Notebook cells each get their
+        // own, so resizing one cell's editor doesn't resize every other SQL cell in the notebook.
+        const sizingKey = isEmbeddedSQLEditorMode(mode) ? `embedded:${tabId ?? 'new'}` : 'scene'
+        const resizerKey = (name: string): string => (sizingKey === 'scene' ? name : `${name}:${sizingKey}`)
+
+        return {
+            logicKey: sizingKey,
             editorSceneRef: ref,
             navigatorRef,
             sidebarRef,
             databaseTreeRef,
             queryPaneDefaultHeight,
+            queryPaneMinHeight,
+            biEditorResizerProps: {
+                containerRef: biEditorRef,
+                logicKey: 'bi-editor-pane',
+                placement: 'bottom' as const,
+                persistent: true,
+                persistPrefix: 'v1',
+            },
             sourceNavigatorResizerProps: {
                 containerRef: navigatorRef,
-                logicKey: 'source-navigator',
+                logicKey: resizerKey('source-navigator'),
                 placement: 'right' as const,
             },
             sidebarResizerProps: {
                 containerRef: sidebarRef,
-                logicKey: 'sidebar-resizer',
+                logicKey: resizerKey('sidebar-resizer'),
                 placement: 'right' as const,
             },
             queryPaneResizerProps: {
                 containerRef: queryPaneRef,
-                logicKey: 'query-pane',
+                logicKey: resizerKey('query-pane'),
                 placement: 'bottom' as const,
             },
             databaseTreeResizerProps: {
                 containerRef: databaseTreeRef,
-                logicKey: 'database-tree',
+                logicKey: resizerKey('database-tree'),
                 placement: 'right' as const,
                 persistent: true,
                 marginTop: mode === SQLEditorMode.FullScene ? 8 : 0,
             },
-        }),
-        [mode, queryPaneDefaultHeight]
-    )
+        }
+    }, [mode, tabId, queryPaneDefaultHeight, queryPaneMinHeight])
 
     const [monacoAndEditor, setMonacoAndEditor] = useState(
-        null as [Monaco, importedEditor.IStandaloneCodeEditor] | null
+        null as [Monaco, importedEditor.IStandaloneCodeEditor | null] | null
     )
     const [monaco, editor] = monacoAndEditor ?? []
 
@@ -154,6 +184,21 @@ export function SQLEditor({
             setMonacoAndEditor(null)
         }
     })
+
+    // The SQL/BI view toggle and the sidebar "Query" action tear the editor widget down and
+    // rebuild it while this scene stays mounted. Nothing else clears the cached reference, so the
+    // logic keeps a disposed editor as a prop. Drop only the editor the instant Monaco disposes it,
+    // and keep the Monaco namespace: `Uri` and `editor.createModel`/`getModel` stay valid after the
+    // widget is gone, so createTab can still prepare a tab before the next editor mounts.
+    useEffect(() => {
+        if (!editor) {
+            return
+        }
+        const disposable = editor.onDidDispose(() =>
+            setMonacoAndEditor((current) => (current ? [current[0], null] : null))
+        )
+        return () => disposable.dispose()
+    }, [editor])
 
     const logic = sqlEditorLogic({
         tabId: tabId || '',
@@ -243,6 +288,7 @@ export function SQLEditor({
                                                             databaseTreeRef={databaseTreeRef}
                                                             tabId={tabId || ''}
                                                             extraTreeSections={extraTreeSections}
+                                                            embedded={isEmbeddedSQLEditorMode(mode)}
                                                         />
                                                     )}
                                                     <div
@@ -256,6 +302,7 @@ export function SQLEditor({
                                                             tabId={tabId || ''}
                                                             showDatabaseTree={showDatabaseTreePanel}
                                                             onShowDatabaseTree={() => setHasShownDatabaseTree(true)}
+                                                            hostProduct={hostProduct}
                                                             showQueryPanel={showQueryPanel}
                                                             showOutputPanel={showOutputPanel}
                                                             onSetMonacoAndEditor={(nextMonaco, nextEditor) =>
@@ -267,6 +314,7 @@ export function SQLEditor({
                                                             runQueryTooltip={runQueryTooltip}
                                                             onCancelQuery={onCancelQuery}
                                                             cancelQueryLoading={cancelQueryLoading}
+                                                            hideRunButton={hideRunButton}
                                                             onShareTab={onShareTab}
                                                             autoFocusQueryPane={autoFocusQueryPane}
                                                         />
@@ -280,6 +328,7 @@ export function SQLEditor({
                                             <MaterializationModal tabId={tabId || ''} />
                                             <AccessControlModal />
                                             <ViewLinkModal />
+                                            <ExpressionModal />
                                         </>
                                     ) : null}
                                 </BindLogic>
@@ -304,28 +353,68 @@ function ViewLoadingOverlay(): JSX.Element | null {
     )
 }
 
+function OpenModelButton({ viewId, onClose }: { viewId: string; onClose: () => void }): JSX.Element {
+    const { upstream, upstreamLoading } = useValues(sqlEditorLogic)
+    const { hasMaterializationChanges, savingMaterialization } = useValues(materializationJobsLogic({ viewId }))
+    const nodeId =
+        upstream?.modelId === viewId ? upstream.nodes.find((node) => node.saved_query_id === viewId)?.id : undefined
+    return (
+        <LemonButton
+            type="secondary"
+            size="small"
+            to={nodeId ? urls.nodeDetail(nodeId, 'materialization') : undefined}
+            onClick={onClose}
+            disabledReason={
+                hasMaterializationChanges || savingMaterialization
+                    ? 'Save or discard your changes first'
+                    : !nodeId
+                      ? upstreamLoading
+                          ? 'Loading model'
+                          : 'Model is not available'
+                      : undefined
+            }
+        >
+            Open model
+        </LemonButton>
+    )
+}
+
 function MaterializationModal({ tabId }: { tabId: string }): JSX.Element {
     const { materializationModalOpen, materializationModalView, viewLoading } = useValues(sqlEditorLogic)
     const { closeMaterializationModal } = useActions(sqlEditorLogic)
+    // Cadence and refresh mode are drafts that only Save writes, and this modal is the only place
+    // they are mounted, so closing the modal throws them away. Keyed on an empty string while no
+    // view is open, which builds an inert instance because every request in that logic is reached
+    // through a viewId guard.
+    const { hasMaterializationChanges } = useValues(
+        materializationJobsLogic({ viewId: materializationModalView?.id ?? '' })
+    )
 
     return (
         <LemonModal
-            title={materializationModalView ? `Materialize ${materializationModalView.name}` : 'Materialize view'}
+            title={materializationModalView?.name ?? 'Model settings'}
+            footer={
+                materializationModalView && !viewLoading ? (
+                    <div className="flex flex-wrap justify-between items-center gap-4 w-full">
+                        <OpenModelButton viewId={materializationModalView.id} onClose={closeMaterializationModal} />
+                        <div className="flex flex-wrap items-center gap-2">
+                            <MaterializationRunActions viewId={materializationModalView.id} />
+                        </div>
+                    </div>
+                ) : undefined
+            }
             isOpen={materializationModalOpen}
             onClose={closeMaterializationModal}
+            hasUnsavedInput={hasMaterializationChanges}
             width={960}
         >
-            <div className="max-h-[75vh] overflow-auto">
+            <div className="min-h-[min(60vh,560px)]">
                 {viewLoading ? (
-                    <div className="flex min-h-64 items-center justify-center">
-                        <Spinner className="text-2xl" />
-                    </div>
+                    <MaterializationLoading />
                 ) : materializationModalView ? (
-                    <QueryInfo tabId={tabId} view={materializationModalView} />
+                    <QueryInfo key={materializationModalView.id} tabId={tabId} view={materializationModalView} tabbed />
                 ) : (
-                    <div className="flex min-h-64 items-center justify-center">
-                        <Spinner className="text-2xl" />
-                    </div>
+                    <MaterializationLoading />
                 )}
             </div>
         </LemonModal>
@@ -347,15 +436,22 @@ function AccessControlModal(): JSX.Element | null {
             resource={editingAccessControlObject.resource}
             resource_id={editingAccessControlObject.resourceId}
             title={editingAccessControlObject.name}
-            description={`Control who can query this ${
-                editingAccessControlObject.resource === AccessControlResourceType.WarehouseTable ? 'table' : 'view'
-            }. Users without access won't see it and queries referencing it will fail for them.`}
+            description={
+                editingAccessControlObject.resource === AccessControlResourceType.ExternalDataSource
+                    ? 'Control who can manage this source. Access set here also applies to its tables, unless a table has access rules of its own.'
+                    : `Control who can query this ${
+                          editingAccessControlObject.resource === AccessControlResourceType.WarehouseTable
+                              ? 'table'
+                              : 'view'
+                      }. Users without access won't see it and queries referencing it will fail for them.`
+            }
         />
     )
 }
 
 function SQLEditorSceneTitle(): JSX.Element | null {
-    const { titleSectionProps, updateInsightButtonEnabled, saveAsMenuItems } = useValues(editorSceneLogic)
+    const { titleSectionProps, updateInsightButtonEnabled, saveAsMenuItems, notebooksLoading } =
+        useValues(editorSceneLogic)
     const {
         queryInput,
         editingView,
@@ -366,32 +462,46 @@ function SQLEditorSceneTitle(): JSX.Element | null {
         inProgressViewEdits,
         isSourceQueryLastRun,
         isMultiQuery,
-        featureFlags,
+        selectedConnectionId,
     } = useValues(sqlEditorLogic)
-    const { openHistoryModal } = useActions(editorSceneLogic)
+    const { convertToNotebook, openHistoryModal } = useActions(editorSceneLogic)
     const {
-        updateView,
+        reviewViewUpdate,
         updateInsight,
         closeEditingObject,
         saveAsInsight,
         saveAsView,
         saveAsEndpoint,
+        saveAsMetric,
+        updateEditingMetric,
+        setEditingMetricName,
         setSourceQuery,
         setSuggestedQueryInput,
         reportAIQueryPromptOpen,
         setEditingInsightName,
         setEditingInsightDescription,
     } = useActions(sqlEditorLogic)
+    const { editingMetricName, metricUpdating } = useValues(sqlEditorLogic)
     const { response, responseError, responseLoading } = useValues(dataNodeLogic)
     const { updatingDataWarehouseSavedQuery } = useValues(dataWarehouseViewsLogic)
 
-    useAttachedContext([
-        {
-            type: 'sql_editor_state',
-            value: JSON.stringify(getExecuteSqlToolContext(queryInput, sourceQuery)),
-            label: 'Current query',
-        },
-    ])
+    const debouncedQueryInput = useDebouncedValue(queryInput, MAX_TOOL_CONTEXT_DEBOUNCE_MS)
+    const debouncedSourceQuery = useDebouncedValue(sourceQuery, MAX_TOOL_CONTEXT_DEBOUNCE_MS)
+    const executeSqlToolContext = useMemo(
+        () => getExecuteSqlToolContext(debouncedQueryInput, debouncedSourceQuery),
+        [debouncedQueryInput, debouncedSourceQuery]
+    )
+    const attachedContextItems = useMemo(
+        () => [
+            {
+                type: 'sql_editor_state' as const,
+                value: JSON.stringify(executeSqlToolContext),
+                label: 'Current query',
+            },
+        ],
+        [executeSqlToolContext]
+    )
+    useAttachedContext(attachedContextItems)
 
     const saveAsViewAccessDisabledReason = getAccessControlDisabledReason(
         AccessControlResourceType.WarehouseObjects,
@@ -400,6 +510,16 @@ function SQLEditorSceneTitle(): JSX.Element | null {
 
     const saveAsEndpointAccessDisabledReason = getAccessControlDisabledReason(
         AccessControlResourceType.Endpoint,
+        AccessControlLevel.Editor
+    )
+
+    // A direct connection's table names only resolve while it is selected, and an endpoint serves data from PostHog.
+    const saveAsEndpointDisabledReason = selectedConnectionId
+        ? "Endpoints can't query a direct connection. Switch the connection to PostHog (ClickHouse) and query a synced table instead."
+        : saveAsEndpointAccessDisabledReason
+
+    const continueInNotebookAccessDisabledReason = getAccessControlDisabledReason(
+        AccessControlResourceType.Notebook,
         AccessControlLevel.Editor
     )
 
@@ -418,28 +538,39 @@ function SQLEditorSceneTitle(): JSX.Element | null {
                         return
                     }
 
+                    if (item.action === 'metric') {
+                        saveAsMetric()
+                        return
+                    }
+
                     saveAsView()
                 },
                 accessDisabledReason:
                     item.action === 'view'
                         ? saveAsViewAccessDisabledReason
                         : item.action === 'endpoint'
-                          ? saveAsEndpointAccessDisabledReason
+                          ? saveAsEndpointDisabledReason
                           : undefined,
             })),
         [
             saveAsEndpoint,
             saveAsInsight,
+            saveAsMetric,
             saveAsMenuItems.secondary,
             saveAsView,
             saveAsViewAccessDisabledReason,
-            saveAsEndpointAccessDisabledReason,
+            saveAsEndpointDisabledReason,
         ]
     )
 
     const onPrimarySaveClick = (): void => {
         if (saveAsMenuItems.primary.action === 'endpoint') {
             saveAsEndpoint()
+            return
+        }
+
+        if (saveAsMenuItems.primary.action === 'metric') {
+            saveAsMetric()
             return
         }
 
@@ -515,6 +646,21 @@ function SQLEditorSceneTitle(): JSX.Element | null {
         : editingView
           ? 'Close this view and reset the SQL editor to an unsaved query without clearing your SQL or visualization settings.'
           : 'Reset the SQL editor to an unsaved query without clearing your SQL or visualization settings.'
+    const continueInNotebookButton = (
+        <LemonButton
+            type="secondary"
+            size="small"
+            icon={<IconNotebook />}
+            onClick={() => convertToNotebook()}
+            loading={notebooksLoading}
+            disabledReason={
+                queryInput?.trim() ? continueInNotebookAccessDisabledReason : 'Write a SQL query before continuing'
+            }
+            data-attr="sql-editor-continue-in-notebook-button"
+        >
+            Continue in a notebook
+        </LemonButton>
+    )
 
     return (
         <>
@@ -532,7 +678,7 @@ function SQLEditorSceneTitle(): JSX.Element | null {
                 })}
                 maxToolProps={{
                     identifier: 'execute_sql',
-                    context: getExecuteSqlToolContext(queryInput, sourceQuery),
+                    context: executeSqlToolContext,
                     contextDescription: {
                         text: 'Current query',
                         icon: iconForType('sql_editor'),
@@ -574,7 +720,7 @@ function SQLEditorSceneTitle(): JSX.Element | null {
                                 >
                                     <LemonButton
                                         onClick={() =>
-                                            updateView({
+                                            reviewViewUpdate({
                                                 id: editingView.id,
                                                 query: {
                                                     ...sourceQuery.source,
@@ -608,17 +754,13 @@ function SQLEditorSceneTitle(): JSX.Element | null {
                                                                     saveAsViewAccessDisabledReason,
                                                                 onClick: () => saveAsView(),
                                                             },
-                                                            ...(featureFlags[FEATURE_FLAGS.ENDPOINTS]
-                                                                ? [
-                                                                      {
-                                                                          label: 'Save as endpoint...',
-                                                                          disabledReason:
-                                                                              saveAsDisabledReason ??
-                                                                              saveAsEndpointAccessDisabledReason,
-                                                                          onClick: () => saveAsEndpoint(),
-                                                                      },
-                                                                  ]
-                                                                : []),
+                                                            {
+                                                                label: 'Save as endpoint...',
+                                                                disabledReason:
+                                                                    saveAsDisabledReason ??
+                                                                    saveAsEndpointDisabledReason,
+                                                                onClick: () => saveAsEndpoint(),
+                                                            },
                                                         ]}
                                                     />
                                                 ),
@@ -639,17 +781,16 @@ function SQLEditorSceneTitle(): JSX.Element | null {
                             </>
                         ) : editingInsight ? (
                             <>
-                                {featureFlags[FEATURE_FLAGS.SQL_EDITOR_QUERY_HISTORY] && (
-                                    <LemonButton
-                                        onClick={() => openHistoryModal()}
-                                        icon={<IconBook />}
-                                        type="secondary"
-                                        size="small"
-                                        data-attr="sql-editor-insight-history-button"
-                                    >
-                                        History
-                                    </LemonButton>
-                                )}
+                                <LemonButton
+                                    onClick={() => openHistoryModal()}
+                                    icon={<IconBook />}
+                                    type="secondary"
+                                    size="small"
+                                    data-attr="sql-editor-insight-history-button"
+                                >
+                                    History
+                                </LemonButton>
+                                {continueInNotebookButton}
                                 <LemonButton
                                     disabledReason={
                                         !isSourceQueryLastRun
@@ -664,6 +805,7 @@ function SQLEditorSceneTitle(): JSX.Element | null {
                                     onClick={() => updateInsight()}
                                     sideAction={{
                                         icon: <IconChevronDown />,
+                                        'data-attr': 'sql-editor-save-options-button',
                                         dropdown: {
                                             placement: 'bottom-end',
                                             overlay: (
@@ -680,17 +822,12 @@ function SQLEditorSceneTitle(): JSX.Element | null {
                                                                 saveAsDisabledReason ?? saveAsViewAccessDisabledReason,
                                                             onClick: () => saveAsView(),
                                                         },
-                                                        ...(featureFlags[FEATURE_FLAGS.ENDPOINTS]
-                                                            ? [
-                                                                  {
-                                                                      label: 'Save as endpoint...',
-                                                                      disabledReason:
-                                                                          saveAsDisabledReason ??
-                                                                          saveAsEndpointAccessDisabledReason,
-                                                                      onClick: () => saveAsEndpoint(),
-                                                                  },
-                                                              ]
-                                                            : []),
+                                                        {
+                                                            label: 'Save as endpoint...',
+                                                            disabledReason:
+                                                                saveAsDisabledReason ?? saveAsEndpointDisabledReason,
+                                                            onClick: () => saveAsEndpoint(),
+                                                        },
                                                     ]}
                                                 />
                                             ),
@@ -709,37 +846,77 @@ function SQLEditorSceneTitle(): JSX.Element | null {
                                     tooltip={closeObjectTooltip}
                                 />
                             </>
+                        ) : editingMetricName ? (
+                            <>
+                                <LemonButton
+                                    type="primary"
+                                    size="small"
+                                    onClick={() => updateEditingMetric()}
+                                    loading={metricUpdating}
+                                    disabledReason={saveAsDisabledReason}
+                                    data-attr="sql-editor-update-metric"
+                                    sideAction={{
+                                        icon: <IconChevronDown />,
+                                        dropdown: {
+                                            placement: 'bottom-end',
+                                            overlay: (
+                                                <LemonMenuOverlay
+                                                    items={secondarySaveMenuItems.map((item) => ({
+                                                        ...item,
+                                                        disabledReason:
+                                                            saveAsDisabledReason ?? item.accessDisabledReason,
+                                                    }))}
+                                                />
+                                            ),
+                                        },
+                                    }}
+                                >
+                                    Update metric
+                                </LemonButton>
+                                <LemonButton
+                                    onClick={() => setEditingMetricName(null)}
+                                    icon={<IconX />}
+                                    type="tertiary"
+                                    size="small"
+                                    aria-label="Stop editing metric"
+                                    tooltip="Stop editing this metric and start a new query"
+                                />
+                            </>
                         ) : (
-                            <LemonButton
-                                type="primary"
-                                size="small"
-                                onClick={onPrimarySaveClick}
-                                disabledReason={
-                                    saveAsDisabledReason ??
-                                    (saveAsMenuItems.primary.action === 'endpoint'
-                                        ? saveAsEndpointAccessDisabledReason
-                                        : saveAsMenuItems.primary.action === 'view'
-                                          ? saveAsViewAccessDisabledReason
-                                          : undefined)
-                                }
-                                sideAction={{
-                                    icon: <IconChevronDown />,
-                                    'data-attr': 'sql-editor-save-options-button',
-                                    dropdown: {
-                                        placement: 'bottom-end',
-                                        overlay: (
-                                            <LemonMenuOverlay
-                                                items={secondarySaveMenuItems.map((item) => ({
-                                                    ...item,
-                                                    disabledReason: saveAsDisabledReason ?? item.accessDisabledReason,
-                                                }))}
-                                            />
-                                        ),
-                                    },
-                                }}
-                            >
-                                {saveAsMenuItems.primary.label}
-                            </LemonButton>
+                            <>
+                                {saveAsMenuItems.primary.action === 'insight' && continueInNotebookButton}
+                                <LemonButton
+                                    type="primary"
+                                    size="small"
+                                    onClick={onPrimarySaveClick}
+                                    disabledReason={
+                                        saveAsDisabledReason ??
+                                        (saveAsMenuItems.primary.action === 'endpoint'
+                                            ? saveAsEndpointDisabledReason
+                                            : saveAsMenuItems.primary.action === 'view'
+                                              ? saveAsViewAccessDisabledReason
+                                              : undefined)
+                                    }
+                                    sideAction={{
+                                        icon: <IconChevronDown />,
+                                        'data-attr': 'sql-editor-save-options-button',
+                                        dropdown: {
+                                            placement: 'bottom-end',
+                                            overlay: (
+                                                <LemonMenuOverlay
+                                                    items={secondarySaveMenuItems.map((item) => ({
+                                                        ...item,
+                                                        disabledReason:
+                                                            saveAsDisabledReason ?? item.accessDisabledReason,
+                                                    }))}
+                                                />
+                                            ),
+                                        },
+                                    }}
+                                >
+                                    {saveAsMenuItems.primary.label}
+                                </LemonButton>
+                            </>
                         )}
                     </div>
                 }

@@ -7,9 +7,10 @@
  * PostHog API - generated
  * OpenAPI spec version: 1.0.0
  */
-export type PropertyGroupOperatorApi = (typeof PropertyGroupOperatorApi)[keyof typeof PropertyGroupOperatorApi]
+export type PropertyGroupOperatorEnumApi =
+    (typeof PropertyGroupOperatorEnumApi)[keyof typeof PropertyGroupOperatorEnumApi]
 
-export const PropertyGroupOperatorApi = {
+export const PropertyGroupOperatorEnumApi = {
     And: 'AND',
     Or: 'OR',
 } as const
@@ -19,6 +20,10 @@ export const PropertyGroupOperatorApi = {
  * * `is_not` - is_not
  * * `icontains` - icontains
  * * `not_icontains` - not_icontains
+ * * `starts_with` - starts_with
+ * * `not_starts_with` - not_starts_with
+ * * `ends_with` - ends_with
+ * * `not_ends_with` - not_ends_with
  * * `regex` - regex
  * * `not_regex` - not_regex
  * * `gt` - gt
@@ -40,6 +45,10 @@ export const PropertyItemOperatorEnumApi = {
     IsNot: 'is_not',
     Icontains: 'icontains',
     NotIcontains: 'not_icontains',
+    StartsWith: 'starts_with',
+    NotStartsWith: 'not_starts_with',
+    EndsWith: 'ends_with',
+    NotEndsWith: 'not_ends_with',
     Regex: 'regex',
     NotRegex: 'not_regex',
     Gt: 'gt',
@@ -182,7 +191,7 @@ export interface PropertyApi {
      *
      * * `AND` - AND
      * * `OR` - OR */
-    type?: PropertyGroupOperatorApi
+    type?: PropertyGroupOperatorEnumApi
     values: PropertyItemApi[]
 }
 
@@ -234,8 +243,8 @@ export interface PatchedPersonRecordApi {
 }
 
 export interface PersonDeletePropertyRequestApi {
-    /** The property key to remove from this person. */
-    $unset: string
+    /** A property key, or a list of property keys, to remove from this person. */
+    $unset: string | string[]
 }
 
 export interface MessageAssetApi {
@@ -249,19 +258,19 @@ export interface MessageAssetApi {
     function_name: string
     /** The batch run this email belongs to, for batch-triggered workflows. Empty for event-triggered runs. */
     parent_run_id: string
-    /** Asset kind. Currently always 'email'. */
+    /** Message channel this asset was sent on: 'email' or 'push'. The per-person endpoints return one channel each. */
     kind: string
     /** The recipient's distinct_id. */
     distinct_id: string
     /** The recipient's person UUID, if resolved. */
     person_id: string
-    /** The recipient email address. */
+    /** Who the message went to: the email address for 'email', or the recipient's distinct ID for 'push'. */
     recipient: string
-    /** The email subject line. */
+    /** The email subject line, or the push notification title. */
     subject: string
-    /** Delivery status at capture time. Currently always 'sent'. */
+    /** Delivery status at capture time. Currently always 'sent' - only delivered messages are captured. */
     status: string
-    /** When the email was sent. */
+    /** When the message was sent. */
     sent_at: string
 }
 
@@ -308,14 +317,39 @@ export type PersonBulkDeleteResponseApiDeletionErrorsItem = { [key: string]: unk
 export interface PersonBulkDeleteResponseApi {
     /** Number of persons matched by the provided IDs or distinct IDs. */
     persons_found: number
-    /** Number of person records deleted from the database. 0 if keep_person was true. */
+    /** Number of person records deleted from the database during this request. 0 if keep_person was true or if the deletion was queued (see persons_queued_for_deletion). */
     persons_deleted: number
+    /** Number of persons queued for deletion in the background. Their person records and distinct IDs are removed shortly after the request completes. 0 if keep_person was true. */
+    persons_queued_for_deletion: number
     /** Whether event deletion was requested for the matched persons. If a deletion was already queued for a person, it will not be duplicated. */
     events_queued_for_deletion: boolean
     /** Whether recording deletion was requested for the matched persons. If a deletion was already queued for a person, it will not be duplicated. */
     recordings_queued_for_deletion: boolean
-    /** Persons that could not be deleted. Each entry contains 'person_uuid'. Contact support if this persists. */
+    /** Persons whose deletion did not fully complete in this request. Each entry contains 'person_uuid' and 'step', the deletion step that failed for that person. Failures are reported here rather than as an error status, so a 202 with entries means those persons were not deleted and the request should be retried for them, except entries whose step is 'log_activity': that person was deleted, but the activity log entry was not written. Always empty when the deletion was queued (see persons_queued_for_deletion). Contact support if this persists. */
     deletion_errors?: PersonBulkDeleteResponseApiDeletionErrorsItem[]
+}
+
+/**
+ * Minimal serializer for cohort references, read by the person cohorts endpoint.
+ */
+export interface CohortMinimalApi {
+    readonly id: number
+    /**
+     * @maxLength 400
+     * @nullable
+     */
+    name?: string | null
+    /**
+     * @minimum -2147483648
+     * @maximum 2147483647
+     * @nullable
+     */
+    count?: number | null
+}
+
+export interface PersonCohortsResponseApi {
+    /** Cohorts the person currently belongs to. */
+    results: CohortMinimalApi[]
 }
 
 export interface AsyncDeletionStatusApi {
@@ -399,6 +433,10 @@ export interface PersonPropertiesAtTimeResponseApi {
 
 export type PersonsListParams = {
     /**
+     * Names the ClickHouse query this request runs. Send the same id to `DELETE /api/projects/:project_id/query/:client_query_id/` to stop a search that is still running. Up to 128 characters.
+     */
+    client_query_id?: string
+    /**
      * Filter list by distinct id.
      */
     distinct_id?: string
@@ -420,7 +458,7 @@ export type PersonsListParams = {
      */
     properties?: PropertyApi[]
     /**
-     * Search persons, either by email (full text search) or distinct_id (exact match).
+     * Search persons by email, name, person ID, or distinct ID. Partial values match. When the term is a complete email address or UUID that exactly matches a distinct ID or person ID, only that person is returned.
      */
     search?: string
 }
@@ -502,13 +540,13 @@ export type PersonsEmailsListParams = {
     before?: string
     format?: PersonsEmailsListFormat
     /**
-     * Maximum number of emails to return (1-500, default 50).
+     * Maximum number of assets to return (1-500, default 50).
      * @minimum 1
      * @maximum 500
      */
     limit?: number
     /**
-     * Number of emails to skip, for pagination.
+     * Number of assets to skip, for pagination.
      * @minimum 0
      */
     offset?: number
@@ -529,6 +567,39 @@ export type PersonsPropertiesTimelineRetrieveFormat =
     (typeof PersonsPropertiesTimelineRetrieveFormat)[keyof typeof PersonsPropertiesTimelineRetrieveFormat]
 
 export const PersonsPropertiesTimelineRetrieveFormat = {
+    Csv: 'csv',
+    Json: 'json',
+} as const
+
+export type PersonsPushNotificationsListParams = {
+    /**
+     * Start of the time range, matched on sent time. Relative ('-30d', '-24h') or ISO 8601. Defaults to -30d (the retention window) — bounds the ClickHouse partition scan.
+     * @minLength 1
+     */
+    after?: string
+    /**
+     * End of the time range, matched on sent time. Same format as 'after'. Defaults to now.
+     * @minLength 1
+     */
+    before?: string
+    format?: PersonsPushNotificationsListFormat
+    /**
+     * Maximum number of assets to return (1-500, default 50).
+     * @minimum 1
+     * @maximum 500
+     */
+    limit?: number
+    /**
+     * Number of assets to skip, for pagination.
+     * @minimum 0
+     */
+    offset?: number
+}
+
+export type PersonsPushNotificationsListFormat =
+    (typeof PersonsPushNotificationsListFormat)[keyof typeof PersonsPushNotificationsListFormat]
+
+export const PersonsPushNotificationsListFormat = {
     Csv: 'csv',
     Json: 'json',
 } as const

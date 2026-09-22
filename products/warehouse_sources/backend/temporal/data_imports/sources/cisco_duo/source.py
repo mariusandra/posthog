@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.cisco_duo.cisco_duo import (
     HOST_NOT_ALLOWED_ERROR,
@@ -31,6 +25,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.ciscoduo import (
     CiscoDuoSourceConfig,
 )
@@ -53,20 +48,20 @@ class CiscoDuoSource(ResumableSource[CiscoDuoSourceConfig, CiscoDuoResumeConfig]
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.CISCO_DUO,
+            name=ExternalDataSourceType.CISCODUO,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="Cisco Duo",
             releaseStatus=ReleaseStatus.ALPHA,
             keywords=["duo", "duo security", "mfa", "2fa"],
-            caption="""Enter your Duo Admin API credentials to pull your Cisco Duo authentication, administrator, telephony, and activity logs — plus users, groups, phones, admins, and integrations — into the PostHog Data warehouse.
+            caption="""Enter your Duo Admin API credentials to pull your Cisco Duo authentication, administrator, telephony, and activity logs into the PostHog Data warehouse, along with users, groups, group memberships, phones, endpoints, admins, integrations, and policies.
 
 In the [Duo Admin Panel](https://admin.duosecurity.com/), go to **Applications**, click **Protect an Application**, and protect the **Admin API** application. That gives you the integration key, secret key, and API hostname.
 
 Grant the application the permissions matching the tables you want to sync:
-- **Grant read log** — authentication, administrator, telephony, and activity logs
-- **Grant read resource** — users, groups, phones
-- **Grant administrators** — admins
-- **Grant applications** — integrations
+- **Grant read log**: authentication, administrator, telephony, and activity logs
+- **Grant read resource**: users, groups, group memberships, phones, endpoints, policies
+- **Grant administrators**: admins
+- **Grant applications**: integrations
 """,
             iconPath="/static/services/cisco_duo.png",
             docsUrl="https://posthog.com/docs/cdp/sources/cisco-duo",

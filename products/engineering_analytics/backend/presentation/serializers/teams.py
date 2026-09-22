@@ -17,7 +17,7 @@ class TeamCIHealthItemSerializer(DataclassSerializer):
         dataclass = TeamCIHealthItem
         extra_kwargs = {
             "owner_team": {
-                "help_text": "Owning team slug (the CODEOWNERS handle minus '@PostHog/', e.g. 'team-replay'), "
+                "help_text": "Owning team slug from the repo's owners.yaml map (e.g. 'team-replay'), "
                 "or the literal 'unowned' for tests whose spans carry no ownership stamp.",
             },
             "flaky_test_count": {
@@ -35,22 +35,36 @@ class TeamCIHealthItemSerializer(DataclassSerializer):
             },
             "regression_test_count_prior": {"help_text": "Same count over the prior window."},
             "failed_run_count": {
-                "help_text": "CI runs (not spans) where an owned test's recorded outcome was failed or error. "
-                "An absolute count, not a rate: fast passing runs are not emitted.",
+                "help_text": "Distinct CI runs where at least one owned test failed or errored. A run with many "
+                "failing owned tests counts once. An absolute count, not a rate: fast passing runs are not emitted.",
             },
             "failed_run_count_prior": {"help_text": "Same count over the prior window."},
             "same_commit_recovery_run_count": {
-                "help_text": "Runs where one commit both failed and passed an owned test: a re-run attempt went "
-                "green, or an in-job retry recovered it.",
+                "help_text": "Distinct CI runs where one commit both failed and passed at least one owned test: a "
+                "re-run attempt went green, or an in-job retry recovered it.",
             },
             "same_commit_recovery_run_count_prior": {"help_text": "Same count over the prior window."},
             "quarantined_failed_run_count": {
-                "help_text": "Runs where an owned test failed while quarantined (xfail): masked in CI, still failing.",
+                "help_text": "Distinct CI runs where at least one owned test recorded a tolerated failure while "
+                "quarantined.",
             },
             "quarantined_failed_run_count_prior": {"help_text": "Same count over the prior window."},
             "last_seen_at": {
-                "help_text": "Most recent failure, recovery, or xfail run across the team's owned tests, either window."
+                "help_text": "Most recent failure, recovery, or quarantined-failure run across the team's owned "
+                "tests, either window. Null for a team present only through the census (no CI signal recorded)."
             },
+            "test_file_count": {
+                "help_text": "Test files the team owns per the daily owners.yaml census. Null until a census "
+                "event exists for the repository.",
+            },
+            "test_file_count_prior": {
+                "help_text": "The latest census value at or before the window start, for the trend.",
+            },
+            "merged_pr_count": {
+                "help_text": "Merged PRs authored by the team's members in the window, bots excluded. Null when "
+                "the team_members snapshot isn't synced, or for 'unowned'.",
+            },
+            "merged_pr_count_prior": {"help_text": "Same count over the prior window."},
         }
 
 
@@ -58,7 +72,10 @@ class TeamCIHealthListSerializer(DataclassSerializer):
     items = TeamCIHealthItemSerializer(
         many=True,
         help_text="Owning teams ranked by current flaky + failure signal, heaviest first, capped at `limit`. "
-        "Teams are organizational owners of code surfaces; this never aggregates by author.",
+        "Teams are organizational owners of code surfaces; this never aggregates by author. A CI setup break "
+        "(a run attempt whose tests errored in 3 or more jobs or for 3 or more owning teams, or a job attempt "
+        "with 100 or more distinct failed or errored tests) excludes every trial of that attempt, not only its "
+        "failures.",
     )
 
     class Meta:
@@ -73,14 +90,17 @@ class TeamTestSignalSerializer(DataclassSerializer):
     class Meta:
         dataclass = TeamTestSignal
         extra_kwargs = {
-            "nodeid": {"help_text": "Reconstructed pytest nodeid (the CI span name), a stable grouping key."},
-            "selector": {"help_text": "Runnable pytest selector; exact when the CI reporter emitted it."},
+            "runner": {"help_text": "Test runner that emitted this signal: 'pytest' or 'jest'."},
+            "nodeid": {"help_text": "Runner-specific test identity (the CI span name), a stable grouping key."},
+            "selector": {"help_text": "Runnable pytest or Jest selector; exact for newly emitted spans."},
             "signal_count": {
                 "help_text": "Runs in the current window where the test failed, errored, or a retry "
-                "recovered it (xfail excluded).",
+                "recovered it (quarantined failures excluded).",
             },
             "signal_count_prior": {"help_text": "Same count over the equal-length window before date_from."},
-            "last_seen_at": {"help_text": "Most recent failure, recovery, or xfail run for this test, either window."},
+            "last_seen_at": {
+                "help_text": "Most recent failure, recovery, or quarantined-failure run for this test, either window."
+            },
         }
 
 

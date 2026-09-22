@@ -20,14 +20,17 @@ from posthog.temporal.tests.utils.models import afetch_batch_export_runs
 from products.batch_exports.backend.service import BatchExportModel, BatchExportSchema
 from products.batch_exports.backend.temporal.batch_exports import finish_batch_export_run, start_batch_export_run
 from products.batch_exports.backend.temporal.destinations.azure_blob_batch_export import (
+    SUPPORTED_COMPRESSIONS,
     AzureBlobBatchExportInputs,
     AzureBlobBatchExportWorkflow,
     azure_blob_default_fields,
     insert_into_azure_blob_activity_from_stage,
 )
+from products.batch_exports.backend.temporal.destinations.constants import FILE_FORMAT_EXTENSIONS
 from products.batch_exports.backend.temporal.pipeline.internal_stage import insert_into_internal_stage_activity
+from products.batch_exports.backend.temporal.queue import RecordBatchQueue
 from products.batch_exports.backend.temporal.record_batch_model import SessionsRecordBatchModel
-from products.batch_exports.backend.temporal.spmc import Producer, RecordBatchQueue
+from products.batch_exports.backend.tests.temporal.utils.clickhouse_test_producer import ClickHouseTestProducer
 from products.batch_exports.backend.tests.temporal.utils.records import get_record_batch_from_queue
 
 
@@ -175,14 +178,17 @@ async def assert_clickhouse_records_in_azure_blob(
 
     expected_records = []
     queue = RecordBatchQueue()
-    producer = Producer(model=SessionsRecordBatchModel(team_id)) if model_name == "sessions" else Producer()
+    producer = (
+        ClickHouseTestProducer(model=SessionsRecordBatchModel(team_id))
+        if model_name == "sessions"
+        else ClickHouseTestProducer()
+    )
 
     producer_task = await producer.start(
         queue=queue,
         model_name=model_name,
         team_id=team_id,
         full_range=(data_interval_start, data_interval_end),
-        done_ranges=[],
         fields=fields,
         filters=filters,
         destination_default_fields=azure_blob_default_fields(),
@@ -264,6 +270,12 @@ TEST_AZURE_BLOB_MODELS: list[BatchExportModel | BatchExportSchema | None] = [
     None,
 ]
 
+SUPPORTED_FILE_FORMAT_COMPRESSIONS: list[tuple[str, str | None]] = [
+    (file_format, compression)
+    for file_format in FILE_FORMAT_EXTENSIONS
+    for compression in (None, *SUPPORTED_COMPRESSIONS[file_format])
+]
+
 
 async def run_azure_blob_batch_export_workflow(
     team,
@@ -277,6 +289,7 @@ async def run_azure_blob_batch_export_workflow(
     compression: str | None = None,
     batch_export_model: BatchExportModel | None = None,
     batch_export_schema: BatchExportSchema | None = None,
+    legacy_parquet_extension: bool = True,
 ):
     """Run the Azure Blob batch export workflow and return the run result."""
     workflow_id = str(uuid.uuid4())
@@ -289,6 +302,7 @@ async def run_azure_blob_batch_export_workflow(
         prefix=prefix,
         file_format=file_format,
         compression=compression,
+        legacy_parquet_extension=legacy_parquet_extension,
         integration_id=integration_id,
         batch_export_model=batch_export_model,
         batch_export_schema=batch_export_schema,

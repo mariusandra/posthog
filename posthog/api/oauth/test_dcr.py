@@ -1,14 +1,19 @@
 import base64
 import hashlib
+import ipaddress
+from urllib.parse import parse_qs, urlparse
 
 from posthog.test.base import APIBaseTest
+from unittest.mock import patch
 
 from parameterized import parameterized
 from rest_framework import status
 from rest_framework.test import APIClient
 
 from posthog.api.oauth.client_name import sanitize_client_name
-from posthog.models.oauth import OAuthApplication, OAuthApplicationAccessLevel
+from posthog.models.oauth import OAuthApplication, OAuthApplicationAccessLevel, OAuthGrant
+
+PUBLIC_IPS = {ipaddress.ip_address("93.184.216.34")}
 
 
 class TestDynamicClientRegistration(APIBaseTest):
@@ -40,7 +45,8 @@ class TestDynamicClientRegistration(APIBaseTest):
         self.assertIsNone(app.organization)
         self.assertIsNone(app.user)
 
-    def test_register_full_client(self):
+    @patch("posthog.security.url_validation.resolve_host_ips", return_value=PUBLIC_IPS)
+    def test_register_full_client(self, _resolve):
         response = self.client.post(
             "/oauth/register/",
             {
@@ -49,6 +55,7 @@ class TestDynamicClientRegistration(APIBaseTest):
                 "grant_types": ["authorization_code", "refresh_token"],
                 "response_types": ["code"],
                 "token_endpoint_auth_method": "none",
+                "logo_uri": "https://example.com/logo.png",
             },
             format="json",
         )
@@ -57,10 +64,29 @@ class TestDynamicClientRegistration(APIBaseTest):
         data = response.json()
         self.assertEqual(data["client_name"], "Test MCP Client")
         self.assertEqual(len(data["redirect_uris"]), 2)
+        self.assertEqual(data["logo_uri"], "https://example.com/logo.png")
 
         # Verify name stored
         app = OAuthApplication.objects.get(client_id=data["client_id"])
         self.assertEqual(app.name, "Test MCP Client")
+        self.assertEqual(app.logo_uri, "https://example.com/logo.png")
+
+    def test_register_drops_an_unusable_logo_without_failing(self):
+        response = self.client.post(
+            "/oauth/register/",
+            {
+                "redirect_uris": ["https://example.com/callback"],
+                "logo_uri": "http://example.com/logo.png",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        data = response.json()
+        self.assertNotIn("logo_uri", data)
+
+        app = OAuthApplication.objects.get(client_id=data["client_id"])
+        self.assertIsNone(app.logo_uri)
 
     def test_register_localhost_http_allowed(self):
         response = self.client.post(
@@ -515,24 +541,17 @@ class TestDynamicClientRegistration(APIBaseTest):
         self.assertNotIn("error=invalid_scope", redirect_to)
         self.assertIn("code=", redirect_to)
 
-    def test_no_scope_dcr_client_rejects_privileged_scope_at_authorize(self):
+    def test_no_scope_dcr_client_does_not_obtain_privileged_scope_at_authorize(self):
         """The broad default excludes PRIVILEGED_SCOPES, so a no-ceiling DCR
-        client cannot obtain llm_gateway access at /authorize."""
+        client cannot obtain llm_gateway access at /authorize. It is dropped from
+        the grant rather than failing the request, so the unprivileged scope
+        alongside it still lands."""
         client_id = self._register_dcr_client()
-        self.client.force_login(self.user)
-        response = self.client.get(
-            "/oauth/authorize/",
-            {
-                "client_id": client_id,
-                "redirect_uri": "https://example.com/callback",
-                "response_type": "code",
-                "scope": "llm_gateway:read",
-                "code_challenge": self.code_challenge,
-                "code_challenge_method": "S256",
-                "state": "test123",
-            },
-        )
-        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
-        location = response.get("Location")
-        assert location
-        self.assertIn("error=invalid_scope", location)
+        response = self._authorize_consent_post(client_id, "llm_gateway:read experiment:read")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        redirect_to = response.json()["redirect_to"]
+        self.assertNotIn("error=invalid_scope", redirect_to)
+        code = parse_qs(urlparse(redirect_to).query)["code"][0]
+        granted = set(OAuthGrant.objects.get(code=code).scope.split())
+        self.assertNotIn("llm_gateway:read", granted)
+        self.assertIn("experiment:read", granted)

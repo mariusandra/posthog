@@ -1,4 +1,4 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Literal, get_args
 
 ## API Scopes
@@ -19,24 +19,28 @@ APIScopeObject = Literal[
     "access_control",
     "account",
     "activity_log",
-    "agents",
-    "agent_approvals",
     "alert",
     "annotation",
     "approvals",
+    "autoresearch",
     "batch_export",
     "batch_import",
     "batch_import_support",
+    "billing",
     "business_knowledge",
+    "canvas",
     "clickhouse_test_cluster_perf",
     "cohort",
     "comment",
     "conversation",
+    "context_layer_internal",
     "customer_analytics",
+    "customer_task",
     "customer_journey",
     "customer_profile_config",
     "data_catalog",
     "data_catalog_approval",
+    "data_deletion",
     "dashboard",
     "event_filter",
     "dashboard_template",
@@ -66,6 +70,7 @@ APIScopeObject = Literal[
     "insight",
     "insight_variable",
     "integration",
+    "interactive_run",
     "internal_run",
     "legal_document",
     "link",
@@ -73,13 +78,17 @@ APIScopeObject = Literal[
     "llm_analytics",
     "ai_observability_clusters",
     "llm_gateway",
+    "llm_playground",
     "llm_prompt",
     "llm_provider_key",
     "llm_skill",
     "logs",
     "loop",
+    "loop_context_internal",
     "marketing_analytics",
+    "mcp_builtin_agent",
     "mcp_analytics",
+    "mcp_registry",
     "metrics",
     "notebook",
     "organization",
@@ -94,6 +103,7 @@ APIScopeObject = Literal[
     "query",  # Covers query and events endpoints
     "query_performance",
     "replay_scanner",
+    "review_hog",
     "revenue_analytics",
     "session_recording",
     "session_recording_playlist",
@@ -101,6 +111,8 @@ APIScopeObject = Literal[
     "signal_scout",
     "signal_scout_internal",
     "signal_scout_report",
+    "signal_scratchpad_internal",
+    "slack_run",
     "stamphog",
     "streamlit_app",
     "subscription",
@@ -115,7 +127,8 @@ APIScopeObject = Literal[
     "usage_metric",
     "user",
     "user_interview",  # Alpha product — access gated by feature flag at the MCP/API layer rather than by hiding the scope.
-    "vision_action",
+    "vision_action",  # Endpoints are gone; kept advertised until desktop OAuth clients stop requesting it.
+    "vision_alert",
     "visual_review",
     "warehouse_objects",
     "warehouse_table",
@@ -124,6 +137,11 @@ APIScopeObject = Literal[
     "webhook",
     "wizard_session",
 ]
+
+
+# Server-only provenance markers hidden from user-controlled scope selectors.
+MCP_BUILT_IN_AGENT_SCOPE = "mcp_builtin_agent:read"
+SLACK_RUN_SCOPE = "slack_run:read"
 
 APIScopeActions = Literal[
     "read",
@@ -144,11 +162,26 @@ API_SCOPE_ACTIONS: tuple[APIScopeActions, ...] = get_args(APIScopeActions)
 INTERNAL_API_SCOPE_OBJECTS: frozenset[APIScopeObject] = frozenset(
     {
         "clickhouse_test_cluster_perf",
+        # Grants Context Wiki writes only to write-enabled sandbox runs. Kept
+        # separate from internal_run because read-only runs carry that marker.
+        "context_layer_internal",
+        # Narrows `internal_run`: the run behind this token was started by a person
+        # pressing a button, not by one of PostHog's own schedulers. Both markers are
+        # minted server-side, so neither can be self-granted; the LLM gateway meters
+        # user-started runs against their own, much smaller budget because their volume
+        # is chosen by the customer rather than by us.
+        "interactive_run",
         # Provenance marker on tokens minted server-side for a sandbox/agent run
         # (never via the consent flow or a personal API key). The LLM gateway requires
         # it on the internal products that share the PostHog Desktop OAuth app so a user's
         # own credential can't reach them — see services/llm-gateway products/config.py.
         "internal_run",
+        # Grants context maintenance tools only to Loop runs configured with update_context.
+        "loop_context_internal",
+        # Marks a sandbox OAuth token as belonging to a trusted built-in agent.
+        # MCP Store uses it to deny the human/member control plane and force the
+        # agent through its own explicit gateway grants.
+        "mcp_builtin_agent",
         # Sandbox-only writes for the headless Signals agent (memory create/delete,
         # finding emit). Read access for the same surface lives on the public
         # `signal_scout` object so user-grantable PAKs can still inspect runs/memory.
@@ -158,6 +191,14 @@ INTERNAL_API_SCOPE_OBJECTS: frozenset[APIScopeObject] = frozenset(
         # opted into the report tools (via the `signals_scout_reports` posture) — every
         # other scout's token lacks it, so the MCP server strips those tools entirely.
         "signal_scout_report",
+        # Sandbox-only write for the shared scratchpad (remember / forget). Split out from
+        # `signal_scout_internal` for the same reason as the report channel: the report
+        # pipeline's research and implementation runs need durable memory, and granting it
+        # through the scout object would hand them `emit_signal` and `record_output` too.
+        "signal_scratchpad_internal",
+        # Marks tokens minted for Slack tasks so spend policy does not depend on the
+        # caller-selected LLM gateway product route.
+        "slack_run",
     }
 )
 
@@ -192,6 +233,9 @@ PROJECT_SECRET_API_KEY_ALLOWED_API_SCOPE_ACTION: list[tuple[APIScopeObject, APIS
     # `loops/:id/trigger/`. PSAKs are project-wide, so a leaked key can fire any loop
     # in the project (accepted and documented in products/tasks/docs/LOOPS.md).
     ("loop", "write"),
+    # Read-only export of experiment definitions (list/retrieve), so services syncing
+    # experiments into a warehouse don't need a credential tied to one person's account.
+    ("experiment", "read"),
 ]
 
 # Server-side scope assignment string-set constants (see RFC: server-side scope
@@ -330,7 +374,12 @@ def resolve_ceiling(app_scopes: Iterable[str]) -> frozenset[str] | None:
     which falls back to the `UNPRIVILEGED_SCOPES` default). A `@default` sentinel
     expands to `UNPRIVILEGED_SCOPES` unioned with the other listed scopes; without it,
     a non-empty ceiling stays an exhaustive allow-list. Entries are stripped so a
-    fat-fingered `" @default"` still resolves (real scopes never have whitespace)."""
+    fat-fingered `" @default"` still resolves (real scopes never have whitespace).
+
+    This is the literal ceiling, which is also what a token carries on the paths that
+    mint the whole thing (`create_wizard_oauth_access_token_for_user`, provisioning
+    account requests). Read halves are added by `grantable_ceiling` at admission time
+    instead, so testing a request against the ceiling can't quietly widen those."""
     app = {s.strip() for s in (app_scopes or [])}
     app.discard("")
     if not app:
@@ -347,6 +396,24 @@ def effective_ceiling(app_scopes: Iterable[str]) -> frozenset[str]:
     return ceiling if ceiling is not None else UNPRIVILEGED_SCOPES
 
 
+def grantable_ceiling(app_scopes: Iterable[str]) -> frozenset[str]:
+    """The scopes a request may name: `effective_ceiling` plus the read half of every
+    `<object>:write` entry.
+
+    `APIScopePermission` already accepts a `:write` token wherever `:read` is required,
+    so refusing a request for the narrower half denies access the token would have
+    carried anyway. That is what the consent screen's read-only toggle asks for.
+
+    Distinct from `effective_ceiling` because the read halves must not reach the paths
+    that mint the whole ceiling as a token: widening those would hand partners and the
+    wizard scope strings they never asked for, for no extra capability."""
+    return _with_read_halves(effective_ceiling(app_scopes))
+
+
+def _with_read_halves(scopes: frozenset[str]) -> frozenset[str]:
+    return frozenset(scopes | {scope.replace(":write", ":read") for scope in scopes if scope.endswith(":write")})
+
+
 def scopes_within_ceiling(
     requested: Iterable[str],
     app_scopes: Iterable[str],
@@ -355,9 +422,10 @@ def scopes_within_ceiling(
 ) -> bool:
     """Whether every requested scope is grantable under an app's scope ceiling.
 
-    The single source of truth for ceiling resolution: `/authorize`
-    (`OAuthValidator.validate_scopes`) and the hand-rolled agentic-provisioning
-    mint paths both call this so they enforce identical rules.
+    The ceiling-resolution rule for callers that reject rather than clamp: the
+    hand-rolled agentic-provisioning mint paths. `/authorize` resolves the same
+    ceiling through `clamp_scopes_to_ceiling` instead, dropping ungrantable scopes
+    rather than failing the request.
 
     - OIDC + introspection (`ALWAYS_ALLOWED_SCOPES`) are always granted.
     - An explicit `app_scopes` ceiling is an exhaustive allow-list: anything
@@ -377,7 +445,7 @@ def scopes_within_ceiling(
     if not to_check:
         return True
     if ceiling is not None:
-        return "*" not in to_check and to_check.issubset(ceiling)
+        return "*" not in to_check and to_check.issubset(_with_read_halves(ceiling))
     allowed = UNPRIVILEGED_SCOPES | {"*"} if allow_wildcard_under_empty_ceiling else UNPRIVILEGED_SCOPES
     return to_check.issubset(allowed)
 
@@ -401,9 +469,97 @@ def scopes_outside_ceiling(
         return []
     if ceiling is not None:
         # `*` is never grantable under an explicit ceiling, even if listed.
-        return sorted(s for s in to_check if s == "*" or s not in ceiling)
+        admissible = _with_read_halves(ceiling)
+        return sorted(s for s in to_check if s == "*" or s not in admissible)
     allowed = UNPRIVILEGED_SCOPES | {"*"} if allow_wildcard_under_empty_ceiling else UNPRIVILEGED_SCOPES
     return sorted(to_check - allowed)
+
+
+def clamp_scopes_to_ceiling(
+    requested: Iterable[str],
+    app_scopes: Iterable[str],
+    *,
+    allow_wildcard_under_empty_ceiling: bool = False,
+) -> list[str]:
+    """The grantable subset of a `/authorize` scope request.
+
+    Where `scopes_within_ceiling` answers whether the whole request is grantable,
+    this resolves it to what the token should actually carry. An ungrantable scope
+    is dropped, never fatal: `/authorize` does not reject on scope grounds at all.
+    Scopes are retired and renamed as a matter of routine, and a client pinning a
+    hardcoded list has no way to see that coming. The resource metadata's
+    `scopes_supported` is resource-wide, so a client cannot discover a narrower
+    per-app ceiling before it asks either. RFC 6749 section 3.3 lets the server
+    fully or partially ignore the requested scope as long as the token response
+    reports what was granted, which oauthlib does whenever it differs.
+
+    An empty return is a real outcome, not an error: the client asked for nothing
+    grantable and gets an identity-only token. That client will 403 on every
+    resource call, so `oauth_scopes_clamped` is the signal that matters here.
+
+    Clamping can only ever grant less than the ceiling already allowed, so the
+    ceiling stays the sole authority on what a token may hold. Resolution mirrors
+    `scopes_within_ceiling` exactly:
+
+    - `ALWAYS_ALLOWED_SCOPES` (OIDC + introspection) pass through untouched.
+    - Under an explicit ceiling, `*` resolves to the whole ceiling rather than
+      staying a wildcard, which is strictly less than the bypass `*` grants in
+      `posthog/permissions.py`.
+    - Under an empty ceiling, `*` is kept verbatim when the caller grandfathers it,
+      because narrowing it there would strip the legacy client's full access.
+    """
+    always_allowed = set(requested) & ALWAYS_ALLOWED_SCOPES
+    resource_requested = set(requested) - ALWAYS_ALLOWED_SCOPES
+    if not resource_requested:
+        return sorted(always_allowed)
+
+    ceiling = resolve_ceiling(app_scopes)
+    if ceiling is not None:
+        granted = (ceiling - {"*"}) if "*" in resource_requested else (resource_requested & _with_read_halves(ceiling))
+    else:
+        allowed = UNPRIVILEGED_SCOPES | {"*"} if allow_wildcard_under_empty_ceiling else UNPRIVILEGED_SCOPES
+        granted = resource_requested & allowed
+
+    return sorted(granted | always_allowed)
+
+
+# How many real scopes a request has to carry before its trailing fragment reads as a cut
+# URL rather than as a junk token. A false positive costs the app's whole ceiling, while a
+# missed one only costs a short consent list, so the bar sits well above the length any
+# deliberate request reaches by accident.
+MIN_SCOPES_BEFORE_TRUNCATION = 20
+
+
+def is_truncated_scope_request(requested: Sequence[str]) -> bool:
+    """Whether a `scope` list looks cut off mid-token rather than merely stale.
+
+    A client pinning a retired or renamed scope is routine, and `clamp_scopes_to_ceiling`
+    drops those one at a time. A cut-off request is a different failure: something in the
+    path truncated the authorization URL, so the last token is a fragment and every scope
+    after it is gone, with no way to tell how many. Dropping the fragment the same way
+    hands the user a short consent list and a half-working client, with no error anywhere.
+
+    The signal is a final token that is a strict prefix of a real scope, with every token
+    before it a real scope. A fragment can only ever be last, because the cut takes the
+    rest of the string with it, and requiring a clean head keeps a client with one stale
+    scope from reading as truncated. `requested` must preserve request order.
+
+    The head also has to be long: `MIN_SCOPES_BEFORE_TRUNCATION` real scopes have to come
+    through before a trailing fragment counts. Scope names are short common words, so a
+    two-token request like `openid insight` prefixes a real scope by coincidence, and
+    reading that as truncation hands the caller the app's whole ceiling. A URL that was
+    actually cut carries most of the list before the cut, so the length is what separates
+    the two.
+    """
+    if len(requested) <= MIN_SCOPES_BEFORE_TRUNCATION:
+        return False
+
+    *head, tail = requested
+    known = ALL_SCOPES | ALWAYS_ALLOWED_SCOPES | {"*"}
+    if not tail or tail in known or not all(scope in known for scope in head):
+        return False
+
+    return any(scope.startswith(tail) for scope in known)
 
 
 def narrow_scopes_to_ceiling(original: Iterable[str], app_scopes: Iterable[str]) -> list[str] | None:
@@ -417,8 +573,15 @@ def narrow_scopes_to_ceiling(original: Iterable[str], app_scopes: Iterable[str])
     - A `*` token is left untouched (narrowing it would strip all resource
       access; `*` retirement is handled separately).
     - Otherwise returns the sorted intersection with the ceiling plus any
-      always-allowed scopes, or `None` when that intersection is empty (the
-      caller should reject with `invalid_grant` and force re-authorization).
+      always-allowed scopes, or `None` when a non-empty scope set narrows to
+      nothing (the caller should reject with `invalid_grant` and force
+      re-authorization, which can then grant whatever is inside the ceiling).
+
+    A token that never held any scope is not that case, and rejecting it would
+    loop: `/authorize` clamps rather than rejecting, so the re-authorization the
+    rejection forces returns the same empty grant, which refreshes and is
+    rejected again. It narrows to the empty list instead, leaving one stable
+    token whose resource calls 403 by scope.
     """
     original_list = list(original)
     ceiling = resolve_ceiling(app_scopes)
@@ -430,7 +593,7 @@ def narrow_scopes_to_ceiling(original: Iterable[str], app_scopes: Iterable[str])
         return original_list
 
     narrowed = (original_set & ceiling) | (original_set & ALWAYS_ALLOWED_SCOPES)
-    if not narrowed:
+    if not narrowed and original_set:
         return None
     return sorted(narrowed)
 
@@ -443,13 +606,18 @@ def get_oauth_scopes_supported() -> list[str]:
     (the latter generated at build time via `bin/build-mcp-oauth-scopes.py` so
     the protected resource cannot drift out of subset of the AS).
 
-    Built from `UNPRIVILEGED_SCOPES`, so it excludes all three non-advertised
-    classes: `INTERNAL_API_SCOPE_OBJECTS` (server-mint-only, e.g.
-    `signal_scout_internal` — never user-grantable), `OAUTH_SCOPES_HIDDEN`
-    (alpha / PAT-only), and `PRIVILEGED_SCOPES` (`llm_gateway:*`, admin-granted
-    only). Discovery metadata shouldn't advertise scopes an OAuth client can't
-    obtain self-serve. PAT validation uses `get_scope_descriptions()` directly
-    and is unaffected.
+    Resource scopes are built from `UNPRIVILEGED_SCOPES`, so the list excludes
+    all three non-advertised classes: `INTERNAL_API_SCOPE_OBJECTS`
+    (server-mint-only, e.g. `signal_scout_internal` — never user-grantable),
+    `OAUTH_SCOPES_HIDDEN` (alpha / PAT-only), and `PRIVILEGED_SCOPES`
+    (`llm_gateway:*`, admin-granted only). Discovery metadata shouldn't advertise
+    scopes an OAuth client can't obtain self-serve. PAT validation uses
+    `get_scope_descriptions()` directly and is unaffected.
+
+    Every `ALWAYS_ALLOWED_SCOPES` member is advertised too, because those ride on
+    every token we issue whether the client asks for them or not. A client that
+    requests one and cannot find it here reads that as consent granted only in
+    part, and warns the user at the moment of install.
 
     The Signals scout harness sandbox token carries `signal_scout_internal:write`,
     but it is minted by directly inserting an `OAuthAccessToken` row (see
@@ -463,4 +631,8 @@ def get_oauth_scopes_supported() -> list[str]:
     ordered = [
         f"{obj}:{action}" for obj in API_SCOPE_OBJECTS for action in API_SCOPE_ACTIONS if f"{obj}:{action}" in visible
     ]
-    return list(OIDC_SCOPES) + ordered
+    # `OIDC_SCOPES` keeps its declared order at the head of the list, so only the
+    # remaining always-allowed scopes are appended (sorted to keep the generated
+    # MCP artifact byte-stable).
+    other_always_allowed = sorted(ALWAYS_ALLOWED_SCOPES - set(OIDC_SCOPES))
+    return list(OIDC_SCOPES) + other_always_allowed + ordered

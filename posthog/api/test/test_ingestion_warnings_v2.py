@@ -1,6 +1,6 @@
 import json
 
-from freezegun.api import freeze_time
+import time_machine
 from posthog.test.base import APIBaseTest, ClickhouseTestMixin
 
 from parameterized import parameterized
@@ -29,7 +29,7 @@ def create_warning(team_id: int, type: str, timestamp: str, details: dict, sourc
     )
 
 
-@freeze_time("2026-07-07T12:00:00.000Z")
+@time_machine.travel("2026-07-07T12:00:00.000Z", tick=False)
 class TestIngestionWarningsV2API(ClickhouseTestMixin, APIBaseTest):
     def setUp(self):
         super().setUp()
@@ -104,6 +104,30 @@ class TestIngestionWarningsV2API(ClickhouseTestMixin, APIBaseTest):
         merge_warnings = results[1]
         assert merge_warnings["category"] == "merge"
         assert merge_warnings["severity"] == "warning"
+
+    @parameterized.expand(
+        [
+            ("missing_event_name", {"pipelineStep": "capture_validation"}, "capture_validation"),
+            ("empty_batch", {}, "unknown"),
+        ]
+    )
+    def test_samples_report_producer_and_pipeline_step(
+        self, warning_type: str, extra_details: dict, expected_step: str
+    ):
+        create_warning(
+            team_id=self.team.id,
+            type=warning_type,
+            timestamp="2026-07-07 11:30:00",
+            details={"category": "event", "severity": "error", **extra_details},
+            source="capture",
+        )
+
+        status_code, results = self._list(type=warning_type)
+
+        assert status_code == status.HTTP_200_OK
+        sample = results[0]["samples"][0]
+        assert sample["source"] == "capture"
+        assert sample["pipeline_step"] == expected_step
 
     @parameterized.expand(
         [

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import uuid
+import base64
 import hashlib
 
 from django.db import IntegrityError, transaction
@@ -23,7 +24,13 @@ from products.streamlit_apps.backend.logic.oauth import (
     find_reusable_streamlit_access_token,
     get_streamlit_oauth_app,
 )
-from products.streamlit_apps.backend.logic.zip_validator import MAX_ZIP_SIZE, validate_zip
+from products.streamlit_apps.backend.logic.zip_validator import (
+    MAX_FILE_COUNT,
+    MAX_ZIP_SIZE,
+    attachment_path_error,
+    build_app_zip,
+    validate_zip,
+)
 from products.streamlit_apps.backend.models import (
     MAX_CPU_CORES,
     MAX_MEMORY_GB,
@@ -47,6 +54,7 @@ logger = structlog.get_logger(__name__)
 _LAST_ACTIVITY_DEBOUNCE_SECONDS = 30
 
 __all__ = [
+    "attachment_path_error",
     "AppRuntimeConcurrencyError",
     "AppRuntimeError",
     "AppNotFoundError",
@@ -57,6 +65,7 @@ __all__ = [
     "NoActiveVersionError",
     "AppNotRunningError",
     "ConnectUnavailableError",
+    "MAX_FILE_COUNT",
     "MAX_ZIP_SIZE",
     "MIN_CPU_CORES",
     "MAX_CPU_CORES",
@@ -70,6 +79,7 @@ __all__ = [
     "delete_app",
     "list_versions",
     "upload_version",
+    "create_version_from_source",
     "activate_version",
     "get_status",
     "start_app",
@@ -430,6 +440,31 @@ def upload_version(
     )
 
     return _version_to_contract(version)
+
+
+def create_version_from_source(
+    team_id: int,
+    short_id: str,
+    user: User,
+    data: contracts.CreateVersionFromSourceInput,
+    was_impersonated: bool,
+) -> contracts.AppVersionContract:
+    """Create and activate a version from free-text source plus optional extra files.
+
+    Packs everything into the same zip shape as an upload, so validation,
+    storage, versioning, and sandbox-stop semantics are identical to
+    ``upload_version``.
+    """
+    assets = {path: base64.b64decode(content, validate=True) for path, content in data.assets.items()}
+    file_content = build_app_zip(data.source, files=data.files, assets=assets)
+    return upload_version(
+        team_id=team_id,
+        short_id=short_id,
+        user=user,
+        file_content=file_content,
+        declared_size=len(file_content),
+        was_impersonated=was_impersonated,
+    )
 
 
 def activate_version(

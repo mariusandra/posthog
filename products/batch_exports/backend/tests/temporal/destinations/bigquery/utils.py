@@ -1,4 +1,3 @@
-import os
 import json
 import asyncio
 import datetime as dt
@@ -17,13 +16,13 @@ from products.batch_exports.backend.temporal.destinations.bigquery_batch_export 
     bigquery_default_fields,
     get_our_google_cloud_credentials,
 )
+from products.batch_exports.backend.temporal.queue import RecordBatchQueue
 from products.batch_exports.backend.temporal.record_batch_model import SessionsRecordBatchModel
-from products.batch_exports.backend.temporal.spmc import Producer, RecordBatchQueue
+from products.batch_exports.backend.tests.temporal.utils.clickhouse_test_producer import ClickHouseTestProducer
 from products.batch_exports.backend.tests.temporal.utils.records import get_record_batch_from_queue
 
-SKIP_IF_MISSING_GOOGLE_APPLICATION_CREDENTIALS = pytest.mark.skipif(
-    "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ,
-    reason="Google credentials not set in environment",
+SKIP_IF_MISSING_GOOGLE_APPLICATION_CREDENTIALS = pytest.mark.requires_vendor_credentials(
+    "GOOGLE_APPLICATION_CREDENTIALS"
 )
 
 TEST_TIME = dt.datetime.now(dt.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -149,9 +148,9 @@ async def assert_clickhouse_records_in_bigquery(
     expected_records = []
     queue = RecordBatchQueue()
     if model_name == "sessions":
-        producer = Producer(model=SessionsRecordBatchModel(team_id))
+        producer = ClickHouseTestProducer(model=SessionsRecordBatchModel(team_id))
     else:
-        producer = Producer()
+        producer = ClickHouseTestProducer()
 
     for data_interval_start, data_interval_end in date_ranges:
         producer_task = await producer.start(
@@ -159,7 +158,6 @@ async def assert_clickhouse_records_in_bigquery(
             model_name=model_name,
             team_id=team_id,
             full_range=(data_interval_start, data_interval_end),
-            done_ranges=[],
             fields=fields,
             filters=filters,
             destination_default_fields=bigquery_default_fields(),

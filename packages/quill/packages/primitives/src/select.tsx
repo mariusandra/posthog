@@ -22,6 +22,10 @@ function SelectValue({ className, ...props }: SelectPrimitive.Value.Props): Reac
     )
 }
 
+function SelectTriggerIcon({ className, ...props }: React.ComponentProps<typeof ChevronDownIcon>): React.ReactElement {
+    return <ChevronDownIcon className={cn('quill-select__icon', className)} {...props} />
+}
+
 function SelectTrigger({
     className,
     size = 'default',
@@ -38,11 +42,11 @@ function SelectTrigger({
                 'quill-select__trigger group/select-trigger flex items-center justify-between gap-3 whitespace-nowrap outline-none',
                 className
             )}
-            render={<Button variant="outline" left />}
+            render={<Button variant="outline" size={size} left />}
             {...props}
         >
             {children}
-            <SelectPrimitive.Icon render={<ChevronDownIcon className="quill-select__icon" />} />
+            <SelectPrimitive.Icon render={<SelectTriggerIcon />} />
         </SelectPrimitive.Trigger>
     )
 }
@@ -50,14 +54,20 @@ function SelectTrigger({
 function SelectContent({
     className,
     children,
+    popupSibling,
     side = 'bottom',
     sideOffset = 4,
     align = 'center',
     alignOffset = 0,
     alignItemWithTrigger = true,
     ...props
-}: SelectPrimitive.Popup.Props &
-    Pick<
+}: SelectPrimitive.Popup.Props & {
+    /**
+     * Rendered in the positioner as the popup's sibling, escaping the popup's overflow and scroll
+     * mask. Use position: absolute — in-flow content here resizes the box the positioner measures.
+     */
+    popupSibling?: React.ReactNode
+} & Pick<
         SelectPrimitive.Positioner.Props,
         'align' | 'alignOffset' | 'side' | 'sideOffset' | 'alignItemWithTrigger'
     >): React.ReactElement {
@@ -73,6 +83,7 @@ function SelectContent({
                 alignItemWithTrigger={alignItemWithTrigger}
                 className="isolate"
             >
+                {popupSibling}
                 <SelectPrimitive.Popup
                     data-slot="select-content"
                     data-align-trigger={alignItemWithTrigger}
@@ -170,5 +181,6 @@ export {
     SelectScrollUpButton,
     SelectSeparator,
     SelectTrigger,
+    SelectTriggerIcon,
     SelectValue,
 }

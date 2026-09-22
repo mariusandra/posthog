@@ -6,6 +6,51 @@ Regenerate the lists with the audit commands in that skill's references.
 
 Status source: `scene: SceneExport` files, checked for `tabAwareScene()` / tabId-keyed root logics.
 
+## September 2026 sync review
+
+The following scene exports arrived or moved during the sync to upstream `e6fddf27007`.
+Their root and child logic need a tab-awareness review before treating them as isolated across desktop tabs.
+The lists below this section describe the pre-sync audit and include paths that have since moved.
+
+- [ ] `frontend/src/scenes/authentication/signup/Signup.tsx`
+- [ ] `frontend/src/scenes/code-canvas/CodeLoopLink.tsx`
+- [ ] `frontend/src/scenes/code-canvas/CodeTaskLink.tsx`
+- [ ] `frontend/src/scenes/experiments/staff/ExperimentsStaffTools.tsx`
+- [ ] `frontend/src/scenes/real-time-usage/RealTimeUsage.tsx`
+- [ ] `frontend/src/scenes/settings/organization/IdentityProviderConfig/IdentityProviderConfigScene.tsx`
+- [ ] `products/ai_observability/frontend/tags/AIObservabilityTagScene.tsx`
+- [ ] `products/analytics_platform/frontend/PrecomputeDebugScene.tsx`
+- [ ] `products/business_knowledge/frontend/scenes/BusinessKnowledgeSettingsScene.tsx`
+- [ ] `products/business_knowledge/frontend/scenes/KnowledgeSourceScene.tsx`
+- [ ] `products/conversations/frontend/scenes/myTickets/MyTicketsScene.tsx`
+- [ ] `products/customer_analytics/frontend/scenes/CustomerAnalyticsAccountScene/CustomerAnalyticsAccountScene.tsx`
+- [ ] `products/customer_analytics/frontend/scenes/WarehousePropertiesScene/WarehousePropertiesScene.tsx`
+- [ ] `products/data_catalog/frontend/DataCatalogMetricScene.tsx`
+- [ ] `products/data_catalog/frontend/DataCatalogScene.tsx`
+- [ ] `products/data_warehouse/frontend/scenes/WarehouseDestinationsScene/WarehouseDestinationsScene.tsx`
+- [ ] `products/experiments/frontend/scenes/ExperimentsScene.tsx`
+- [ ] `products/experiments/frontend/scenes/ExperimentsSharedMetricsScene.tsx`
+- [ ] `products/games/frontend/ShipIt/ShipIt.tsx`
+- [ ] `products/growth/frontend/aiEnrichment/AIEnrichmentScene.tsx`
+- [ ] `products/logs/frontend/scenes/LogsRetentionDetailScene/LogsRetentionDetailScene.tsx`
+- [ ] `products/logs/frontend/scenes/LogsRetentionNewScene/LogsRetentionNewScene.tsx`
+- [ ] `products/mcp_registry/frontend/MCPRegistryScene.tsx`
+- [ ] `products/mcp_store/frontend/gateway/GatewayAgentScene.tsx`
+- [ ] `products/mcp_store/frontend/gateway/GatewayMemberScene.tsx`
+- [ ] `products/mcp_store/frontend/gateway/GatewayServerScene.tsx`
+- [ ] `products/mcp_store/frontend/gateway/McpGatewayScene.tsx`
+- [ ] `products/notebooks/frontend/ReusableWidget/ReusableWidgetScene.tsx`
+- [ ] `products/signals/frontend/inbox/InboxScene.tsx`
+- [ ] `products/skills/frontend/CommunitySkillsScene.tsx`
+- [ ] `products/stamphog/frontend/scenes/StamphogDigestsScene/StamphogDigestsScene.tsx`
+- [ ] `products/stamphog/frontend/scenes/StamphogRunsScene/StamphogRunsScene.tsx`
+- [ ] `products/streamlit_apps/frontend/StreamlitApp.tsx`
+- [ ] `products/streamlit_apps/frontend/StreamlitAppEdit.tsx`
+- [ ] `products/streamlit_apps/frontend/StreamlitApps.tsx`
+- [ ] `products/visual_review/frontend/scenes/VisualReviewFlakinessScene.tsx`
+- [ ] `products/web_analytics/frontend/heatmaps/scenes/heatmap/HeatmapScene.tsx`
+- [ ] `products/wizard/frontend/WizardRunsScene.tsx`
+
 ## Tab aware (43)
 
 - [x] `frontend/src/scenes/activity/explore/EventsScene.tsx` (eventsSceneLogic)

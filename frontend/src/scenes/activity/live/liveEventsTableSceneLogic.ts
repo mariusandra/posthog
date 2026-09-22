@@ -18,7 +18,7 @@ export interface liveEventsTableSceneLogicMeta {
 export type liveEventsTableSceneLogicType = MakeLogicType<
     liveEventsTableSceneLogicValues,
     {},
-    Record<string, any>,
+    LiveEventsTableSceneProps,
     liveEventsTableSceneLogicMeta
 >
 

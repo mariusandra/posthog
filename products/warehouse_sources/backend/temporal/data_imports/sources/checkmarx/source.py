@@ -1,19 +1,13 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
     SourceFieldSelectConfig,
     SourceFieldSelectConfigOption,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.checkmarx.checkmarx import (
     AUTH_ERROR_PREFIX,
@@ -32,6 +26,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.checkmarx import (
     CheckmarxSourceConfig,
 )
@@ -49,7 +44,7 @@ class CheckmarxSource(ResumableSource[CheckmarxSourceConfig, CheckmarxResumeConf
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.CHECKMARX,
+            name=ExternalDataSourceType.CHECKMARX,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="Checkmarx (Checkmarx One)",
             releaseStatus=ReleaseStatus.ALPHA,
@@ -125,12 +120,15 @@ You can generate an API key in Checkmarx One under **Settings** → **Identity a
         api_version: str | None = None,
     ) -> list[SourceSchema]:
         def _description(endpoint: str) -> str | None:
-            if CHECKMARX_ENDPOINTS[endpoint].fan_out_over_scans:
+            endpoint_config = CHECKMARX_ENDPOINTS[endpoint]
+            if endpoint_config.fan_out is None:
+                return None
+            if endpoint_config.incremental_lookback is not None:
                 return (
                     "Fetched per scan. Incremental syncs pull data for scans created since the last sync "
                     "(with a 7-day overlap so late-finishing scans and recent triage changes are picked up)"
                 )
-            return None
+            return f"Fetched once per row in the {endpoint_config.fan_out.parent} table"
 
         def _build_schema(endpoint: str) -> SourceSchema:
             endpoint_config = CHECKMARX_ENDPOINTS[endpoint]
@@ -140,7 +138,7 @@ You can generate an API key in Checkmarx One under **Settings** → **Identity a
                 supports_incremental=has_incremental,
                 # The fan-outs' incremental lookback intentionally re-pulls a window of rows each run;
                 # only merge dedupes those on the primary key, append would materialize duplicates.
-                supports_append=has_incremental and not endpoint_config.fan_out_over_scans,
+                supports_append=has_incremental and endpoint_config.fan_out is None,
                 incremental_fields=endpoint_config.incremental_fields,
                 should_sync_default=endpoint_config.should_sync_default,
                 description=_description(endpoint),

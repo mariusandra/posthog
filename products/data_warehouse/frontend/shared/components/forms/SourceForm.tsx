@@ -7,6 +7,7 @@ import {
     LemonDivider,
     LemonFileInput,
     LemonInput,
+    LemonInputSelect,
     LemonSelect,
     LemonSkeleton,
     LemonSwitch,
@@ -25,7 +26,8 @@ import { lemonToast } from 'lib/lemon-ui/LemonToast'
 import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
 import { organizationLogic } from 'scenes/organizationLogic'
 
-import { SourceConfig, SourceFieldConfig } from '~/queries/schema/schema-general'
+import type { SourceFieldConfig } from 'products/data_warehouse/frontend/types'
+import { SourceConfigResponseApi } from 'products/warehouse_sources/frontend/generated/api.schemas'
 
 import { availableSourcesLogic } from '../../../scenes/NewSourceScene/availableSourcesLogic'
 import {
@@ -37,7 +39,7 @@ import { CDC_SOURCE_TYPES } from '../../cdc'
 import { isCustomSourceAiBuilderEnabled } from './customSourceManifest'
 import { CustomSourceManifestBuilder } from './CustomSourceManifestBuilder'
 import { customSourceManifestBuilderLogic } from './customSourceManifestBuilderLogic'
-import { IntegrationAccountSelector } from './IntegrationAccountSelector'
+import { IntegrationAccountSelector, findOauthBranch } from './IntegrationAccountSelector'
 import { SourceIntegrationChoice } from './IntegrationChoice'
 import { parseConnectionStringForSource } from './parsers'
 import { supportsDirectQuery } from './schemaGroupingUtils'
@@ -46,7 +48,7 @@ import { supportsDirectQuery } from './schemaGroupingUtils'
 const NO_OP_SET_VALUE = (): void => undefined
 
 export interface SourceFormProps {
-    sourceConfig: SourceConfig
+    sourceConfig: SourceConfigResponseApi
     showPrefix?: boolean
     showDescription?: boolean
     showAccessMethodSelector?: boolean
@@ -140,7 +142,7 @@ export function SourceAccessMethodSelector({
 
 export const sourceFieldToElement = (
     field: SourceFieldConfig,
-    sourceConfig: SourceConfig,
+    sourceConfig: SourceConfigResponseApi,
     lastValue?: any,
     isUpdateMode?: boolean,
     setSourceConnectionDetailsValue?: (key: FieldName, value: any) => void,
@@ -160,35 +162,59 @@ export const sourceFieldToElement = (
         return (
             <React.Fragment key={field.name}>
                 <LemonField name={field.name} label={field.label}>
-                    {({ onChange }) => (
-                        <LemonInput
-                            key={field.name}
-                            className="ph-connection-string"
-                            data-attr={field.name}
-                            placeholder={field.placeholder}
-                            type="text"
-                            onChange={(updatedConnectionString) => {
-                                onChange(updatedConnectionString)
-                                const { isValid, fields } = parseConnectionStringForSource(
-                                    sourceConfig.name,
-                                    updatedConnectionString
-                                )
+                    {({ value, onChange }) => {
+                        const typed = String(value ?? '')
+                        // A half-typed string parses as garbage, so only report a failure once the
+                        // value carries a scheme and reads as a whole connection string.
+                        const looksLikeConnectionString = typed.includes('://')
+                        const unparsed =
+                            looksLikeConnectionString &&
+                            !parseConnectionStringForSource(sourceConfig.name, typed).isValid
+                        return (
+                            <>
+                                <LemonInput
+                                    key={field.name}
+                                    className="ph-connection-string"
+                                    data-attr={field.name}
+                                    placeholder={field.placeholder}
+                                    type="text"
+                                    onChange={(updatedConnectionString) => {
+                                        onChange(updatedConnectionString)
+                                        const { isValid, fields } = parseConnectionStringForSource(
+                                            sourceConfig.name,
+                                            updatedConnectionString
+                                        )
 
-                                if (isValid) {
-                                    for (const { path, value } of fields) {
-                                        if (setSourceConnectionDetailsValue) {
-                                            setSourceConnectionDetailsValue(['payload', ...path], value)
-                                        } else {
-                                            sourceWizardLogic.actions.setSourceConnectionDetailsValue(
-                                                ['payload', ...path],
-                                                value
-                                            )
+                                        if (isValid) {
+                                            for (const { path, value } of fields) {
+                                                if (setSourceConnectionDetailsValue) {
+                                                    setSourceConnectionDetailsValue(['payload', ...path], value)
+                                                } else {
+                                                    sourceWizardLogic.actions.setSourceConnectionDetailsValue(
+                                                        ['payload', ...path],
+                                                        value
+                                                    )
+                                                }
+                                            }
                                         }
-                                    }
-                                }
-                            }}
-                        />
-                    )}
+                                    }}
+                                />
+                                {unparsed && (
+                                    <p className="m-0 mt-1 text-xs text-warning">
+                                        Couldn't read that connection string, so the fields below are still empty.{' '}
+                                        {field.placeholder ? (
+                                            <>
+                                                Check it looks like <code>{field.placeholder}</code>, or fill them in
+                                                yourself.
+                                            </>
+                                        ) : (
+                                            'Fill them in yourself instead.'
+                                        )}
+                                    </p>
+                                )}
+                            </>
+                        )
+                    }}
                 </LemonField>
                 <LemonDivider />
             </React.Fragment>
@@ -196,11 +222,15 @@ export const sourceFieldToElement = (
     }
 
     if (field.type === 'switch-group') {
-        const enabled = !!lastValue?.[field.name]?.enabled || lastValue?.[field.name]?.enabled === 'True'
+        // job_inputs booleans round-trip through the encrypted field as the strings "True"/"False",
+        // and LemonSwitch treats anything but a real `true` as off — translate before rendering.
+        // `lastValue` is already scoped to this group by the caller.
+        const toBool = (flag: unknown): boolean => flag === true || flag === 'True'
+        const enabled = toBool(lastValue?.enabled)
         return (
             <LemonField key={field.name} name={[field.name, 'enabled']} label={field.label}>
                 {({ value, onChange }) => {
-                    const isEnabled = value === undefined || value === null || value === 'False' ? enabled : value
+                    const isEnabled = value === undefined || value === null ? enabled : toBool(value)
                     return (
                         <>
                             {!!field.caption && <p className="mb-0">{field.caption}</p>}
@@ -222,6 +252,31 @@ export const sourceFieldToElement = (
                         </>
                     )
                 }}
+            </LemonField>
+        )
+    }
+
+    if (field.type === 'select' && field.multiple) {
+        // A config saved before the field became multiple still holds a bare string.
+        const toArray = (value: any): string[] => (Array.isArray(value) ? value : value ? [value] : [])
+
+        return (
+            <LemonField
+                key={field.name}
+                name={field.name}
+                label={field.label}
+                help={field.caption ? <LemonMarkdown className="text-xs">{field.caption}</LemonMarkdown> : undefined}
+            >
+                {({ value, onChange }) => (
+                    <LemonInputSelect
+                        mode="multiple"
+                        data-attr={field.name}
+                        placeholder={`Select ${field.label.toLowerCase()}`}
+                        options={field.options.map((option) => ({ key: option.value, label: option.label }))}
+                        value={toArray(value === undefined || value === null ? lastValue?.[field.name] : value)}
+                        onChange={onChange}
+                    />
+                )}
             </LemonField>
         )
     }
@@ -269,7 +324,12 @@ export const sourceFieldToElement = (
 
     if (field.type === 'textarea') {
         return (
-            <LemonField key={field.name} name={field.name} label={field.label}>
+            <LemonField
+                key={field.name}
+                name={field.name}
+                label={field.label}
+                help={field.caption ? <LemonMarkdown className="text-xs">{field.caption}</LemonMarkdown> : undefined}
+            >
                 {({ value, onChange }) => (
                     <LemonTextArea
                         className="ph-ignore-input"
@@ -334,10 +394,11 @@ export const sourceFieldToElement = (
                 integrationField={field.integrationField}
                 integrationKind={field.integrationKind}
                 sourceType={sourceConfig.name}
-                placeholder={field.placeholder}
-                caption={field.caption}
-                multiple={field.multiple}
+                placeholder={field.placeholder ?? undefined}
+                caption={field.caption ?? undefined}
+                multiple={field.multiple ?? undefined}
                 legacySingleField={legacySingleField}
+                oauthBranch={findOauthBranch(sourceConfig.fields, field.integrationField)}
             />
         )
     }
@@ -349,7 +410,7 @@ export const sourceFieldToElement = (
                     <div className="bg-fill-input p-2 border rounded-[var(--radius)]">
                         <LemonFileInput
                             value={value}
-                            accept={field.fileFormat.format}
+                            accept={field.fileFormat.format ?? '.json'}
                             multiple={false}
                             onChange={onChange}
                         />
@@ -370,19 +431,24 @@ export const sourceFieldToElement = (
         )
     }
 
+    // Every other field type returned above, so what is left renders as a plain input.
+    const inputField = field
+
     return (
         <LemonField
-            key={field.name}
-            name={field.name}
-            label={field.label}
-            help={field.caption ? <LemonMarkdown className="text-xs">{field.caption}</LemonMarkdown> : undefined}
+            key={inputField.name}
+            name={inputField.name}
+            label={inputField.label}
+            help={
+                inputField.caption ? <LemonMarkdown className="text-xs">{inputField.caption}</LemonMarkdown> : undefined
+            }
         >
             {({ value, onChange }) => (
                 <LemonInput
                     className="ph-ignore-input"
-                    data-attr={field.name}
-                    placeholder={field.placeholder}
-                    type={field.type as 'text'}
+                    data-attr={inputField.name}
+                    placeholder={inputField.placeholder}
+                    type={inputField.type as 'text'}
                     value={value || ''}
                     onChange={onChange}
                 />
@@ -949,8 +1015,8 @@ export function SourceFormComponent({
             {showPrefix && !isDirectQuerySource && !customAiIntroActive && (
                 <LemonField
                     name="prefix"
-                    label="Table prefix (optional)"
-                    help="Use only letters, numbers, and underscores. Must start with a letter or underscore."
+                    label="Table name prefix (optional)"
+                    help="Renames the tables PostHog creates. It doesn't filter which tables get imported. Use only letters, numbers, and underscores, and start with a letter or underscore."
                 >
                     {({ value, onChange }) => {
                         const cleaned = value ? value.trim().replace(/^_+|_+$/g, '') : ''

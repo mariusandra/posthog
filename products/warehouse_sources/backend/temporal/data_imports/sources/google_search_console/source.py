@@ -3,22 +3,22 @@ from typing import Optional, cast
 import requests
 from google.auth.exceptions import RefreshError
 
-from posthog.schema import (
+from posthog.exceptions_capture import capture_exception
+from posthog.models.integration import Integration
+
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldOauthAccountSelectConfig,
     SourceFieldOauthConfig,
-)
-
-from posthog.models.integration import Integration
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
+    SourceFieldSelectConfig,
+    SourceFieldSelectConfigOption,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
+    CanonicalDescriptions,
+)
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.integration_accounts import (
     IntegrationAccount,
     IntegrationAccountListingError,
@@ -27,22 +27,68 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.mix
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.googlesearchconsole import (
     GoogleSearchConsoleSourceConfig,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.google_search_console.google_search_console import (
     GoogleSearchConsoleResumeConfig,
+    _is_quota_error,
     google_search_console_session,
     google_search_console_source,
+    is_search_console_ui_url,
     list_sites,
     normalize_site_url,
     suggest_registered_site,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.google_search_console.settings import (
+    DEFAULT_SEARCH_TYPE,
+    PROPERTY_SCHEMAS,
     SEARCH_ANALYTICS_INCREMENTAL_FIELD,
     SEARCH_ANALYTICS_SCHEMAS,
+    SEARCH_TYPES,
+    SearchAnalyticsSchema,
+    qualified_schema_name,
 )
 from products.warehouse_sources.backend.types import ExternalDataSourceType
+
+# Fallback messages for unexpected failures during credential validation. The raw exception can
+# embed OAuth tokens, ids, or an HTML error body, so we capture it for debugging and show generic
+# guidance instead of surfacing `str(e)` to the user.
+_LOAD_CONNECTION_ERROR = (
+    "PostHog couldn't load your Google Search Console connection. Please reconnect your Google account and try again."
+)
+_LIST_SITES_ERROR = (
+    "PostHog couldn't reach Google Search Console to list your properties. Please try again in a few minutes."
+)
+
+# Listing properties fails three ways that need three different next steps, and Google reports the
+# first two both as a 403: an exhausted quota, an account that can't read any property, and a token
+# that no longer works. Telling a user to reconnect covers only the last one.
+_PROPERTY_LIST_QUOTA_ERROR = "Google is rate limiting Search Console requests. Wait a minute, then try again."
+_PROPERTY_LIST_ACCESS_ERROR = (
+    "The connected Google account can't read any Search Console property. Reconnect and allow "
+    "Search Console access, or use the account that owns the property."
+)
+_PROPERTY_LIST_CREDENTIALS_ERROR = (
+    "Google rejected the credentials for this connection. Reconnect your Google account, then pick a property."
+)
+# Search Console's own address is what sits in the browser bar while people hunt for the value to
+# paste, so it gets pasted. It is no account's property, and the "not visible to the connected
+# account" wording sends them off to check permissions instead of the field they filled in.
+_SEARCH_CONSOLE_UI_ERROR = (
+    "That's the address of the Search Console dashboard, not one of your properties. Enter the "
+    "property as 'https://example.com/' or 'sc-domain:example.com'."
+)
+
+
+def _property_list_http_error(error: requests.HTTPError) -> str:
+    response = error.response
+    if response is not None and _is_quota_error(response):
+        return _PROPERTY_LIST_QUOTA_ERROR
+    if response is not None and response.status_code == 403:
+        return _PROPERTY_LIST_ACCESS_ERROR
+    return _PROPERTY_LIST_CREDENTIALS_ERROR
 
 
 @SourceRegistry.register
@@ -75,6 +121,14 @@ class GoogleSearchConsoleSource(
             "invalid_grant": "Your Google Search Console connection has expired or been revoked. Please reconnect your account.",
         }
 
+    def get_retryable_errors(self) -> set[str]:
+        # `_query_search_analytics` already retries Search Analytics quota exhaustion in-line with
+        # backoff; if it stays exhausted once those retries run out, the property's quota refills
+        # over time and the resumable source picks up from the last saved date and row, so let
+        # Temporal retry the activity without paging it as a bug. The three quota raise sites carry a
+        # stable `(retryable)` marker, which does not collide with the 401/403 non-retryable keys.
+        return {"(retryable)"}
+
     def get_oauth_accounts(
         self, integration_id: int, team_id: int, search: str | None = None
     ) -> list[IntegrationAccount]:
@@ -91,13 +145,10 @@ class GoogleSearchConsoleSource(
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else None
             if status in (401, 403):
-                # The token refreshed fine but the connected Google account isn't authorized to read
-                # Search Console — a customer-side connection issue. Surface an actionable message the
-                # endpoint turns into a 400 rather than an unhandled 500.
-                raise IntegrationAccountListingError(
-                    "Google Search Console rejected the credentials. Please reconnect your account "
-                    "and ensure it has read access to the property."
-                )
+                # The token refreshed fine but Google still refused the listing — a customer-side
+                # connection issue. Surface an actionable message the endpoint turns into a 400
+                # rather than an unhandled 500.
+                raise IntegrationAccountListingError(_property_list_http_error(e))
             raise
         except RefreshError:
             # The stored OAuth token is revoked/expired/missing scopes — raised while AuthorizedSession
@@ -116,6 +167,33 @@ class GoogleSearchConsoleSource(
             for site in sites
         ]
 
+    @staticmethod
+    def effective_search_types(config: GoogleSearchConsoleSourceConfig) -> list[str]:
+        """Search types to build tables for, in `SEARCH_TYPES` order.
+
+        Falls back to web when unset, so sources created before this field existed keep
+        exactly the table set they already sync.
+        """
+        selected = set(config.search_types or [])
+        return [t for t in SEARCH_TYPES if t in selected] or [DEFAULT_SEARCH_TYPE]
+
+    @staticmethod
+    def _search_analytics_schema(base_name: str, schema: SearchAnalyticsSchema, search_type: str) -> SourceSchema:
+        is_default_type = search_type == DEFAULT_SEARCH_TYPE
+        description = schema["description"]
+        if not is_default_type and description is not None:
+            description = f"{description} Restricted to {search_type} search results."
+        return SourceSchema(
+            name=qualified_schema_name(base_name, search_type),
+            supports_incremental=True,
+            supports_append=True,
+            incremental_fields=[SEARCH_ANALYTICS_INCREMENTAL_FIELD],
+            description=description,
+            # Never default-on a non-web table: each one costs a full history backfill,
+            # and picking a search type shouldn't silently start one.
+            should_sync_default=schema["should_sync_default"] and is_default_type,
+        )
+
     def get_schemas(
         self,
         config: GoogleSearchConsoleSourceConfig,
@@ -126,15 +204,22 @@ class GoogleSearchConsoleSource(
         api_version: str | None = None,
     ) -> list[SourceSchema]:
         schemas = [
+            self._search_analytics_schema(base_name, schema, search_type)
+            for search_type in self.effective_search_types(config)
+            for base_name, schema in SEARCH_ANALYTICS_SCHEMAS.items()
+            if search_type == DEFAULT_SEARCH_TYPE or not schema.get("web_only")
+        ]
+        # Property metadata is a full snapshot each sync: both endpoints return the current
+        # state with no timestamp to filter on, so there is nothing to sync incrementally.
+        schemas += [
             SourceSchema(
                 name=name,
-                supports_incremental=True,
-                supports_append=True,
-                incremental_fields=[SEARCH_ANALYTICS_INCREMENTAL_FIELD],
-                description=schema["description"],
-                should_sync_default=schema["should_sync_default"],
+                supports_incremental=False,
+                supports_append=False,
+                description=property_schema["description"],
+                should_sync_default=property_schema["should_sync_default"],
             )
-            for name, schema in SEARCH_ANALYTICS_SCHEMAS.items()
+            for name, property_schema in PROPERTY_SCHEMAS.items()
         ]
 
         if names is not None:
@@ -142,6 +227,13 @@ class GoogleSearchConsoleSource(
             schemas = [s for s in schemas if s.name in names_set]
 
         return schemas
+
+    def get_canonical_descriptions(self) -> CanonicalDescriptions:
+        from products.warehouse_sources.backend.temporal.data_imports.sources.google_search_console.canonical_descriptions import (
+            CANONICAL_DESCRIPTIONS,
+        )
+
+        return CANONICAL_DESCRIPTIONS
 
     def get_resumable_source_manager(
         self, inputs: SourceInputs
@@ -172,6 +264,10 @@ class GoogleSearchConsoleSource(
         schema_name: Optional[str] = None,
         api_version: str | None = None,
     ) -> tuple[bool, str | None]:
+        site_url = normalize_site_url(config.site_url)
+        if is_search_console_ui_url(site_url):
+            return False, _SEARCH_CONSOLE_UI_ERROR
+
         try:
             session = google_search_console_session(config.google_search_console_integration_id, team_id)
         except Integration.DoesNotExist:
@@ -182,21 +278,20 @@ class GoogleSearchConsoleSource(
         except Exception as e:
             if "matching query does not exist" in str(e):
                 return False, (
-                    "Your Google Search Console connection is no longer available — it may have been "
+                    "Your Google Search Console connection is no longer available. It may have been "
                     "disconnected. Please reconnect your Google Search Console account."
                 )
-            return False, f"Could not load Google Search Console credentials: {e}"
+            capture_exception(e)
+            return False, _LOAD_CONNECTION_ERROR
 
         try:
             sites = list_sites(session)
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else None
             if status in (401, 403):
-                return (
-                    False,
-                    "Google Search Console rejected the credentials. Please reconnect your account and ensure it has read access to the property.",
-                )
-            return False, f"Failed to list Google Search Console sites: {e}"
+                return False, _property_list_http_error(e)
+            capture_exception(e)
+            return False, _LIST_SITES_ERROR
         except RefreshError:
             # Raised while AuthorizedSession refreshes the OAuth access token (e.g. invalid_scope or
             # invalid_grant): the stored token is missing the required permissions, or has expired or
@@ -209,10 +304,15 @@ class GoogleSearchConsoleSource(
                 "and grant access to Search Console.",
             )
         except Exception as e:
-            return False, f"Failed to list Google Search Console sites: {e}"
+            capture_exception(e)
+            return False, _LIST_SITES_ERROR
 
         normalized = {url: site.get("permissionLevel") for site in sites if (url := site.get("siteUrl")) is not None}
-        site_url = normalize_site_url(config.site_url)
+        if not normalized:
+            # The account owns no property at all, so no value can ever validate. The "not visible"
+            # message below sends the user back to re-checking the URL format they got right, which
+            # is the loop we keep seeing. Same failure the 403 listing path names, so same wording.
+            return False, _PROPERTY_LIST_ACCESS_ERROR
         if site_url not in normalized:
             suggestion = suggest_registered_site(site_url, normalized.keys())
             if suggestion is not None:
@@ -239,7 +339,7 @@ class GoogleSearchConsoleSource(
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.GOOGLE_SEARCH_CONSOLE,
+            name=ExternalDataSourceType.GOOGLESEARCHCONSOLE,
             category=DataWarehouseSourceCategory.ANALYTICS,
             keywords=["gsc", "seo", "search analytics", "organic search"],
             label="Google Search Console",
@@ -270,6 +370,25 @@ class GoogleSearchConsoleSource(
                             "Use the trailing slash for URL prefix properties or the `sc-domain:` prefix for domain properties."
                         ),
                         required=True,
+                    ),
+                    SourceFieldSelectConfig(
+                        name="search_types",
+                        label="Search types",
+                        required=True,
+                        defaultValue=DEFAULT_SEARCH_TYPE,
+                        multiple=True,
+                        options=[
+                            SourceFieldSelectConfigOption(label="Web", value="web"),
+                            SourceFieldSelectConfigOption(label="Image", value="image"),
+                            SourceFieldSelectConfigOption(label="Video", value="video"),
+                            SourceFieldSelectConfigOption(label="News", value="news"),
+                        ],
+                        caption=(
+                            "Which Search Console result types to sync. Web keeps the original table names. "
+                            "Every other type adds a copy of each table with the type as a suffix, such as "
+                            "search_analytics_by_page_image, and each copy costs a full set of API requests. "
+                            "Removing a type later stops its tables syncing, but keeps the data already imported."
+                        ),
                     ),
                 ],
             ),

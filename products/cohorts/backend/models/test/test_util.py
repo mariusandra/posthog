@@ -1,7 +1,10 @@
+from typing import Any
+
 from posthog.test.base import BaseTest, _create_person, flush_persons_and_events
 from unittest.mock import MagicMock, patch
 
 from django.db import DEFAULT_DB_ALIAS, OperationalError
+from django.test import SimpleTestCase
 
 from clickhouse_driver.errors import SocketTimeoutError
 from parameterized import parameterized
@@ -25,6 +28,7 @@ from posthog.models.person.sql import PERSON_STATIC_COHORT_TABLE
 
 from products.cohorts.backend.models.cohort import Cohort, CohortOrEmpty
 from products.cohorts.backend.models.util import (
+    ERROR_CODE_MESSAGES,
     CohortErrorCode,
     _recalculate_cohortpeople_for_team,
     _sanitize_query_for_cohort,
@@ -37,6 +41,7 @@ from products.cohorts.backend.models.util import (
     print_cohort_hogql_query,
     simplified_cohort_filter_properties,
     sort_cohorts_topologically,
+    validate_actors_query_for_cohort,
 )
 
 MISSING_COHORT_ID = 12345
@@ -49,6 +54,40 @@ def _create_cohort(**kwargs):
     is_static = kwargs.pop("is_static", False)
     cohort = Cohort.objects.create(team=team, name=name, groups=groups, is_static=is_static)
     return cohort
+
+
+class TestCohortQueryValidation(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("time_series_trends_without_day", None, None, True),
+            ("time_series_trends_with_empty_day", None, "", True),
+            ("time_series_trends_with_whitespace_day", None, " ", True),
+            ("time_series_trends_with_malformed_day", None, "not-a-date", True),
+            ("time_series_trends_with_integer_day", None, 0, True),
+            ("time_series_trends_with_day", None, "2026-07-01", False),
+            ("total_value_trends_without_day", "BoldNumber", None, False),
+            ("total_value_trends_with_day", "BoldNumber", "2026-07-01", True),
+        ]
+    )
+    def test_validate_actors_query_for_cohort_requires_valid_day(
+        self, _name: str, display: str | None, day: str | int | None, should_raise: bool
+    ) -> None:
+        insight: dict[str, Any] = {
+            "kind": "TrendsQuery",
+            "series": [{"kind": "EventsNode", "event": "$pageview"}],
+        }
+        if display:
+            insight["trendsFilter"] = {"display": display}
+        source: dict[str, Any] = {"kind": "InsightActorsQuery", "source": insight}
+        if day is not None:
+            source["day"] = day
+        query = {"kind": "ActorsQuery", "select": ["person"], "source": source}
+
+        if should_raise:
+            with self.assertRaises(DRFValidationError):
+                validate_actors_query_for_cohort(query)
+        else:
+            validate_actors_query_for_cohort(query)
 
 
 class TestCohortUtils(BaseTest):
@@ -365,30 +404,13 @@ class TestCohortUtils(BaseTest):
 
     def test_print_cohort_hogql_query_includes_settings(self):
         """Test that cohort queries include HogQL global settings"""
-        # Create a cohort with a HogQL query (simulating a funnel-to-cohort conversion)
+        # The settings come from the printer, so any actors-shaped cohort query reaches them.
         cohort = Cohort.objects.create(
             team=self.team,
-            name="Test Funnel Cohort",
+            name="Test Actors Cohort",
             query={
                 "kind": "ActorsQuery",
-                "source": {
-                    "kind": "FunnelsActorsQuery",
-                    "source": {
-                        "kind": "FunnelsQuery",
-                        "series": [
-                            {"kind": "EventsNode", "event": "$pageview"},
-                            {"kind": "EventsNode", "event": "$identify"},
-                        ],
-                        "interval": "day",
-                        "dateRange": {"date_from": "-30d"},
-                        "funnelsFilter": {
-                            "funnelVizType": "steps",
-                            "funnelWindowInterval": 1,
-                            "funnelWindowIntervalUnit": "day",
-                        },
-                    },
-                    "funnelStep": 2,
-                },
+                "source": {"kind": "HogQLQuery", "query": "SELECT id AS actor_id FROM persons"},
             },
         )
 
@@ -731,6 +753,120 @@ class TestCohortUtils(BaseTest):
         self.assertIn("order by", sql.lower())
         self.assertIn("limit 100", sql.lower())
         self.assertIn("as actor_id", sql.lower())
+
+    @parameterized.expand(
+        [
+            ("events_source", "SELECT count() AS cnt FROM events", "actor_id"),
+            ("persons_source", "SELECT properties.email AS email FROM persons", "actor_id"),
+        ]
+    )
+    def test_print_cohort_hogql_query_source_without_id_column_uses_table_fallback(self, _name, source_sql, expected):
+        # A stored ActorsQuery whose source selects no id-named column used to crash in
+        # ActorsQueryRunner.to_query with "Source query must have an id column" before
+        # print_cohort_hogql_query could apply its events→person.id / persons→id fallback.
+        cohort = Cohort.objects.create(
+            team=self.team,
+            name="Test Source Without ID Column",
+            query={
+                "kind": "ActorsQuery",
+                "source": {"kind": "HogQLQuery", "query": source_sql},
+            },
+        )
+
+        context = HogQLContext(team_id=self.team.id, enable_select_queries=True)
+
+        sql = print_cohort_hogql_query(cohort, context, team=self.team)
+
+        self.assertIn(expected, sql)
+
+    def test_print_cohort_hogql_query_source_without_id_column_still_raises_when_unresolvable(self):
+        # When the source has no id column and its table isn't events/persons, the fallback
+        # can't resolve an actor id — surface the clear "Could not find" error, not a crash
+        # deep inside to_query.
+        cohort = Cohort.objects.create(
+            team=self.team,
+            name="Test Unresolvable Source",
+            query={
+                "kind": "ActorsQuery",
+                "source": {"kind": "HogQLQuery", "query": "SELECT count() AS cnt FROM sessions"},
+            },
+        )
+
+        context = HogQLContext(team_id=self.team.id, enable_select_queries=True)
+
+        with self.assertRaises(ValueError) as cm:
+            print_cohort_hogql_query(cohort, context, team=self.team)
+
+        self.assertIn("Could not find a person_id, actor_id, id, or distinct_id column", str(cm.exception))
+
+    @parameterized.expand(
+        [
+            # Unbounded query: positional GROUP BY must be inlined (bounded ORDER BY is exercised below).
+            (
+                "unbounded_group_by",
+                "SELECT count(), person_id FROM events GROUP BY 2",
+                "group by 2",
+                "group by",
+            ),
+            # Bounded query keeps its ORDER BY, so a positional ORDER BY must be inlined too.
+            (
+                "bounded_order_by",
+                "SELECT person_id, count() AS cnt FROM events GROUP BY 1 ORDER BY 2 DESC LIMIT 100",
+                "order by 2",
+                "order by count()",
+            ),
+            # LIMIT BY is also positional and marks the query bounded, so its ordinal must be inlined too.
+            (
+                "bounded_limit_by",
+                "SELECT person_id, event FROM events ORDER BY person_id LIMIT 1 BY 2",
+                "by 2",
+                "by events.event",
+            ),
+        ]
+    )
+    def test_print_cohort_hogql_query_resolves_positional_references(
+        self, _name, query, dangling_ordinal, resolved_clause
+    ):
+        # A positional GROUP BY/ORDER BY ordinal (e.g. `GROUP BY 2`) references the Nth SELECT
+        # expression. Collapsing the SELECT to the single actor column leaves any ordinal past the
+        # first pointing out of bounds, so ClickHouse rejects the query and the cohort never fills.
+        cohort = Cohort.objects.create(
+            team=self.team,
+            name="Test Positional Cohort",
+            query={"kind": "HogQLQuery", "query": query},
+        )
+
+        context = HogQLContext(team_id=self.team.id, enable_select_queries=True)
+
+        sql = print_cohort_hogql_query(cohort, context, team=self.team).lower()
+
+        self.assertIn("as actor_id", sql)
+        # The ordinal must be inlined to the real expression, not left dangling past the collapsed SELECT.
+        self.assertNotIn(dangling_ordinal, sql)
+        # Dropping the clause outright would also remove the ordinal, but it would change who lands in
+        # the cohort, so the clause itself has to survive.
+        self.assertIn(resolved_clause, sql)
+
+    def test_print_cohort_hogql_query_leaves_positional_references_on_wildcard_select(self):
+        # `*` is a single node in the SELECT list until the resolver fans it out into one node per
+        # column, and ClickHouse numbers positional arguments against that expanded list. Guessing
+        # which expression ordinal 2 means here would quietly build a different cohort, so the
+        # ordinals stay untouched and the query keeps failing the way it does without any inlining.
+        cohort = Cohort.objects.create(
+            team=self.team,
+            name="Test Wildcard Positional Cohort",
+            query={
+                "kind": "HogQLQuery",
+                "query": "SELECT *, count() AS cnt FROM events GROUP BY 1 ORDER BY 2 DESC LIMIT 100",
+            },
+        )
+
+        context = HogQLContext(team_id=self.team.id, enable_select_queries=True)
+
+        sql = print_cohort_hogql_query(cohort, context, team=self.team).lower()
+
+        self.assertIn("group by 1", sql)
+        self.assertIn("order by 2", sql)
 
 
 class TestGetNestedCohortIds(BaseTest):
@@ -1091,6 +1227,7 @@ class TestParseErrorCode(BaseTest):
             ("value_error", "ValueError", CohortErrorCode.UNKNOWN),
             ("clickhouse_regex", "ClickHouseRegexError", CohortErrorCode.INVALID_REGEX),
             ("clickhouse_memory", "ClickHouseMemoryError", CohortErrorCode.MEMORY_LIMIT),
+            ("clickhouse_too_many_bytes", "ClickHouseTooManyBytesError", CohortErrorCode.DATA_LIMIT),
             ("clickhouse_timeout", "ClickHouseTimeoutError", CohortErrorCode.TIMEOUT),
             ("clickhouse_type", "ClickHouseTypeError", CohortErrorCode.INCOMPATIBLE_TYPES),
             ("generic_exception", "Exception", CohortErrorCode.UNKNOWN),
@@ -1133,6 +1270,7 @@ class TestParseErrorCode(BaseTest):
         clickhouse_code_names = {
             "ClickHouseRegexError": "CANNOT_COMPILE_REGEXP",
             "ClickHouseMemoryError": "MEMORY_LIMIT_EXCEEDED",
+            "ClickHouseTooManyBytesError": "TOO_MANY_BYTES",
             "ClickHouseTimeoutError": "TIMEOUT_EXCEEDED",
             "ClickHouseTypeError": "NO_COMMON_TYPE",
         }
@@ -1152,6 +1290,7 @@ class TestGetFriendlyErrorMessage(BaseTest):
             (CohortErrorCode.INTERRUPTED, "interrupted"),
             (CohortErrorCode.TIMEOUT, "terminated for taking too long"),
             (CohortErrorCode.MEMORY_LIMIT, "terminated for using too much memory"),
+            (CohortErrorCode.DATA_LIMIT, "reading too much data"),
             (CohortErrorCode.QUERY_SIZE, "query that was too large"),
             (CohortErrorCode.VALIDATION_ERROR, "an error occurred"),
             (CohortErrorCode.INVALID_REGEX, "invalid regular expression"),
@@ -1164,6 +1303,23 @@ class TestGetFriendlyErrorMessage(BaseTest):
         message = get_friendly_error_message(error_code)
         assert message is not None
         self.assertIn(expected_substring, message.lower())
+
+    @parameterized.expand(
+        [
+            (CohortErrorCode.CAPACITY, "system was busy"),
+            (CohortErrorCode.INTERRUPTED, "interrupted"),
+        ]
+    )
+    def test_get_friendly_error_message_drops_the_retry_promise_when_nothing_will_retry(
+        self, error_code: str, expected_substring: str
+    ):
+        message = get_friendly_error_message(error_code, will_retry=False)
+        assert message is not None
+        self.assertIn(expected_substring, message.lower())
+        # Only the dynamic recalculation scheduler retries, so a cohort it never picks up must not
+        # be told to wait for one.
+        self.assertNotIn("automatically retry", message.lower())
+        self.assertIn("automatically retry", ERROR_CODE_MESSAGES[error_code].lower())
 
     def test_get_friendly_error_message_none(self):
         self.assertIsNone(get_friendly_error_message(None))

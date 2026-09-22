@@ -10,8 +10,6 @@ import { insightLogic } from 'scenes/insights/insightLogic'
 import type { SeriesDatum } from 'scenes/insights/InsightTooltip/insightTooltipUtils'
 import { teamLogic } from 'scenes/teamLogic'
 import { openPersonsModal } from 'scenes/trends/persons-modal/PersonsModal'
-import { trendsDataLogic } from 'scenes/trends/trendsDataLogic'
-import type { IndexedTrendResult } from 'scenes/trends/types'
 
 import { cohortsModel } from '~/models/cohortsModel'
 import { groupsModel } from '~/models/groupsModel'
@@ -20,7 +18,12 @@ import { InsightVizNode } from '~/queries/schema/schema-general'
 import { QueryContext } from '~/queries/types'
 import { ChartDisplayType } from '~/types'
 
+import { trendsDataLogic } from 'products/product_analytics/frontend/insights/trends/trendsDataLogic'
+import type { IndexedTrendResult } from 'products/product_analytics/frontend/insights/trends/types'
+
+import { hasTrendsChartData } from '../../shared/hasTrendsChartData'
 import { InsightSeriesTooltip } from '../../shared/InsightSeriesTooltip'
+import { getSeriesIdentification } from '../../shared/seriesIdentification'
 import { makeChartErrorHandler } from '../../trends/shared/chartErrorHandler'
 import { getTrendsSeriesDisplayLabel } from '../../trends/shared/getTrendsSeriesDisplayLabel'
 import {
@@ -31,7 +34,6 @@ import {
 import { useInsightsLegendConfig } from '../../trends/shared/useInsightsLegendConfig'
 import { handleStickinessChartClick } from '../StickinessLineChart/handleStickinessChartClick'
 import {
-    buildStickinessLabels,
     buildStickinessTooltipTitle,
     stickinessPercentFormatter,
     STICKINESS_TOOLTIP_CONFIG,
@@ -64,11 +66,17 @@ export function StickinessBarChart({ context }: StickinessBarChartProps): JSX.El
         hasPersonsModal,
         querySource,
         showValuesOnSeries,
+        isSingleSeriesDefinition,
     } = useValues(trendsDataLogic(insightProps))
     const { timezone, baseCurrency } = useValues(teamLogic)
     const { aggregationLabel } = useValues(groupsModel)
     const { allCohorts } = useValues(cohortsModel)
     const { formatPropertyValueForDisplay } = useValues(propertyDefinitionsModel)
+
+    const seriesIdentification = useMemo(
+        () => getSeriesIdentification((indexedResults ?? []).map(buildTrendsSeriesMeta)),
+        [indexedResults]
+    )
 
     const getLabel = useCallback(
         (r: IndexedTrendResult): string =>
@@ -76,8 +84,16 @@ export function StickinessBarChart({ context }: StickinessBarChartProps): JSX.El
                 breakdownFilter,
                 cohorts: allCohorts?.results,
                 formatPropertyValueForDisplay,
+                isSingleSeriesDefinition,
+                seriesIdentification,
             }),
-        [breakdownFilter, allCohorts?.results, formatPropertyValueForDisplay]
+        [
+            breakdownFilter,
+            allCohorts?.results,
+            formatPropertyValueForDisplay,
+            isSingleSeriesDefinition,
+            seriesIdentification,
+        ]
     )
 
     // Inverted polarity vs legacy `isStacked` in `ActionsLineGraph`; matches `TrendsBarChart`.
@@ -85,10 +101,9 @@ export function StickinessBarChart({ context }: StickinessBarChartProps): JSX.El
 
     const resolvedGroupTypeLabel = context?.groupTypeLabel ?? resolveGroupTypeLabel(labelGroupType, aggregationLabel)
 
-    const bucketCount = currentPeriodResult?.labels?.length ?? 0
-    const labels = useMemo(() => buildStickinessLabels(bucketCount, interval), [bucketCount, interval])
+    const labels = currentPeriodResult?.labels ?? []
 
-    const hasData = (indexedResults ?? []).some((r: IndexedTrendResult) => r.count !== 0)
+    const hasData = hasTrendsChartData(indexedResults)
 
     // `TimeSeriesBarChart` has a single y-axis — `showMultipleYAxes` is intentionally not forwarded.
     const series: Series<TrendsSeriesMeta>[] = useMemo(

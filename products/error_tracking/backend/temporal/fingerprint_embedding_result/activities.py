@@ -4,9 +4,6 @@ from datetime import datetime, timedelta
 from django.conf import settings
 from django.utils.dateparse import parse_datetime
 
-import posthoganalytics
-from temporalio import activity
-
 from posthog.hogql import ast
 from posthog.hogql.parser import parse_select
 from posthog.hogql.query import execute_hogql_query
@@ -15,8 +12,8 @@ from posthog.clickhouse.client.connection import ClickHouseUser, Workload
 from posthog.event_usage import groups
 from posthog.exceptions_capture import capture_exception
 from posthog.models import Team
-from posthog.ph_client import ph_scoped_capture
-from posthog.temporal.common.utils import close_db_connections
+from posthog.ph_client import ph_background_capture
+from posthog.temporal.common.posthog_client import is_expected_activity_failure
 
 from products.error_tracking.backend.indexed_embedding import EMBEDDING_TABLES
 from products.error_tracking.backend.models import (
@@ -184,13 +181,13 @@ def _report_closest_fingerprint_metrics(
         properties[f"rank_{index}_fingerprint"] = closest_fingerprint.fingerprint
         properties[f"rank_{index}_distance"] = closest_fingerprint.distance
 
-    with ph_scoped_capture() as capture:
-        capture(
-            distinct_id=str(team.uuid),
-            event="error_tracking_fingerprint_embedding_result_metrics",
-            groups=groups(team=team),
-            properties=properties,
-        )
+    capture = ph_background_capture()
+    capture(
+        distinct_id=str(team.uuid),
+        event="error_tracking_fingerprint_embedding_result_metrics",
+        groups=groups(team=team),
+        properties=properties,
+    )
 
 
 def _merge_fingerprint_into_closest_issue(
@@ -239,7 +236,7 @@ def _merge_fingerprint_into_closest_issue(
 
         source_issue_id = source_fingerprint.issue_id
         target_issue_id = target_fingerprint.issue_id
-        merge_result = target_fingerprint.issue.merge(
+        merge_result, _merged_issue_ids = target_fingerprint.issue.merge(
             issue_ids=[source_issue_id],
             expected_fingerprint_issue_ids={
                 fingerprint: source_issue_id,
@@ -251,20 +248,20 @@ def _merge_fingerprint_into_closest_issue(
         if merge_result != ErrorTrackingIssueMergeResult.MERGED:
             raise StaleAutoMergeStateError(f"Fingerprint issue ownership changed before auto-merge for team {team_id}")
 
-        with ph_scoped_capture() as capture:
-            capture(
-                distinct_id=str(team.uuid),
-                event="error_tracking_issue_merged",
-                groups=groups(team=team),
-                properties={
-                    "merge_source": "auto",
-                    "source_issue_id": str(source_issue_id),
-                    "target_issue_id": str(target_issue_id),
-                    "source_fingerprint": fingerprint,
-                    "target_fingerprint": candidate.fingerprint,
-                    "distance": candidate.distance,
-                },
-            )
+        capture = ph_background_capture()
+        capture(
+            distinct_id=str(team.uuid),
+            event="error_tracking_issue_merged",
+            groups=groups(team=team),
+            properties={
+                "merge_source": "auto",
+                "source_issue_id": str(source_issue_id),
+                "target_issue_id": str(target_issue_id),
+                "source_fingerprint": fingerprint,
+                "target_fingerprint": candidate.fingerprint,
+                "distance": candidate.distance,
+            },
+        )
         return 1
 
     return 0
@@ -303,23 +300,13 @@ def merge_similar_fingerprints(
             closest_fingerprints=closest_fingerprints,
         )
     except Exception as err:
-        _capture_activity_exception(
-            err,
-            inputs,
-            activity_name=activity_name,
-            workflow_name=workflow_name,
-        )
+        # A drained worker raises a cancellation straight into this thread, usually while the
+        # merge waits on a row lock, so the trace looks like a database fault.
+        if not is_expected_activity_failure(err):
+            _capture_activity_exception(
+                err,
+                inputs,
+                activity_name=activity_name,
+                workflow_name=workflow_name,
+            )
         raise
-
-
-@activity.defn
-@posthoganalytics.scoped()
-@close_db_connections
-def merge_similar_fingerprints_activity(
-    inputs: FingerprintEmbeddingResultInputs,
-) -> FingerprintEmbeddingMergeResult:
-    return merge_similar_fingerprints(
-        inputs,
-        activity_name="merge_similar_fingerprints_activity",
-        workflow_name="error-tracking-fingerprint-embedding-result",
-    )

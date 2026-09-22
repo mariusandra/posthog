@@ -11,8 +11,14 @@ export function humanizeHogFunctionType(type: HogFunctionTypeType, plural: boole
     if (type === 'source_webhook') {
         return 'source' + (plural ? 's' : '')
     }
+    if (type === 'internal_destination') {
+        return 'notification' + (plural ? 's' : '')
+    }
     if (type === 'site_app') {
         return 'Web script' + (plural ? 's' : '')
+    }
+    if (type === 'transformation_log') {
+        return 'log transformation' + (plural ? 's' : '')
     }
     return type.replaceAll('_', ' ') + (plural ? 's' : '')
 }

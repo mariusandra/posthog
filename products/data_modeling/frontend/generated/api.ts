@@ -15,7 +15,9 @@ import type {
     DataModelingNodesLineageRetrieveParams,
     DataModelingNodesListParams,
     EdgeApi,
+    LineageResponseApi,
     NodeApi,
+    NodeResumeApi,
     PaginatedDAGListApi,
     PaginatedEdgeListApi,
     PaginatedNodeListApi,
@@ -362,6 +364,28 @@ export const dataModelingNodesMaterializeCreate = async (
     })
 }
 
+export const getDataModelingNodesResumeCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/data_modeling_nodes/${id}/resume/`
+}
+
+/**
+ * Resume a node suspended after repeated failed materializations.
+ *
+ * Scheduled runs skip a suspended node and its descendants, so it cannot succeed its way back
+ * on its own. Resuming also gives it a fresh failure window rather than re-suspending on the
+ * next failure.
+ */
+export const dataModelingNodesResumeCreate = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<NodeResumeApi> => {
+    return apiMutator<NodeResumeApi>(getDataModelingNodesResumeCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+    })
+}
+
 export const getDataModelingNodesRunCreateUrl = (projectId: string, id: string) => {
     return `/api/projects/${projectId}/data_modeling_nodes/${id}/run/`
 }
@@ -388,20 +412,6 @@ export const dataModelingNodesRunCreate = async (
     })
 }
 
-export const getDataModelingNodesDagIdsRetrieveUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/data_modeling_nodes/dag_ids/`
-}
-
-/**
- * Get all distinct DAGs for the team.
- */
-export const dataModelingNodesDagIdsRetrieve = async (projectId: string, options?: RequestInit): Promise<NodeApi> => {
-    return apiMutator<NodeApi>(getDataModelingNodesDagIdsRetrieveUrl(projectId), {
-        ...options,
-        method: 'GET',
-    })
-}
-
 export const getDataModelingNodesLineageRetrieveUrl = (
     projectId: string,
     params?: DataModelingNodesLineageRetrieveParams
@@ -424,15 +434,15 @@ export const getDataModelingNodesLineageRetrieveUrl = (
 /**
  * Return the subgraph of nodes and edges reachable from a node (upstream + downstream).
  *
- * Accepts either node_id or saved_query_id, so a caller holding only a saved query (the SQL
- * editor) doesn't need to resolve the node itself.
+ * Accepts node_id, saved_query_id or metric_id, so a caller holding only the backing resource
+ * (the SQL editor, the metric page) doesn't need to resolve the node itself.
  */
 export const dataModelingNodesLineageRetrieve = async (
     projectId: string,
     params?: DataModelingNodesLineageRetrieveParams,
     options?: RequestInit
-): Promise<NodeApi> => {
-    return apiMutator<NodeApi>(getDataModelingNodesLineageRetrieveUrl(projectId, params), {
+): Promise<LineageResponseApi> => {
+    return apiMutator<LineageResponseApi>(getDataModelingNodesLineageRetrieveUrl(projectId, params), {
         ...options,
         method: 'GET',
     })

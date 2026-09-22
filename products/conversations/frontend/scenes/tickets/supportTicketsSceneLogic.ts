@@ -1,16 +1,31 @@
-import { MakeLogicType, actions, afterMount, kea, key, listeners, path, props, reducers, selectors } from 'kea'
+import {
+    MakeLogicType,
+    actions,
+    afterMount,
+    isBreakpoint,
+    kea,
+    key,
+    listeners,
+    path,
+    props,
+    reducers,
+    selectors,
+} from 'kea'
 import { actionToUrl, router, urlToAction } from 'kea-router'
 
 import { lemonToast } from '@posthog/lemon-ui'
 
 import api from 'lib/api'
 import { Sorting } from 'lib/lemon-ui/LemonTable/sorting'
+import { accessLevelSatisfied } from 'lib/utils/accessControlUtils'
 import { objectsEqual } from 'lib/utils/objects'
+import { Scene } from 'scenes/sceneTypes'
 import { teamLogic } from 'scenes/teamLogic'
 
-import { TeamType } from '~/types'
+import { AccessControlLevel, AccessControlResourceType, Breadcrumb, TeamType } from '~/types'
 
 import { conversationsViewsRetrieve } from '../../generated/api'
+import type { AiTriageResultEnumApi } from '../../generated/api.schemas'
 import { normalizeAssigneeFilter } from '../../types'
 import type {
     AITriageFilterValue,
@@ -187,6 +202,7 @@ export interface supportTicketsSceneLogicValues {
     aiTriageResultFilter: AITriageFilterValue[]
     assigneeFilter: AssigneeFilterEntry[]
     assigneeFilterEntries: AssigneeFilterEntry[]
+    breadcrumbs: Breadcrumb[]
     bulkUpdating: boolean
     channelFilter: TicketChannel | 'all'
     currentFilters: TicketViewFilters
@@ -197,6 +213,7 @@ export interface supportTicketsSceneLogicValues {
         dateTo: string | null
     } | null
     dateTo: string | null
+    editableSelectedTicketIds: string[]
     hasActiveFilters: boolean
     orderBy: string
     priorityFilter: TicketPriority[]
@@ -254,7 +271,7 @@ export interface supportTicketsSceneLogicActions {
         view: SavedTicketView | null
     }
     setAiTriageResultFilter: (results: AITriageFilterValue[]) => {
-        results: AITriageFilterValue[]
+        results: AiTriageResultEnumApi[]
     }
     setAssigneeFilter: (assignees: AssigneeFilterEntry[]) => {
         assignees: AssigneeFilterEntry[]
@@ -324,16 +341,18 @@ export interface supportTicketsSceneLogicActions {
 export interface supportTicketsSceneLogicMeta {
     key: string
     __keaTypeGenInternalSelectorTypes: {
+        breadcrumbs: (activeView: SavedTicketView | null) => Breadcrumb[]
         aiEnabled: (currentTeam: TeamType | null | import('~/types').TeamPublicType) => boolean
         orderBy: (sorting: Sorting | null) => string
         selectedTickets: (tickets: Ticket[], selectedTicketIds: string[]) => Ticket[]
+        editableSelectedTicketIds: (selectedTickets: Ticket[]) => string[]
         assigneeFilterEntries: (assigneeFilter: AssigneeFilterEntry[]) => AssigneeFilterEntry[]
         hasActiveFilters: (
             statusFilter: TicketStatus[],
             priorityFilter: TicketPriority[],
             channelFilter: TicketChannel | 'all',
             slaFilter: TicketSlaState | 'all',
-            aiTriageResultFilter: AITriageFilterValue[],
+            aiTriageResultFilter: AiTriageResultEnumApi[],
             assigneeFilterEntries: AssigneeFilterEntry[],
             tagsFilter: string[],
             tagsExcludeFilter: string[],
@@ -345,7 +364,7 @@ export interface supportTicketsSceneLogicMeta {
             priorityFilter: TicketPriority[],
             channelFilter: TicketChannel | 'all',
             slaFilter: TicketSlaState | 'all',
-            aiTriageResultFilter: AITriageFilterValue[],
+            aiTriageResultFilter: AiTriageResultEnumApi[],
             assigneeFilterEntries: AssigneeFilterEntry[],
             tagsFilter: string[],
             tagsMatch: TicketTagsMatch,
@@ -534,6 +553,7 @@ export const supportTicketsSceneLogic = kea<supportTicketsSceneLogicType>([
         ],
         activeView: [
             null as SavedTicketView | null,
+            { persist: true },
             {
                 setActiveView: (_, { view }) => view,
                 clearActiveView: () => null,
@@ -564,6 +584,12 @@ export const supportTicketsSceneLogic = kea<supportTicketsSceneLogicType>([
         ],
     }),
     selectors({
+        breadcrumbs: [
+            (s) => [s.activeView],
+            (activeView: SavedTicketView | null): Breadcrumb[] => [
+                { key: Scene.SupportTickets, name: activeView?.name || 'Ticket list' },
+            ],
+        ],
         aiEnabled: [
             () => [teamLogic.selectors.currentTeam],
             (currentTeam: TeamType | null): boolean => !!currentTeam?.conversations_settings?.ai_suggestions_enabled,
@@ -584,6 +610,21 @@ export const supportTicketsSceneLogic = kea<supportTicketsSceneLogicType>([
                 const idSet = new Set(selectedIds)
                 return tickets.filter((t) => idSet.has(t.id))
             },
+        ],
+        editableSelectedTicketIds: [
+            (s) => [s.selectedTickets],
+            (selectedTickets: Ticket[]): string[] =>
+                selectedTickets
+                    .filter(
+                        (ticket) =>
+                            !ticket.user_access_level ||
+                            accessLevelSatisfied(
+                                AccessControlResourceType.Ticket,
+                                ticket.user_access_level,
+                                AccessControlLevel.Editor
+                            )
+                    )
+                    .map((ticket) => ticket.id),
         ],
         assigneeFilterEntries: [
             (s) => [s.assigneeFilter],
@@ -720,9 +761,15 @@ export const supportTicketsSceneLogic = kea<supportTicketsSceneLogicType>([
 
             try {
                 const response = await api.conversationsTickets.list(params)
+                // Drop responses that were superseded while in flight, so a slow reply
+                // to an older query can't overwrite newer results.
+                breakpoint()
                 actions.setTickets(response.results || [])
                 actions.setTotalCount(response.count ?? response.results?.length ?? 0)
-            } catch {
+            } catch (error: any) {
+                if (isBreakpoint(error)) {
+                    throw error
+                }
                 lemonToast.error('Failed to load tickets')
                 actions.setTicketsLoading(false)
             }

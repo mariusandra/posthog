@@ -92,6 +92,13 @@
             "intents": ["product_analytics"]
         },
         {
+            "path": "Data catalog",
+            "category": "Analytics",
+            "iconType": "data_warehouse",
+            "type": null,
+            "intents": ["data_catalog"]
+        },
+        {
             "path": "SQL editor",
             "category": "Analytics",
             "iconType": "sql_editor",
@@ -154,6 +161,7 @@
             "type": null,
             "intents": ["marketing_analytics"]
         },
+        { "path": "Inbox", "category": "Tools", "iconType": null, "type": null, "intents": [] },
         { "path": "Links", "category": "Unreleased", "iconType": null, "type": "link", "intents": ["links"] },
         {
             "path": "Live Debugger",
@@ -177,6 +185,7 @@
             "type": "mcp_analytics",
             "intents": ["mcp_analytics"]
         },
+        { "path": "MCP servers", "category": "AI engineering", "iconType": "tools", "type": null, "intents": [] },
         {
             "path": "Metrics",
             "category": "App monitoring",
@@ -224,6 +233,13 @@
         },
         { "path": "Code review", "category": "Unreleased", "iconType": null, "type": null, "intents": ["review_hog"] },
         { "path": "Skills", "category": "Tools", "iconType": null, "type": "llm_skills", "intents": ["skills"] },
+        {
+            "path": "Apps",
+            "category": "Unreleased",
+            "iconType": "tools",
+            "type": "streamlit_app",
+            "intents": ["streamlit_apps"]
+        },
         { "path": "Surveys", "category": "Behavior", "iconType": "survey", "type": "survey", "intents": ["surveys"] },
         { "path": "Toolbar", "category": "Tools", "iconType": "toolbar", "type": "toolbar", "intents": ["toolbar"] },
         {
@@ -254,6 +270,7 @@
             "type": null,
             "intents": ["web_analytics"]
         },
+        { "path": "Wizard", "category": "Tools", "iconType": null, "type": "wizard", "intents": [] },
         {
             "path": "Workflows",
             "category": "Tools",
@@ -264,7 +281,8 @@
     ],
     "games": [
         { "path": "368 Hedgehogs", "category": null, "iconType": null, "type": null, "intents": [] },
-        { "path": "Flappy Hog", "category": null, "iconType": null, "type": null, "intents": [] }
+        { "path": "Flappy Hog", "category": null, "iconType": null, "type": null, "intents": [] },
+        { "path": "Ship It", "category": null, "iconType": null, "type": null, "intents": [] }
     ],
     "metadata": [
         { "path": "Actions", "category": "Schema", "iconType": null, "type": null, "intents": [] },
@@ -298,6 +316,13 @@
         },
         { "path": "Core events", "category": "Schema", "iconType": null, "type": null, "intents": [] },
         {
+            "path": "Warehouse properties",
+            "category": "Schema",
+            "iconType": "data_warehouse",
+            "type": null,
+            "intents": []
+        },
+        {
             "path": "Sources",
             "category": "Pipeline",
             "iconType": "data_pipeline_metadata",
@@ -305,6 +330,13 @@
             "intents": []
         },
         { "path": "Models", "category": "Tools", "iconType": "sql_editor", "type": "sql", "intents": [] },
+        {
+            "path": "Warehouse destinations",
+            "category": "Pipeline",
+            "iconType": "data_warehouse",
+            "type": null,
+            "intents": []
+        },
         {
             "path": "Managed viewsets",
             "category": "Unreleased",
@@ -343,7 +375,6 @@
         },
         { "path": "SQL variables", "category": "Schema", "iconType": null, "type": null, "intents": [] },
         { "path": "Annotations", "category": "Metadata", "iconType": "annotation", "type": null, "intents": [] },
-        { "path": "Comments", "category": "Metadata", "iconType": "comment", "type": null, "intents": [] },
         { "path": "Revenue definitions", "category": "Schema", "iconType": null, "type": null, "intents": [] }
     ]
 }

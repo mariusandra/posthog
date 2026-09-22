@@ -1,31 +1,29 @@
 import clsx from 'clsx'
 import { useActions, useValues } from 'kea'
-import { useEffect, useState } from 'react'
 
 import { IconPencil, IconWarning } from '@posthog/icons'
-import { LemonButton, LemonModal, LemonTag, Link, ProfilePicture, Tooltip } from '@posthog/lemon-ui'
+import { LemonButton, LemonCard, LemonTag, Link, ProfilePicture, Tooltip } from '@posthog/lemon-ui'
 
 import { CopyToClipboardInline } from 'lib/components/CopyToClipboard'
 import { IconOpenInNew } from 'lib/lemon-ui/icons'
-import { LemonTextArea } from 'lib/lemon-ui/LemonTextArea/LemonTextArea'
 import { Label } from 'lib/ui/Label/Label'
-import { cn } from 'lib/utils/css-classes'
 import { urls } from 'scenes/urls'
 
 import { ExperimentStatsMethod, ExperimentStatus } from '~/types'
 
-import { CONCLUSION_DISPLAY_CONFIG } from '../constants'
+import { StatusTag } from 'products/experiments/frontend/components/StatusTag'
+import { CONCLUSION_DISPLAY_CONFIG } from 'products/experiments/frontend/constants'
+import { getExperimentStatus, isExperimentPaused } from 'products/experiments/frontend/experimentStatus'
+
 import { experimentLogic } from '../experimentLogic'
 import type { ExperimentSceneLogicProps } from '../experimentSceneLogic'
-import { getExperimentStatus, isExperimentPaused } from '../experimentsLogic'
 import { modalsLogic } from '../modalsLogic'
 import { ExperimentDuration } from './ExperimentDuration'
 import { ExperimentReloadActionContainer } from './ExperimentReloadActionContainer'
 import { flagCleanupTaskLogic } from './flagCleanupTaskLogic'
 import { RunningTime } from './RunningTime'
-import { StatusTag } from './StatusTag'
 
-function FlagCleanupLine({ experimentId, taskId }: { experimentId: number; taskId: string }): JSX.Element | null {
+function FlagCleanupField({ experimentId, taskId }: { experimentId: number; taskId: string }): JSX.Element | null {
     const { cleanupTask } = useValues(flagCleanupTaskLogic({ experimentId }))
 
     if (!cleanupTask) {
@@ -52,26 +50,29 @@ function FlagCleanupLine({ experimentId, taskId }: { experimentId: number; taskI
     const showLink = isExternalLink || cleanupTask.can_view_task
 
     return (
-        <div className="text-xs text-muted mt-1 mb-3 flex items-center gap-1">
-            {text}
-            {showLink && (
-                <>
-                    ·
-                    <Link
-                        target={isExternalLink ? '_blank' : undefined}
-                        className="flex items-center gap-0.5"
-                        to={prUrl ?? urls.taskDetail(taskId)}
-                    >
-                        {isExternalLink ? (
-                            <>
-                                View on GitHub <IconOpenInNew fontSize="12" />
-                            </>
-                        ) : (
-                            'View task'
-                        )}
-                    </Link>
-                </>
-            )}
+        <div className="flex flex-col" data-attr="experiment-flag-cleanup">
+            <Label intent="menu">Flag cleanup</Label>
+            <div className="flex items-center gap-1">
+                {text}
+                {showLink && (
+                    <>
+                        ·
+                        <Link
+                            target={isExternalLink ? '_blank' : undefined}
+                            className="flex items-center gap-0.5"
+                            to={prUrl ?? urls.taskDetail(taskId)}
+                        >
+                            {isExternalLink ? (
+                                <>
+                                    View on GitHub <IconOpenInNew fontSize="14" />
+                                </>
+                            ) : (
+                                'View task'
+                            )}
+                        </Link>
+                    </>
+                )}
+            </div>
         </div>
     )
 }
@@ -86,16 +87,7 @@ export function Info({ tabId }: Pick<ExperimentSceneLogicProps, 'tabId'>): JSX.E
         isSingleVariantShipped,
         shippedVariantKey,
     } = useValues(experimentLogic)
-    const { updateExperiment } = useActions(experimentLogic)
-    const { openEditConclusionModal, openDescriptionModal, closeDescriptionModal, openRunningTimeConfigModal } =
-        useActions(modalsLogic)
-    const { isDescriptionModalOpen } = useValues(modalsLogic)
-
-    const [tempDescription, setTempDescription] = useState(experiment.description || '')
-
-    useEffect(() => {
-        setTempDescription(experiment.description || '')
-    }, [experiment.description])
+    const { openEditConclusionModal, openRunningTimeConfigModal } = useActions(modalsLogic)
 
     const { created_by } = experiment
 
@@ -112,7 +104,7 @@ export function Info({ tabId }: Pick<ExperimentSceneLogicProps, 'tabId'>): JSX.E
 
     return (
         <>
-            <div className="grid gap-2 overflow-hidden grid-cols-1 min-[1100px]:grid-cols-[1fr_1fr]">
+            <div className="grid gap-2 overflow-hidden grid-cols-1 min-[1100px]:grid-cols-[3fr_2fr]">
                 {/* Column 1 */}
                 <div className="flex flex-col gap-0 overflow-hidden min-w-0">
                     {/* Row 1: Status, Feature flag, Stats engine */}
@@ -188,54 +180,33 @@ export function Info({ tabId }: Pick<ExperimentSceneLogicProps, 'tabId'>): JSX.E
                                     : `${((1 - (experiment.stats_config?.frequentist?.alpha ?? 0.05)) * 100).toFixed(0)}%`}
                             </span>
                         </div>
-                    </div>
-
-                    <div className="max-w-[500px]">
-                        <div className="flex items-center gap-2 mt-2">
-                            <Label intent="menu">Hypothesis</Label>
-                            <LemonButton
-                                type="secondary"
-                                size="xsmall"
-                                icon={<IconPencil />}
-                                onClick={openDescriptionModal}
-                            />
-                        </div>
-                        {experiment.description ? (
-                            <p className={cn('m-0 mt-2')}>{experiment.description}</p>
-                        ) : (
-                            <p className={cn('m-0 mt-2 text-secondary italic')}>Add your hypothesis for this test</p>
-                        )}
-
-                        <LemonModal
-                            isOpen={isDescriptionModalOpen}
-                            onClose={closeDescriptionModal}
-                            title="Edit hypothesis"
-                            footer={
-                                <div className="flex items-center gap-2 justify-end">
-                                    <LemonButton type="secondary" onClick={closeDescriptionModal}>
-                                        Cancel
-                                    </LemonButton>
+                        {experiment.conclusion && experiment.end_date && (
+                            <div className="flex flex-col" data-attr="experiment-conclusion">
+                                <Label intent="menu">Conclusion</Label>
+                                <div className="flex items-center gap-2">
+                                    <div
+                                        className={clsx(
+                                            'w-2 h-2 rounded-full shrink-0',
+                                            CONCLUSION_DISPLAY_CONFIG[experiment.conclusion]?.color || ''
+                                        )}
+                                    />
+                                    <span className="font-semibold">
+                                        {CONCLUSION_DISPLAY_CONFIG[experiment.conclusion]?.title ||
+                                            experiment.conclusion}
+                                    </span>
                                     <LemonButton
-                                        type="primary"
-                                        onClick={() => {
-                                            updateExperiment({ description: tempDescription })
-                                            closeDescriptionModal()
-                                        }}
-                                    >
-                                        Save
-                                    </LemonButton>
+                                        type="secondary"
+                                        size="xsmall"
+                                        icon={<IconPencil />}
+                                        onClick={openEditConclusionModal}
+                                        tooltip="Edit conclusion"
+                                    />
                                 </div>
-                            }
-                        >
-                            <LemonTextArea
-                                className="w-full"
-                                value={tempDescription}
-                                onChange={(value) => setTempDescription(value)}
-                                placeholder="Add your hypothesis for this test"
-                                minRows={6}
-                                maxLength={3000}
-                            />
-                        </LemonModal>
+                            </div>
+                        )}
+                        {experiment.flag_cleanup_task_id && typeof experiment.id === 'number' && (
+                            <FlagCleanupField experimentId={experiment.id} taskId={experiment.flag_cleanup_task_id} />
+                        )}
                     </div>
                 </div>
 
@@ -266,41 +237,29 @@ export function Info({ tabId }: Pick<ExperimentSceneLogicProps, 'tabId'>): JSX.E
                     </div>
                 </div>
             </div>
-            <div className="flex gap-6">
-                {experiment.conclusion && experiment.end_date && (
-                    <div className="max-w-[500px]">
-                        <div className="flex items-center gap-2">
-                            <Label intent="menu">Conclusion</Label>
-                            <LemonButton
-                                type="secondary"
-                                size="xsmall"
-                                icon={<IconPencil />}
-                                onClick={openEditConclusionModal}
-                            />
-                        </div>
-                        <div>
-                            <div className="font-semibold flex items-center gap-2">
-                                <div
-                                    className={clsx(
-                                        'w-2 h-2 rounded-full',
-                                        CONCLUSION_DISPLAY_CONFIG[experiment.conclusion]?.color || ''
-                                    )}
-                                />
-                                <span>
-                                    {CONCLUSION_DISPLAY_CONFIG[experiment.conclusion]?.title || experiment.conclusion}
-                                </span>
-                            </div>
-                            <div>{experiment.conclusion_comment}</div>
-                            {experiment.flag_cleanup_task_id && typeof experiment.id === 'number' && (
-                                <FlagCleanupLine
-                                    experimentId={experiment.id}
-                                    taskId={experiment.flag_cleanup_task_id}
-                                />
+            {experiment.conclusion && experiment.end_date && experiment.conclusion_comment && (
+                <LemonCard
+                    hoverEffect={false}
+                    className="mt-2 bg-[var(--color-bg-table)] px-3 py-2.5"
+                    data-attr="experiment-conclusion-comment"
+                >
+                    <div className="flex items-center gap-2">
+                        <span className="metric-cell-header font-bold">Conclusion</span>
+                        <div
+                            className={clsx(
+                                'w-2 h-2 rounded-full shrink-0',
+                                CONCLUSION_DISPLAY_CONFIG[experiment.conclusion]?.color || ''
                             )}
-                        </div>
+                        />
+                        <span className="metric-cell font-semibold">
+                            {CONCLUSION_DISPLAY_CONFIG[experiment.conclusion]?.title || experiment.conclusion}
+                        </span>
                     </div>
-                )}
-            </div>
+                    <p className="metric-cell font-normal m-0 mt-1 leading-relaxed whitespace-pre-wrap break-words">
+                        {experiment.conclusion_comment}
+                    </p>
+                </LemonCard>
+            )}
         </>
     )
 }

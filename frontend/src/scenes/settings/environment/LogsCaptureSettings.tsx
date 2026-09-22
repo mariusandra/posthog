@@ -1,17 +1,23 @@
 import { useActions, useValues } from 'kea'
 
-import { LemonDialog, LemonSegmentedButton, LemonSegmentedButtonOption, LemonSwitch } from '@posthog/lemon-ui'
+import { LemonDialog, LemonSwitch } from '@posthog/lemon-ui'
 
 import { AccessControlAction } from 'lib/components/AccessControlAction'
 import { RestrictionScope, useRestrictedArea } from 'lib/components/RestrictedArea'
 import { TeamMembershipLevel } from 'lib/constants'
 import { dayjs } from 'lib/dayjs'
+import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
 import { teamLogic } from 'scenes/teamLogic'
 
 import { AccessControlLevel, AccessControlResourceType } from '~/types'
 
-const VALID_RETENTION_DAYS = [14, 30, 90] as const
-type LogsRetentionDays = (typeof VALID_RETENTION_DAYS)[number]
+import {
+    LOGS_RETENTION_DEFAULT_DAYS,
+    isValidLogsRetentionDays,
+    logsRetentionDaysLabel,
+} from 'products/logs/frontend/components/LogsRetention/logsRetentionPeriod'
+import { LogsRetentionPeriodPicker } from 'products/logs/frontend/components/LogsRetention/LogsRetentionPeriodPicker'
+import { LogsFeatureFlagKeys } from 'products/logs/frontend/logsFeatureFlagKeys'
 
 export function LogsCaptureSettings(): JSX.Element {
     const { updateCurrentTeam } = useActions(teamLogic)
@@ -115,15 +121,17 @@ export function LogsPiiScrubSettings(): JSX.Element {
 export function LogsRetentionSettings(): JSX.Element {
     const { updateCurrentTeam } = useActions(teamLogic)
     const { currentTeam, currentTeamLoading } = useValues(teamLogic)
+    const allowCustomRetention = useFeatureFlag(LogsFeatureFlagKeys.customRetention)
     const restrictedReason = useRestrictedArea({
         scope: RestrictionScope.Project,
         minimumAccessLevel: TeamMembershipLevel.Admin,
     })
 
-    const storedRetentionDays = currentTeam?.logs_settings?.retention_days ?? 14
-    const currentRetention: LogsRetentionDays = VALID_RETENTION_DAYS.includes(storedRetentionDays as LogsRetentionDays)
-        ? (storedRetentionDays as LogsRetentionDays)
-        : 14
+    const storedRetentionDays = currentTeam?.logs_settings?.retention_days ?? LOGS_RETENTION_DEFAULT_DAYS
+    // Show any stored period the backend accepts, even when the flag that offered it is now off.
+    const currentRetention = isValidLogsRetentionDays(storedRetentionDays, true)
+        ? storedRetentionDays
+        : LOGS_RETENTION_DEFAULT_DAYS
     const retentionLastUpdated = currentTeam?.logs_settings?.retention_last_updated
 
     const getThrottleReason = (): string | undefined => {
@@ -138,37 +146,13 @@ export function LogsRetentionSettings(): JSX.Element {
         return undefined
     }
 
-    const throttleReason = getThrottleReason()
+    const disabledReason = currentTeamLoading ? 'Loading...' : (restrictedReason ?? getThrottleReason())
 
-    const renderOptions = (): LemonSegmentedButtonOption<LogsRetentionDays>[] => {
-        const disabledReason = currentTeamLoading ? 'Loading...' : (restrictedReason ?? throttleReason ?? undefined)
-        return [
-            {
-                value: 14,
-                label: '14 days (default)',
-                disabledReason,
-                'data-attr': 'logs-retention-button-14d',
-            },
-            {
-                value: 30,
-                label: '30 days',
-                disabledReason,
-                'data-attr': 'logs-retention-button-30d',
-            },
-            {
-                value: 90,
-                label: '90 days',
-                disabledReason,
-                'data-attr': 'logs-retention-button-90d',
-            },
-        ]
-    }
-
-    const handleRetentionChange = (retentionDays: LogsRetentionDays): void => {
+    const handleRetentionChange = (retentionDays: number): void => {
         if (retentionDays === currentRetention) {
             return
         }
-        const label = renderOptions().find((o) => o.value === retentionDays)?.label ?? `${retentionDays} days`
+        const label = logsRetentionDaysLabel(retentionDays)
         LemonDialog.open({
             title: 'Change logs retention period?',
             description:
@@ -189,11 +173,12 @@ export function LogsRetentionSettings(): JSX.Element {
 
     return (
         <AccessControlAction resourceType={AccessControlResourceType.Logs} minAccessLevel={AccessControlLevel.Editor}>
-            <LemonSegmentedButton
+            <LogsRetentionPeriodPicker
                 value={currentRetention}
-                onChange={(val) => handleRetentionChange(val)}
-                options={renderOptions()}
-                disabledReason={restrictedReason ?? undefined}
+                onChange={handleRetentionChange}
+                allowCustom={allowCustomRetention}
+                disabledReason={disabledReason}
+                customCommit="apply"
             />
         </AccessControlAction>
     )

@@ -1,19 +1,13 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
     SourceFieldSelectConfig,
     SourceFieldSelectConfigOption,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, SimpleSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -24,10 +18,13 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.microsoftclarity import (
     MicrosoftClaritySourceConfig,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.microsoft_clarity.microsoft_clarity import (
+    TOKEN_INVALID_ERROR,
+    TOKEN_WRONG_PROJECT_ERROR,
     microsoft_clarity_source,
     validate_credentials as validate_clarity_credentials,
 )
@@ -60,8 +57,9 @@ class MicrosoftClaritySource(SimpleSource[MicrosoftClaritySourceConfig]):
 
     def get_non_retryable_errors(self) -> dict[str, str | None]:
         return {
-            "401 Client Error": "Your Microsoft Clarity API token is invalid or expired. Generate a new token in Clarity under Settings -> Data Export and reconnect.",
-            "403 Client Error": "This Microsoft Clarity API token is not authorized for this project.",
+            "400 Client Error": "Microsoft Clarity rejected the request. Check the reporting window and breakdown dimensions on this source and reconnect.",
+            "401 Client Error": TOKEN_INVALID_ERROR,
+            "403 Client Error": TOKEN_WRONG_PROJECT_ERROR,
             "429 Client Error": "The Microsoft Clarity daily quota (10 requests per project) has been used up. Try again after the quota resets.",
         }
 
@@ -104,7 +102,7 @@ class MicrosoftClaritySource(SimpleSource[MicrosoftClaritySourceConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.MICROSOFT_CLARITY,
+            name=ExternalDataSourceType.MICROSOFTCLARITY,
             category=DataWarehouseSourceCategory.ANALYTICS,
             label="Microsoft Clarity",
             releaseStatus=ReleaseStatus.ALPHA,

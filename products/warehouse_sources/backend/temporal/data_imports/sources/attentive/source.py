@@ -6,20 +6,14 @@ import orjson
 import pyarrow as pa
 from asgiref.sync import async_to_sync
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
 )
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
-)
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.utils import table_from_py_list
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.arrow_utils import table_from_py_list
 from products.warehouse_sources.backend.temporal.data_imports.sources.attentive import api_client
 from products.warehouse_sources.backend.temporal.data_imports.sources.attentive.constants import (
     ATTENTIVE_WEBHOOK_SCHEMA_NAMES,
@@ -39,6 +33,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.webhook_s3 import WebhookSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.attentive import (
     AttentiveSourceConfig,
@@ -96,7 +91,7 @@ class AttentiveSource(
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.ATTENTIVE,
+            name=ExternalDataSourceType.ATTENTIVE,
             category=DataWarehouseSourceCategory.MARKETING___EMAIL,
             label="Attentive",
             caption=(
@@ -164,14 +159,8 @@ class AttentiveSource(
 
     def get_non_retryable_errors(self) -> dict[str, str | None]:
         return {
-            "401 Client Error: Unauthorized": (
-                "Attentive rejected the API key. Create a private app under Marketplace > Create app "
-                "in Attentive and reconnect with its API key."
-            ),
-            "403 Client Error: Forbidden": (
-                "The API key doesn't have permission for this endpoint. Make sure the private app has "
-                "the Webhooks permission."
-            ),
+            "401 Client Error: Unauthorized": api_client.API_KEY_REJECTED_ERROR,
+            "403 Client Error: Forbidden": api_client.WEBHOOKS_PERMISSION_ERROR,
         }
 
     def get_schemas(

@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -20,6 +14,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.inngest import (
     InngestSourceConfig,
 )
@@ -31,7 +26,9 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.inngest.in
 from products.warehouse_sources.backend.temporal.data_imports.sources.inngest.settings import (
     ENDPOINTS,
     INCREMENTAL_FIELDS,
+    INNGEST_DEFAULT_VERSION,
     INNGEST_ENDPOINTS,
+    INNGEST_SUPPORTED_VERSIONS,
 )
 from products.warehouse_sources.backend.types import ExternalDataSourceType
 
@@ -40,6 +37,8 @@ from products.warehouse_sources.backend.types import ExternalDataSourceType
 class InngestSource(ResumableSource[InngestSourceConfig, InngestResumeConfig]):
     lists_tables_without_credentials = True  # static endpoint catalog — safe for public docs
     api_docs_url = "https://api-docs.inngest.com"
+    supported_versions = INNGEST_SUPPORTED_VERSIONS
+    default_version = INNGEST_DEFAULT_VERSION
 
     @property
     def source_type(self) -> ExternalDataSourceType:
@@ -48,7 +47,7 @@ class InngestSource(ResumableSource[InngestSourceConfig, InngestResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.INNGEST,
+            name=ExternalDataSourceType.INNGEST,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="Inngest",
             releaseStatus=ReleaseStatus.ALPHA,
@@ -175,4 +174,5 @@ Inngest retains event and run history for a plan-dependent window (from 24 hours
             db_incremental_field_last_value=inputs.db_incremental_field_last_value
             if inputs.should_use_incremental_field
             else None,
+            api_version=self.resolve_api_version(inputs.api_version),
         )

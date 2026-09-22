@@ -20,6 +20,8 @@ def _run(run_id: int) -> WorkflowRunDetail:
         duration_seconds=None,
         run_attempt=1,
         pr_number=5,
+        commit_pr_number=None,
+        is_merge_queue=False,
     )
 
 

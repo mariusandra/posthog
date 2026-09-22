@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -23,6 +17,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.descope.descope import (
     DescopeResumeConfig,
     descope_source,
@@ -109,7 +104,7 @@ class DescopeSource(ResumableSource[DescopeSourceConfig, DescopeResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.DESCOPE,
+            name=ExternalDataSourceType.DESCOPE,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="Descope",
             caption="Sync users, audit trail events, tenants, roles, and access keys from your Descope project. Requires a Management Key, generated from the [Descope Console](https://app.descope.com) under Project Settings > Company/Management Keys.",

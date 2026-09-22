@@ -49,6 +49,7 @@ export const ReminderStatusEnumApi = {
  * * `leadership` - Leadership
  * * `marketing` - Marketing
  * * `sales` - Sales / Success
+ * * `student` - Student
  * * `other` - Other
  */
 export type RoleAtOrganizationEnumApi = (typeof RoleAtOrganizationEnumApi)[keyof typeof RoleAtOrganizationEnumApi]
@@ -61,6 +62,7 @@ export const RoleAtOrganizationEnumApi = {
     Leadership: 'leadership',
     Marketing: 'marketing',
     Sales: 'sales',
+    Student: 'student',
     Other: 'other',
 } as const
 
@@ -151,6 +153,7 @@ export interface ReminderApi {
     /** @nullable */
     readonly last_fired_at: string | null
     readonly status: ReminderStatusEnumApi
+    deleted?: boolean
     readonly created_by: UserBasicApi
     readonly created_at: string
     /** @nullable */
@@ -227,6 +230,7 @@ export interface PatchedReminderApi {
     /** @nullable */
     readonly last_fired_at?: string | null
     readonly status?: ReminderStatusEnumApi
+    deleted?: boolean
     readonly created_by?: UserBasicApi
     readonly created_at?: string
     /** @nullable */

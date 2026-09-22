@@ -1,7 +1,14 @@
 import { Hono } from 'hono'
 
 import { env } from '@/lib/env'
-import { loadSigningKeyFromEnv, NonceLedger, SignedStateCodec } from '@/lib/signed-state'
+import { getPublicUrl } from '@/lib/routing'
+import {
+    loadSigningKeyFromEnv,
+    NonceLedger,
+    PayloadStash,
+    type PayloadStashRedis,
+    SignedStateCodec,
+} from '@/lib/signed-state'
 import { setConfirmedActionRuntime } from '@/tools/confirmed-action-registry'
 
 import { confirmedActionRuntimeInstalled } from './metrics'
@@ -19,13 +26,13 @@ export type App = {
 }
 
 const sseRedirect = (c: HonoCtx): Response => {
-    const target = new URL(c.req.url)
+    const target = getPublicUrl(c.req.raw)
     target.pathname = '/mcp' + target.pathname.slice('/sse'.length)
     target.searchParams.set('_deprecated', 'sse')
     return c.redirect(target.toString(), 308) as unknown as Response
 }
 
-export function createApp(redis: RedisWithPing): App {
+export function createApp(redis: RedisWithPing & Pick<PayloadStashRedis, 'incrby'>): App {
     const app = new Hono()
     const lifecycle: Lifecycle = { shuttingDown: false }
 
@@ -44,6 +51,7 @@ export function createApp(redis: RedisWithPing): App {
         setConfirmedActionRuntime({
             codec: new SignedStateCodec(loadSigningKeyFromEnv()),
             ledger: new NonceLedger(redis),
+            stash: new PayloadStash(redis),
         })
         confirmedActionRuntimeInstalled.set(1)
     } catch (err) {

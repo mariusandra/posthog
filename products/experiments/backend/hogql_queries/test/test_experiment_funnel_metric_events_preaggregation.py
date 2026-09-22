@@ -54,17 +54,17 @@ class TestExperimentFunnelMetricEventsPreaggregation(ExperimentQueryRunnerBaseTe
     def _build_lazy_computation_builder(
         self, experiment, feature_flag, metric, as_of: datetime | None = None
     ) -> ExperimentQueryBuilder:
-        exposure_config, multiple_variant_handling, filter_test_accounts = get_exposure_config_params_for_builder(
-            experiment.exposure_criteria
+        exposure_params = get_exposure_config_params_for_builder(
+            experiment.exposure_criteria, experiment.team, experiment.start_date
         )
         as_of = as_of if as_of is not None else datetime.now(UTC)
         date_range = experiment_window(experiment, self.team, as_of)
         return ExperimentQueryBuilder(
             team=self.team,
             feature_flag_key=feature_flag.key,
-            exposure_config=exposure_config,
-            filter_test_accounts=filter_test_accounts,
-            multiple_variant_handling=multiple_variant_handling,
+            exposure_config=exposure_params.exposure_config,
+            filter_test_accounts=exposure_params.filter_test_accounts,
+            multiple_variant_handling=exposure_params.multiple_variant_handling,
             variants=[v["key"] for v in feature_flag.variants],
             date_range_query=QueryDateRange(
                 date_range=date_range,
@@ -105,7 +105,7 @@ class TestExperimentFunnelMetricEventsPreaggregation(ExperimentQueryRunnerBaseTe
         )
 
         # Precompute metric events
-        metric_query_string, metric_placeholders = builder.get_funnel_metric_events_query_for_precomputation()
+        metric_query_string, metric_placeholders = builder.get_metric_events_query_for_precomputation()
         ensure_precomputed(
             team=self.team,
             insert_query=metric_query_string,
@@ -167,8 +167,13 @@ class TestExperimentFunnelMetricEventsPreaggregation(ExperimentQueryRunnerBaseTe
 
         assert first_result.ready is True
         assert second_result.ready is True
-        assert first_result.job_ids == second_result.job_ids
-        assert mock_sync_execute.call_count == len(first_result.job_ids)
+        # The stable hash shares the complete day-aligned jobs across as_of values;
+        # only the final partial day, claimed up to each as_of, is rebuilt.
+        first_jobs = set(first_result.job_ids)
+        second_jobs = set(second_result.job_ids)
+        assert len(second_jobs) == len(first_jobs)
+        assert len(first_jobs & second_jobs) == len(first_jobs) - 1
+        assert mock_sync_execute.call_count == len(first_jobs) + 1
 
     @patch("products.analytics_platform.backend.lazy_computation.lazy_computation_executor.sync_execute")
     def test_metric_events_precomputation_for_stopped_experiment_uses_end_date(self, mock_sync_execute):
@@ -358,7 +363,7 @@ class TestExperimentFunnelMetricEventsPreaggregation(ExperimentQueryRunnerBaseTe
         )
 
         # Precompute metric events — extend end date by conversion window
-        metric_query_string, metric_placeholders = builder.get_funnel_metric_events_query_for_precomputation()
+        metric_query_string, metric_placeholders = builder.get_metric_events_query_for_precomputation()
         conversion_window_seconds = builder._get_conversion_window_seconds()
         metric_end_date = experiment.end_date + timedelta(seconds=conversion_window_seconds)
         ensure_precomputed(

@@ -3,7 +3,6 @@ from typing import Any
 
 from requests.auth import HTTPBasicAuth
 
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.http import make_tracked_session
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source import (
     RESTAPIConfig,
@@ -19,6 +18,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.res
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.resource import Resource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.typing import ClientConfig
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.source_helpers import validate_via_probe
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.upstash.settings import (
     UPSTASH_API_BASE_URL,
     UPSTASH_ENDPOINTS,
@@ -28,6 +28,22 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.upstash.se
 # Internal parent resource that lists every Redis database id, used to drive the per-database stats
 # fan-out. Named distinctly from the public `redis_databases` endpoint so the two never collide.
 _DATABASES_PARENT = "redis_databases_parent"
+
+# Shared with the source's 401 entry in `get_non_retryable_errors` so a rejected credential reads
+# the same whether it surfaces during setup or during a sync.
+INVALID_CREDENTIALS_ERROR = (
+    "Your Upstash email or management API key is invalid or has been revoked. Create a new key in "
+    "the Upstash console, then reconnect."
+)
+
+# A 403 on the probe is not a per-resource permission problem: /v2/teams is the account-level
+# endpoint every native account can read. The Developer API is closed to marketplace accounts
+# (Vercel, Fly.io), so naming the key sends those customers round a loop of generating another one
+# that cannot work either.
+_UNAUTHORIZED_ACCOUNT_ERROR = (
+    "Your Upstash account isn't authorized to use the management API. Marketplace accounts (Vercel "
+    "or Fly.io) can't use it, so connect with a native Upstash account."
+)
 
 
 def validate_credentials(email: str, api_key: str) -> tuple[bool, str | None]:
@@ -44,8 +60,10 @@ def validate_credentials(email: str, api_key: str) -> tuple[bool, str | None]:
         f"{UPSTASH_API_BASE_URL}/teams",
         auth=HTTPBasicAuth(email, api_key),
     )
-    if status in (401, 403):
-        return False, "Invalid Upstash email or management API key"
+    if status == 401:
+        return False, INVALID_CREDENTIALS_ERROR
+    if status == 403:
+        return False, _UNAUTHORIZED_ACCOUNT_ERROR
     return True, None
 
 

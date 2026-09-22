@@ -12,8 +12,10 @@ import { LemonCard } from 'lib/lemon-ui/LemonCard'
 import { LemonDialog } from 'lib/lemon-ui/LemonDialog'
 import { copyToClipboard } from 'lib/utils/copyToClipboard'
 
-import { SourceConfig, SourceFieldConfig } from '~/queries/schema/schema-general'
 import { WebhookInfo } from '~/types'
+
+import type { SourceFieldConfig } from 'products/data_warehouse/frontend/types'
+import { SourceConfigResponseApi } from 'products/warehouse_sources/frontend/generated/api.schemas'
 
 import { sourceFieldToElement } from '../../../shared/components/forms/SourceForm'
 import {
@@ -86,6 +88,7 @@ export function WebhookTab({ id, tabId }: { id: string; tabId?: string }): JSX.E
                 sourceConfig={sourceConfig}
                 webhookResult={createWebhookResult}
                 webhookCreating={webhookCreating}
+                autoCreationBlockedReason={webhookInfo?.auto_creation_blocked_reason}
                 onCreateWebhook={createWebhook}
                 formLogic={webhookTabLogic(logicProps)}
                 formKey="webhookFieldInputs"
@@ -134,6 +137,7 @@ export function WebhookTab({ id, tabId }: { id: string; tabId?: string }): JSX.E
                             sourceConfig={sourceConfig}
                             webhookCreating={webhookCreating}
                             createWebhookResult={createWebhookResult}
+                            autoCreationBlockedReason={webhookInfo.auto_creation_blocked_reason}
                             onCreateWebhook={createWebhook}
                             tabId={tabId}
                         />
@@ -204,7 +208,7 @@ function WebhookConfigurationSection({
     sourceConfig,
     formLogicProps,
 }: {
-    sourceConfig: SourceConfig
+    sourceConfig: SourceConfigResponseApi
     formLogicProps: { id: string; tabId?: string }
 }): JSX.Element {
     const { webhookFieldInputs, isWebhookFieldInputsSubmitting } = useValues(webhookTabLogic(formLogicProps))
@@ -310,6 +314,7 @@ function WebhookRecreateSection({
     sourceConfig,
     webhookCreating,
     createWebhookResult,
+    autoCreationBlockedReason,
     onCreateWebhook,
 }: {
     id: string
@@ -318,6 +323,7 @@ function WebhookRecreateSection({
     sourceConfig: any
     webhookCreating: boolean
     createWebhookResult: WebhookCreateResult | null
+    autoCreationBlockedReason?: string | null
     onCreateWebhook: () => void
 }): JSX.Element {
     return (
@@ -326,6 +332,7 @@ function WebhookRecreateSection({
             sourceConfig={sourceConfig}
             webhookResult={createWebhookResult}
             webhookCreating={webhookCreating}
+            autoCreationBlockedReason={autoCreationBlockedReason}
             onCreateWebhook={onCreateWebhook}
             formLogic={webhookTabLogic({ id, tabId })}
             formKey="webhookFieldInputs"

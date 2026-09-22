@@ -5,7 +5,7 @@ from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from freezegun import freeze_time
+import time_machine
 from unittest import mock
 
 import urllib3
@@ -13,7 +13,6 @@ import requests
 from parameterized import parameterized
 from tenacity import wait_none
 
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.cody import cody
 from products.warehouse_sources.backend.temporal.data_imports.sources.cody.cody import (
     CodyCredentialsError,
@@ -26,6 +25,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.cody.cody 
     normalize_instance_url,
     validate_credentials,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceResponse
 
 CSV_BODY = "User Email,Chats,Completion Acceptance Rate (CAR%)\na@b.com,12,0.5\nc@d.com,3,0.25\n"
 
@@ -156,7 +156,7 @@ class TestCodyTransport:
         session.get.return_value = _response(200, text=CSV_BODY)
 
         with (
-            freeze_time("2025-06-15"),
+            time_machine.travel("2025-06-15", tick=False),
             mock.patch.object(cody, "make_tracked_session", return_value=session),
         ):
             assert validate_credentials("token", "example.com") is True
@@ -272,7 +272,7 @@ class TestCodyTransport:
         session.get.side_effect = lambda *args, **kwargs: _response(200, text=CSV_BODY)
 
         with (
-            freeze_time("2023-03-15"),
+            time_machine.travel("2023-03-15", tick=False),
             mock.patch.object(cody, "make_tracked_session", return_value=session),
         ):
             batches = list(_batches(cody_source("token", "example.com", "usage_by_user_day", mock.Mock(), manager)))
@@ -297,7 +297,7 @@ class TestCodyTransport:
         session.get.return_value = _response(200, text=CSV_BODY)
 
         with (
-            freeze_time("2023-03-15"),
+            time_machine.travel("2023-03-15", tick=False),
             mock.patch.object(cody, "make_tracked_session", return_value=session),
         ):
             list(_batches(cody_source("token", "example.com", "usage_by_user_day", mock.Mock(), manager)))
@@ -312,7 +312,7 @@ class TestCodyTransport:
         session.get.side_effect = lambda *args, **kwargs: _response(200, text=CSV_BODY)
 
         with (
-            freeze_time("2023-02-10"),
+            time_machine.travel("2023-02-10", tick=False),
             mock.patch.object(cody, "make_tracked_session", return_value=session),
         ):
             iterator = _batches(cody_source("token", "example.com", "usage_by_user_day", mock.Mock(), manager))

@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -20,6 +14,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.mailchimp import (
     MailchimpSourceConfig,
 )
@@ -50,7 +45,7 @@ class MailchimpSource(ResumableSource[MailchimpSourceConfig, MailchimpResumeConf
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.MAILCHIMP,
+            name=ExternalDataSourceType.MAILCHIMP,
             category=DataWarehouseSourceCategory.MARKETING___EMAIL,
             label="Mailchimp",
             releaseStatus=ReleaseStatus.GA,
@@ -90,6 +85,15 @@ The API key format is: `key-dc` (e.g., `abc123def456-us6`), where `dc` is the da
             "403 Client Error": "Access forbidden. Your API key may lack required permissions.",
             "Invalid Mailchimp API key format": "Invalid API key format. Expected format: key-dc (e.g., abc123-us6)",
         }
+
+    def get_retryable_errors(self) -> set[str]:
+        # `_mailchimp_session`'s `DEFAULT_RETRY` already retries 429/5xx responses in-process
+        # (Retry-After-aware backoff) before `raise_for_status()` can raise here. A response that
+        # still exhausts that budget is a transient Mailchimp/edge blip, not a bug — Temporal's
+        # activity retry recovers once it clears, so keep it out of error tracking as noise.
+        # `requests.Response.raise_for_status` derives these prefixes from the status code alone,
+        # not the vendor's reason text, so they're stable to match on.
+        return {"429 Client Error", "Server Error"}
 
     def get_schemas(
         self,

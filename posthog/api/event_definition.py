@@ -1,27 +1,36 @@
 from __future__ import annotations
 
 import uuid
+import functools
 from collections import defaultdict
 from typing import Any, Literal, Optional, cast
 
 from django.core.cache import cache
-from django.db.models import Manager, Prefetch
+from django.db import IntegrityError, connections, transaction
+from django.db.models import Field, Manager, Prefetch
 from django.http import Http404
+from django.utils import timezone
 
 import orjson
 import posthoganalytics
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_serializer
+from prometheus_client import Counter
 from rest_framework import mixins, request, response, serializers, status, viewsets
+from rest_framework.settings import api_settings
 
 from posthog.api.event_definition_generators.base import EventDefinitionGenerator
 from posthog.api.event_definition_generators.golang import GolangGenerator
 from posthog.api.event_definition_generators.python import PythonGenerator
 from posthog.api.event_definition_generators.typescript import TypeScriptGenerator
+from posthog.api.pagination import PrecountedLimitOffsetPagination
 from posthog.api.routing import TeamAndOrgViewSetMixin
 from posthog.api.shared import UserBasicSerializer
+from posthog.api.statement_timeout import statement_timeout
 from posthog.api.tagged_item import (
+    BULK_UPDATE_TAGS_MAX_IDS,
     BulkTagActivityContext,
+    BulkUpdateTagsUUIDErrorSerializer,
     BulkUpdateTagsUUIDRequestSerializer,
     BulkUpdateTagsUUIDResponseSerializer,
     TaggedItemSerializerMixin,
@@ -35,14 +44,95 @@ from posthog.event_usage import report_user_action
 from posthog.filters import TermSearchFilterBackend, term_search_filter_sql
 from posthog.helpers.impersonation import is_impersonated
 from posthog.models import EventDefinition, ObjectMediaPreview, TaggedItem, Team
-from posthog.models.activity_logging.activity_log import Detail, log_activity
+from posthog.models.activity_logging.activity_log import Detail, dict_changes_between, log_activity
+from posthog.models.tagged_item_registry import content_type_for
 from posthog.models.user import User
 from posthog.models.utils import UUIDT
 from posthog.settings import EE_AVAILABLE
+from posthog.taxonomy.definition_listing import (
+    DEFINITION_LIST_STATEMENT_TIMEOUT_MS,
+    DefinitionListTimedOut,
+    definition_read_db_alias,
+)
+from posthog.taxonomy.definition_search import search_plan
 from posthog.taxonomy.taxonomy import CORE_EVENTS, STALE_EVENT_DAYS
 from posthog.utils import get_safe_cache, relative_date_parse
 
 # If EE is enabled, we use ee.api.ee_event_definition.EnterpriseEventDefinitionSerializer
+
+EVENT_DEFINITIONS_TIMED_OUT_COUNTER = Counter(
+    "event_definitions_list_timed_out_total",
+    "Event definition list requests cancelled by the statement timeout.",
+)
+
+
+class EventDefinitionsTimedOut(DefinitionListTimedOut):
+    default_code = "event_definitions_timeout"
+    default_detail = "Loading events took too long. Try a narrower search, or try again in a moment."
+
+
+@functools.cache
+def event_definition_model(is_enterprise: bool) -> type[EventDefinition]:
+    """The model the list query runs through, which the enterprise extension replaces."""
+    if is_enterprise:
+        from ee.models.event_definition import EnterpriseEventDefinition
+
+        return EnterpriseEventDefinition
+    return EventDefinition
+
+
+def read_db_alias() -> str:
+    return definition_read_db_alias(event_definition_model(EE_AVAILABLE))
+
+
+def _event_definitions_source_sql(
+    event_type: EventDefinitionType,
+    is_enterprise: bool,
+    conditions: str,
+) -> str:
+    """FROM/JOIN/WHERE shared by the page fetch and the count that pages it."""
+    # LEFT, not FULL OUTER. The two return the same rows here, on two independent grounds:
+    # `eventdefinition_ptr_id` is the child's primary key and a validated NOT NULL foreign key, so an
+    # enterprise row without a base row cannot be committed; and even if one existed, the scope
+    # filter below reads base-table columns, so that row's `COALESCE(project_id, team_id)` would be
+    # NULL and it would be filtered out regardless of join type.
+    # The join type does change the plan. A full join can be neither a nested loop nor a filter
+    # pushed into the scan, which leaves a sequential scan of the whole table available to the
+    # planner — and it picked that plan in production once statistics shifted.
+    enterprise_join = (
+        "LEFT JOIN ee_enterpriseeventdefinition ON posthog_eventdefinition.id=ee_enterpriseeventdefinition.eventdefinition_ptr_id"
+        if is_enterprise
+        else ""
+    )
+
+    if event_type == EventDefinitionType.EVENT_CUSTOM:
+        conditions += " AND posthog_eventdefinition.name NOT LIKE %(is_posthog_event)s"
+    if event_type == EventDefinitionType.EVENT_POSTHOG:
+        conditions += " AND posthog_eventdefinition.name LIKE %(is_posthog_event)s"
+
+    # COALESCE(project_id, team_id) is the leading expression of the unique index
+    # `event_definition_proj_uniq`, so the planner can seek that index for the project scope and
+    # for any `name` equality in `conditions`. The equivalent form
+    # `project_id = X OR (project_id IS NULL AND team_id = X)` matches no index at all.
+    return f"""
+            FROM posthog_eventdefinition
+            {enterprise_join}
+            WHERE COALESCE(project_id, team_id) = %(project_id)s
+            {conditions}
+        """
+
+
+def create_event_definitions_count_sql(
+    event_type: EventDefinitionType,
+    is_enterprise: bool = False,
+    conditions: str = "",
+) -> str:
+    """Counts the rows `create_event_definitions_sql` pages over.
+
+    Selecting no column lets Postgres drop the enterprise join whenever `conditions` reads only
+    base-table columns, so the common count is an index-only scan.
+    """
+    return f"SELECT count(*) {_event_definitions_source_sql(event_type, is_enterprise, conditions)}"
 
 
 def create_event_definitions_sql(
@@ -53,33 +143,18 @@ def create_event_definitions_sql(
 ) -> str:
     if order_expressions is None:
         order_expressions = []
-    if is_enterprise:
-        from ee.models import EnterpriseEventDefinition
-
-        ee_model = EnterpriseEventDefinition
-    else:
-        # telling mypy to ignore this...
-        # it's fine to assign EventDefinition
-        ee_model = EventDefinition  # type: ignore
 
     event_definition_fields = {
         f'"{f.column}"'
-        for f in ee_model._meta.get_fields()
-        if hasattr(f, "column") and f.column not in ["deprecated_tags", "tags"]
+        for f in event_definition_model(is_enterprise)._meta.get_fields()
+        if isinstance(f, Field) and f.column is not None and f.column not in ["deprecated_tags", "tags"]
     }
     # Django relies on PK being present in the result set to tell if it's a saved instance
     event_definition_fields.add("id as pk")
-
-    enterprise_join = (
-        "FULL OUTER JOIN ee_enterpriseeventdefinition ON posthog_eventdefinition.id=ee_enterpriseeventdefinition.eventdefinition_ptr_id"
-        if is_enterprise
-        else ""
-    )
-
-    if event_type == EventDefinitionType.EVENT_CUSTOM:
-        conditions += " AND posthog_eventdefinition.name NOT LIKE %(is_posthog_event)s"
-    if event_type == EventDefinitionType.EVENT_POSTHOG:
-        conditions += " AND posthog_eventdefinition.name LIKE %(is_posthog_event)s"
+    # Sorted because a set iterates in an order that depends on the process hash seed. Unsorted,
+    # every worker emits a different statement text, so pg_stat_statements and Performance Insights
+    # split this query's load across hundreds of fingerprints and none of them looks expensive.
+    selected_fields = sorted(event_definition_fields)
 
     additional_ordering = []
     for order_expression, order_direction in order_expressions:
@@ -88,13 +163,14 @@ def create_event_definitions_sql(
                 f"{order_expression} {order_direction} NULLS {'FIRST' if order_direction == 'ASC' else 'LAST'}"
             )
 
+    # A `RawQuerySet` has no `count()`, so DRF's paginator counts it with `len()` and slices the
+    # result in Python. Without this clause one page of 100 costs a read of every event definition
+    # the project has, wide columns included.
     return f"""
-            SELECT {",".join(event_definition_fields)}
-            FROM posthog_eventdefinition
-            {enterprise_join}
-            WHERE (project_id = %(project_id)s OR (project_id IS NULL AND team_id = %(project_id)s))
-            {conditions}
+            SELECT {",".join(selected_fields)}
+            {_event_definitions_source_sql(event_type, is_enterprise, conditions)}
             ORDER BY {",".join(additional_ordering)}
+            LIMIT %(limit)s OFFSET %(offset)s
         """
 
 
@@ -161,6 +237,14 @@ class EventDefinitionSerializer(TaggedItemSerializerMixin, serializers.ModelSeri
         return value
 
     def validate(self, data):
+        unsupported_metadata = {
+            field: "This field is not supported by this deployment."
+            for field in ("description", "verified", "hidden")
+            if field in self.initial_data
+        }
+        if unsupported_metadata:
+            raise serializers.ValidationError(unsupported_metadata)
+
         validated_data = super().validate(data)
 
         if "hidden" in validated_data and "verified" in validated_data:
@@ -227,6 +311,61 @@ class EventDefinitionSerializer(TaggedItemSerializerMixin, serializers.ModelSeri
         return hasattr(obj, "action_id") and obj.action_id is not None
 
 
+class EventDefinitionBulkUpdateVerifiedRequestSerializer(serializers.Serializer):
+    ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        allow_empty=False,
+        max_length=BULK_UPDATE_TAGS_MAX_IDS,
+        help_text="List of event definition UUIDs to update.",
+    )
+    verified = serializers.BooleanField(
+        help_text=(
+            "Target verified state to apply to every matched event. `true` marks the events as verified "
+            "(and unhides them, since an event cannot be both hidden and verified); `false` unverifies them."
+        ),
+    )
+
+
+class EventDefinitionBulkUpdateVerifiedItemSerializer(serializers.Serializer):
+    id = serializers.UUIDField(help_text="UUID of the event definition whose verified state changed.")
+    verified = serializers.BooleanField(help_text="The event's verified state after the update.")
+
+
+class EventDefinitionBulkUpdateVerifiedResponseSerializer(serializers.Serializer):
+    updated = EventDefinitionBulkUpdateVerifiedItemSerializer(
+        many=True, help_text="Events whose verified state was changed. Events already in the target state are omitted."
+    )
+    skipped = BulkUpdateTagsUUIDErrorSerializer(
+        many=True, help_text="Events that were skipped (e.g. not found in this project), with a reason each."
+    )
+
+
+# Postgres LIMIT and OFFSET take a bigint. DRF accepts arbitrary-size ints, and binding one past
+# the bigint range makes Postgres answer with a 500, so clamp them.
+POSTGRES_BIGINT_MAX = 2**63 - 1
+
+
+class EventDefinitionQuerySerializer(serializers.Serializer):
+    limit = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        default=api_settings.PAGE_SIZE,
+        help_text="Number of results to return per page.",
+    )
+    offset = serializers.IntegerField(
+        required=False,
+        min_value=0,
+        default=0,
+        help_text="The initial index from which to return the results.",
+    )
+
+    def validate_limit(self, value: int) -> int:
+        return min(value, POSTGRES_BIGINT_MAX)
+
+    def validate_offset(self, value: int) -> int:
+        return min(value, POSTGRES_BIGINT_MAX)
+
+
 class EventDefinitionViewSet(
     TeamAndOrgViewSetMixin,
     TaggedItemViewSetMixin,
@@ -238,11 +377,21 @@ class EventDefinitionViewSet(
     viewsets.GenericViewSet,
 ):
     scope_object = "event_definition"
-    # "bulk_update_tags" must be opted in here so personal API keys with event_definition:write can use it.
-    scope_object_write_actions = ["create", "update", "partial_update", "patch", "destroy", "bulk_update_tags"]
+    # "bulk_update_tags"/"bulk_update_verified" must be opted in here so personal API keys with
+    # event_definition:write can use them.
+    scope_object_write_actions = [
+        "create",
+        "update",
+        "partial_update",
+        "patch",
+        "destroy",
+        "bulk_update_tags",
+        "bulk_update_verified",
+    ]
     serializer_class = EventDefinitionSerializer
     lookup_field = "id"
     filter_backends = [TermSearchFilterBackend]
+    pagination_class = PrecountedLimitOffsetPagination
     queryset = EventDefinition.objects.all()
 
     search_fields = ["name"]
@@ -253,24 +402,25 @@ class EventDefinitionViewSet(
         # Allows this endpoint to return lists of event definitions, actions, or both.
         event_type = EventDefinitionType(self.request.GET.get("event_type", EventDefinitionType.EVENT))
 
+        event_definition_object_manager: Manager = event_definition_model(EE_AVAILABLE).objects
+
         search = self.request.GET.get("search", None)
-        search_query, search_kwargs = term_search_filter_sql(self.search_fields, search)
+        has_search_terms = bool(search and search.strip())
+        plan = (
+            search_plan("posthog_eventdefinition", self.project_id, event_definition_object_manager.db)
+            if has_search_terms
+            else None
+        )
+        search_query, search_kwargs = term_search_filter_sql(
+            self.search_fields, search, avoid_trigram_index=plan == "project_scan"
+        )
 
         params = {"project_id": self.project_id, "is_posthog_event": "$%", **search_kwargs}
         order_expressions = self._ordering_params_from_request()
         has_explicit_ordering = "ordering" in self.request.GET
-        has_search_terms = bool(search and search.strip())
 
         if has_search_terms and not has_explicit_ordering:
             order_expressions = [("length(name)", "ASC"), *order_expressions]
-
-        event_definition_object_manager: Manager
-        if EE_AVAILABLE:
-            from ee.models.event_definition import EnterpriseEventDefinition
-
-            event_definition_object_manager = EnterpriseEventDefinition.objects
-        else:
-            event_definition_object_manager = EventDefinition.objects
 
         exclude_hidden = self.request.GET.get("exclude_hidden", "false").lower() == "true"
         if exclude_hidden and EE_AVAILABLE:
@@ -310,30 +460,65 @@ class EventDefinitionViewSet(
             search_query = search_query + " AND NOT name = ANY(%(excluded_list)s)"
             params["excluded_list"] = excluded_list
 
+        names = [name for value in self.request.query_params.getlist("names") for name in value.split(",") if name]
+        if names:
+            search_query = search_query + " AND posthog_eventdefinition.name = ANY(%(names)s)"
+            params["names"] = list(set(names))
+
+        tags_list = self._tags_filter_from_request()
+        if tags_list:
+            # EXISTS, not a join: it keeps one row per definition, so the page stays a page and
+            # the count stays a count, with no DISTINCT over the whole result set.
+            search_query = (
+                search_query
+                + " AND EXISTS (SELECT 1 FROM posthog_taggeditem"
+                + " JOIN posthog_tag ON posthog_tag.id = posthog_taggeditem.tag_id"
+                + " WHERE posthog_taggeditem.content_type_id = %(tagged_content_type_id)s"
+                + " AND posthog_taggeditem.object_uuid = posthog_eventdefinition.id"
+                + " AND posthog_tag.name = ANY(%(tags)s))"
+            )
+            params["tags"] = tags_list
+            params["tagged_content_type_id"] = content_type_for(EventDefinition).id
+
         sql = create_event_definitions_sql(
             event_type,
             is_enterprise=EE_AVAILABLE,
             conditions=search_query,
             order_expressions=order_expressions,
         )
-        queryset = event_definition_object_manager.raw(sql, params=params)
 
-        # Apply tags filter if provided
+        paginator = cast(PrecountedLimitOffsetPagination, self.paginator)
+        query = EventDefinitionQuerySerializer(data=self.request.query_params)
+        query.is_valid(raise_exception=True)
+        params["limit"] = query.validated_data["limit"]
+        params["offset"] = query.validated_data["offset"]
+
+        count_sql = create_event_definitions_count_sql(
+            event_type,
+            is_enterprise=EE_AVAILABLE,
+            conditions=search_query,
+        )
+        # The count has to run on the connection the page fetch will use, or it describes a
+        # different row set than the one it bounds.
+        with connections[read_db_alias()].cursor() as cursor:
+            cursor.execute(count_sql, params)
+            paginator.set_count(cursor.fetchone()[0])
+
+        return event_definition_object_manager.raw(sql, params=params)
+
+    def _tags_filter_from_request(self) -> list[str]:
         tags = self.request.GET.get("tags")
-        if tags:
-            try:
-                tags_list = orjson.loads(tags)
-                if tags_list:
-                    # Convert raw queryset to regular queryset for filtering
-                    ids = [obj.id for obj in queryset]
-                    queryset = event_definition_object_manager.filter(  # type: ignore[assignment]
-                        id__in=ids, tagged_items__tag__name__in=tags_list
-                    ).distinct()
-            except (orjson.JSONDecodeError, TypeError):
-                # If the JSON is invalid, ignore the filter
-                pass
-
-        return queryset
+        if not tags:
+            return []
+        try:
+            decoded = orjson.loads(tags)
+        except orjson.JSONDecodeError:
+            return []
+        # Only a list of tag names disables pagination. A bare JSON scalar like `true` or `5`
+        # is not iterable and would break the downstream `__in` filter, so ignore it.
+        if not isinstance(decoded, list):
+            return []
+        return [tag for tag in decoded if isinstance(tag, str)]
 
     def _ordering_params_from_request(
         self,
@@ -364,6 +549,12 @@ class EventDefinitionViewSet(
         if not results:
             results = [("last_seen_at::date", "DESC"), ("name", "ASC")]
 
+        # `name` is unique per project, so it is the tiebreaker that keeps SQL LIMIT/OFFSET paging
+        # stable. An explicit `?ordering=` without it can order tied rows differently per page, so a
+        # row is paged twice or skipped.
+        if not any(expression == "name" for expression, _ in results):
+            results.append(("name", "ASC"))
+
         return results
 
     @extend_schema(
@@ -387,32 +578,47 @@ class EventDefinitionViewSet(
                 required=False,
                 description="When true, omit events that have been explicitly hidden by a team admin (Enterprise only).",
             ),
+            OpenApiParameter(
+                "names",
+                OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                many=True,
+                description="Return exact matches for these event names. Pass names as repeated or comma-separated values.",
+            ),
         ],
+        extensions={"x-product": "event_definitions"},
     )
     def list(self, request, *args, **kwargs):
-        queryset = self.filter_queryset(self.get_queryset())
-        page = self.paginate_queryset(queryset)
-        objects = page if page is not None else list(queryset)
+        with statement_timeout(
+            read_db_alias(),
+            DEFINITION_LIST_STATEMENT_TIMEOUT_MS,
+            EventDefinitionsTimedOut,
+            EVENT_DEFINITIONS_TIMED_OUT_COUNTER,
+        ):
+            queryset = self.filter_queryset(self.get_queryset())
+            page = self.paginate_queryset(queryset)
+            objects = page if page is not None else list(queryset)
 
-        # Batch-fetch media preview URLs to avoid N+1 queries in the serializer
-        event_ids = [obj.id for obj in objects]
-        media_map: dict[str, list[str]] = defaultdict(list)
-        if event_ids:
-            previews = (
-                ObjectMediaPreview.objects.filter(event_definition_id__in=event_ids)
-                .select_related("uploaded_media", "exported_asset")
-                .order_by("-updated_at")
-            )
-            for p in previews:
-                if p.media_url:
-                    media_map[str(p.event_definition_id)].append(p.media_url)
+            # Batch-fetch media preview URLs to avoid N+1 queries in the serializer
+            event_ids = [obj.id for obj in objects]
+            media_map: dict[str, list[str]] = defaultdict(list)
+            if event_ids:
+                previews = (
+                    ObjectMediaPreview.objects.filter(event_definition_id__in=event_ids)
+                    .select_related("uploaded_media", "exported_asset")
+                    .order_by("-updated_at")
+                )
+                for p in previews:
+                    if p.media_url:
+                        media_map[str(p.event_definition_id)].append(p.media_url)
 
-        serializer = self.get_serializer(objects, many=True)
-        serializer.context["media_preview_urls_map"] = media_map
+            serializer = self.get_serializer(objects, many=True)
+            serializer.context["media_preview_urls_map"] = media_map
 
-        if page is not None:
-            return self.get_paginated_response(serializer.data)
-        return response.Response(serializer.data)
+            if page is not None:
+                return self.get_paginated_response(serializer.data)
+            return response.Response(serializer.data)
 
     def dangerously_get_object(self):
         # A non-UUID lookup (e.g. the literal "undefined" from a link built without a saved
@@ -437,7 +643,16 @@ class EventDefinitionViewSet(
                 eventdefinition_ptr_id=non_enterprise_event.id, description=""
             )
             new_enterprise_event.__dict__.update(non_enterprise_event.__dict__)
-            new_enterprise_event.save()
+            try:
+                # Savepoint so a losing race here doesn't poison a surrounding transaction.
+                with transaction.atomic():
+                    new_enterprise_event.save()
+            except IntegrityError:
+                # A concurrent request promoted the same base row first; reuse its extension.
+                existing = EnterpriseEventDefinition.objects.filter(pk=non_enterprise_event.pk).first()
+                if existing is None:
+                    raise
+                return existing
             return new_enterprise_event
 
         return EventDefinition.objects.get(**filters)
@@ -486,9 +701,117 @@ class EventDefinitionViewSet(
             # The single-object event-definition update path logs under the "changed" verb.
             activity="changed",
         )
+        self.validate_bulk_tag_changes(objects, validated["action"], validated["tags"])
         updated = apply_bulk_tag_changes(
             objects, validated["action"], validated["tags"], activity_context=activity_context
         )
+        return response.Response({"updated": updated, "skipped": skipped})
+
+    @extend_schema(
+        request=EventDefinitionBulkUpdateVerifiedRequestSerializer,
+        responses={200: EventDefinitionBulkUpdateVerifiedResponseSerializer},
+    )
+    @action(methods=["POST"], detail=False)
+    def bulk_update_verified(self, request, *args, **kwargs) -> response.Response:
+        """Mark multiple event definitions as verified or unverified in one request.
+
+        In the same vein as ``bulk_update_tags``, but ``verified`` lives on the enterprise
+        ``EnterpriseEventDefinition`` extension rather than the base row, so this action:
+        - requires an enterprise license;
+        - scopes by project (``team__project_id``) and relies on project membership — the same
+          boundary the single-object update path uses — rather than object-level RBAC;
+        - lazily promotes ingestion-created base rows to ``EnterpriseEventDefinition`` (mirroring
+          ``_get_event_definition``) before setting ``verified``;
+        - mirrors the single-object semantics: verifying stamps ``verified_by``/``verified_at`` and
+          unhides the event (an event cannot be both hidden and verified); unverifying clears them;
+        - logs a "changed" activity per event so the History tab matches the single-object path.
+
+        Events already in the target state are skipped (not re-written, not logged).
+        """
+        # Gate on the enterprise build, mirroring the single-object verify path, which selects the
+        # enterprise serializer under the same flag. `verified` isn't a separately-licensed feature,
+        # so there's no stricter per-license check to make here without diverging from that path.
+        if not EE_AVAILABLE:
+            raise serializers.ValidationError("Verifying event definitions requires an enterprise license.")
+
+        from ee.models.event_definition import EnterpriseEventDefinition
+
+        serializer = EventDefinitionBulkUpdateVerifiedRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        # De-duplicate while preserving order: the no-op check below reads a pre-loop snapshot of
+        # verified state, so a repeated id would otherwise be written (and logged) more than once.
+        validated_ids = list(dict.fromkeys(serializer.validated_data["ids"]))
+        verified = serializer.validated_data["verified"]
+
+        # Base rows are authoritative for existence and project scoping.
+        found_ids = set(
+            EventDefinition.objects.filter(id__in=validated_ids, team__project_id=self.project_id).values_list(
+                "id", flat=True
+            )
+        )
+        skipped = [{"id": obj_id, "reason": "Not found"} for obj_id in validated_ids if obj_id not in found_ids]
+
+        # Current verified state comes from existing enterprise rows; a base row without one is
+        # unverified by default, so a missing entry means verified=False. `found_ids` is already
+        # project-scoped, but keep the team filter explicit for tenant-isolation (IDOR) safety.
+        verified_by_id = dict(
+            EnterpriseEventDefinition.objects.filter(id__in=found_ids, team__project_id=self.project_id).values_list(
+                "id", "verified"
+            )
+        )
+
+        user = cast(User, request.user)
+        now = timezone.now()
+        was_impersonated = is_impersonated(request)
+        updated: list[dict[str, Any]] = []
+
+        # One transaction for the whole batch: if any event fails part-way the write rolls back
+        # entirely, so the caller never has to reason about a half-applied set. Activity logs are
+        # transaction-aware and defer to commit, so they roll back with it too.
+        with transaction.atomic():
+            for obj_id in validated_ids:
+                if obj_id not in found_ids:
+                    continue
+                if bool(verified_by_id.get(obj_id, False)) == verified:
+                    continue  # no-op: skip without promoting a base row or writing
+
+                # Promote base -> enterprise if needed (same lazy path as single-object updates).
+                # EE_AVAILABLE is checked above, so _get_event_definition returns an EnterpriseEventDefinition
+                # that carries the verified/hidden fields (absent from the base EventDefinition type).
+                enterprise = cast(
+                    EnterpriseEventDefinition, self._get_event_definition(id=obj_id, team__project_id=self.project_id)
+                )
+                before_hidden = bool(enterprise.hidden)
+
+                enterprise.verified = verified
+                if verified:
+                    enterprise.verified_by = user
+                    enterprise.verified_at = now
+                    enterprise.hidden = False  # an event cannot be both hidden and verified
+                else:
+                    enterprise.verified_by = None
+                    enterprise.verified_at = None
+                enterprise.save()
+
+                # `verified` was necessarily the opposite before (no-ops were skipped above).
+                changes = dict_changes_between(
+                    "EventDefinition",
+                    {"verified": not verified, "hidden": before_hidden},
+                    {"verified": verified, "hidden": bool(enterprise.hidden)},
+                    use_field_exclusions=True,
+                )
+                log_activity(
+                    organization_id=None,
+                    team_id=self.team_id,
+                    user=user,
+                    item_id=str(enterprise.id),
+                    scope="EventDefinition",
+                    activity="changed",
+                    was_impersonated=was_impersonated,
+                    detail=Detail(name=str(enterprise.name), changes=changes),
+                )
+                updated.append({"id": enterprise.id, "verified": verified})
+
         return response.Response({"updated": updated, "skipped": skipped})
 
     def perform_create(self, serializer):

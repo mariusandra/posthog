@@ -11,13 +11,17 @@ export interface RedisLike {
     incr(key: string): Promise<number>
     expire(key: string, seconds: number): Promise<number>
     ttl(key: string): Promise<number>
+    // Session context persists only through a Lua compare-and-merge, so a client
+    // that can't EVAL loses it silently. Declaring it here makes that a type error
+    // instead of a caught exception behind a write_error counter.
+    eval(script: string, numberOfKeys: number, ...args: (string | number)[]): Promise<unknown>
 }
 
 const DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60 // 7 days
 const CLEAR_MAX_ITERATIONS = 50
 const CLEAR_SCAN_COUNT = 100
 
-export type CachePrefix = 'token' | 'session' | 'user'
+export type CachePrefix = 'token' | 'user' | 'session'
 
 export class RedisCache<T extends Record<string, any>> extends ScopedCache<T> {
     private redis: RedisLike
@@ -71,6 +75,18 @@ export class RedisCache<T extends Record<string, any>> extends ScopedCache<T> {
     async delete<K extends keyof T>(key: K): Promise<void> {
         const scopedKey = this.getScopedKey(key as string)
         await this.redis.del(scopedKey)
+    }
+
+    /**
+     * Renew the TTL on `keys` without rewriting their values. `set` stamps a
+     * fresh TTL on every write, so a value only read on later requests would
+     * otherwise expire while its session is still active. A caller whose
+     * lifetime should track session activity rather than last write refreshes
+     * here on each request. EXPIRE on a missing key is a no-op, so refreshing a
+     * key that was never written is harmless.
+     */
+    async refreshTtl<K extends keyof T>(keys: K[]): Promise<void> {
+        await Promise.all(keys.map((key) => this.redis.expire(this.getScopedKey(key as string), this.ttl)))
     }
 
     async clear(): Promise<void> {

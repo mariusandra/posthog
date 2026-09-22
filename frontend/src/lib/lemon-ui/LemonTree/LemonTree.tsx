@@ -222,7 +222,12 @@ export type LemonTreeNodeProps = LemonTreeBaseProps & {
 
 export interface LemonTreeRef {
     getVisibleItems: () => TreeDataItem[]
-    focusItem: (id: string) => void
+    focusItem: (id: string, options?: LemonTreeFocusOptions) => void
+}
+
+export interface LemonTreeFocusOptions {
+    scrollPosition?: 'top-third'
+    behavior?: ScrollBehavior
 }
 
 type FlattenedTreeItem = {
@@ -460,6 +465,40 @@ const LemonTreeItemRow = forwardRef<HTMLDivElement, LemonTreeItemRowProps>(
             )
         }
 
+        const sideActionContent = !isEmptyFolder && size === 'default' ? itemSideAction?.(item) : undefined
+        const sideActionButton = sideActionContent !== undefined ? itemSideActionButton?.(item) : undefined
+        const sideAction =
+            sideActionContent !== undefined ? (
+                sideActionContent !== null ? (
+                    <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                            {sideActionButton ?? (
+                                <ButtonPrimitive
+                                    iconOnly
+                                    isSideActionRight
+                                    className="
+                                        absolute right-0
+                                        opacity-0
+                                        group-hover/lemon-tree-button-group:opacity-100
+                                        z-10
+                                        data-[state=open]:opacity-100
+                                        -outline-offset-2
+                                        focus-visible:opacity-100
+                                    "
+                                >
+                                    <IconEllipsis className="text-tertiary size-3 group-hover/lemon-tree-button-group:text-primary z-10" />
+                                </ButtonPrimitive>
+                            )}
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent loop align="end" side="bottom" className="max-w-[250px]">
+                            {sideActionContent}
+                        </DropdownMenuContent>
+                    </DropdownMenu>
+                ) : (
+                    sideActionButton
+                )
+            ) : null
+
         const content = (
             <AccordionPrimitive.Item
                 value={item.id}
@@ -516,38 +555,7 @@ const LemonTreeItemRow = forwardRef<HTMLDivElement, LemonTreeItemRowProps>(
                             button
                         )}
 
-                        {itemSideAction &&
-                            itemSideAction(item) !== undefined &&
-                            !isEmptyFolder &&
-                            size === 'default' && (
-                                <DropdownMenu>
-                                    <DropdownMenuTrigger asChild>
-                                        {itemSideActionButton?.(item) ?? (
-                                            <ButtonPrimitive
-                                                iconOnly
-                                                isSideActionRight
-                                                className="
-                                                    absolute right-0
-                                                    opacity-0
-                                                    group-hover/lemon-tree-button-group:opacity-100
-                                                    z-10
-                                                    data-[state=open]:opacity-100
-                                                    -outline-offset-2
-                                                    focus-visible:opacity-100
-                                                "
-                                            >
-                                                <IconEllipsis className="text-tertiary size-3 group-hover/lemon-tree-button-group:text-primary z-10" />
-                                            </ButtonPrimitive>
-                                        )}
-                                    </DropdownMenuTrigger>
-
-                                    {!!itemSideAction(item) && (
-                                        <DropdownMenuContent loop align="end" side="bottom" className="max-w-[250px]">
-                                            {itemSideAction(item)}
-                                        </DropdownMenuContent>
-                                    )}
-                                </DropdownMenu>
-                            )}
+                        {sideAction}
                     </ButtonGroupPrimitive>
                 </AccordionPrimitive.Trigger>
 
@@ -618,7 +626,10 @@ const LemonTreeNode = forwardRef<HTMLDivElement, LemonTreeNodeProps>(
                             return null
                         }
                         return (
-                            <div key={item.id} className="not-first:mt-3 py-1 px-2 flex items-center">
+                            <div
+                                key={item.id}
+                                className="not-first:mt-[var(--lemon-tree-category-gap,0.75rem)] py-[var(--lemon-tree-category-padding-y,0.25rem)] px-2 flex items-center"
+                            >
                                 <span className="text-xs font-semibold text-tertiary">{item.displayName}</span>
                             </div>
                         )
@@ -721,6 +732,10 @@ const LemonTree = forwardRef<LemonTreeRef, LemonTreeProps>(
         const [disableKeyboardInput, setDisableKeyboardInput] = useState(false)
         const [typeAheadBuffer, setTypeAheadBuffer] = useState<string>('')
         const [focusedItemId, setFocusedItemId] = useState<string | undefined>(defaultSelectedFolderOrNodeId)
+        const [imperativeFocusRequest, setImperativeFocusRequest] = useState<{
+            id: string
+            options: LemonTreeFocusOptions
+        } | null>(null)
         const [virtualWindow, setVirtualWindow] = useState<VirtualWindow>({
             startIndex: 0,
             endIndex: 0,
@@ -878,11 +893,11 @@ const LemonTree = forwardRef<LemonTreeRef, LemonTreeProps>(
             return []
         }, [])
 
-        const focusTreeItem = useCallback((id: string): void => {
+        const focusTreeItem = useCallback((id: string, preventScroll = false): void => {
             setFocusedItemId(id)
             setTimeout(() => {
                 const element = containerRef.current?.querySelector(`[data-id="${CSS.escape(id)}"]`) as HTMLElement
-                element?.focus()
+                element?.focus({ preventScroll })
             }, 0)
         }, [])
 
@@ -1335,8 +1350,9 @@ const LemonTree = forwardRef<LemonTreeRef, LemonTreeProps>(
 
         useImperativeHandle(ref, () => ({
             getVisibleItems,
-            focusItem: (id: string) => {
-                focusTreeItem(id)
+            focusItem: (id: string, options: LemonTreeFocusOptions = {}) => {
+                focusTreeItem(id, !!options.scrollPosition)
+                setImperativeFocusRequest({ id, options })
             },
         }))
 
@@ -1462,6 +1478,43 @@ const LemonTree = forwardRef<LemonTreeRef, LemonTreeProps>(
             }
         }, [computeVirtualWindow, focusedItemId, flattenedVisibleItems.length])
 
+        useEffect(() => {
+            if (!imperativeFocusRequest || (isFinishedBuildingTreeData ?? true) === false) {
+                return
+            }
+
+            const element = containerRef.current?.querySelector(
+                `[data-id="${CSS.escape(imperativeFocusRequest.id)}"]`
+            ) as HTMLElement | null
+            if (!element) {
+                return
+            }
+
+            element.focus({ preventScroll: !!imperativeFocusRequest.options.scrollPosition })
+
+            if (imperativeFocusRequest.options.scrollPosition === 'top-third') {
+                const viewport = virtualizationScrollContainerRef?.current ?? scrollViewportRef.current
+                if (viewport) {
+                    const viewportBounds = viewport.getBoundingClientRect()
+                    const elementBounds = element.getBoundingClientRect()
+                    const top = Math.max(
+                        0,
+                        viewport.scrollTop + elementBounds.top - viewportBounds.top - viewport.clientHeight / 3
+                    )
+                    viewport.scrollTo({ top, behavior: imperativeFocusRequest.options.behavior ?? 'auto' })
+                }
+            }
+
+            setImperativeFocusRequest(null)
+        }, [
+            imperativeFocusRequest,
+            isFinishedBuildingTreeData,
+            virtualizationScrollContainerRef,
+            virtualWindow.endIndex,
+            virtualWindow.startIndex,
+            expandedItemIdsState,
+        ])
+
         const virtualizedStartIndex = virtualWindow.startIndex
         const virtualizedEndIndex = virtualWindow.endIndex
         const indexByItemId = useMemo(
@@ -1478,7 +1531,11 @@ const LemonTree = forwardRef<LemonTreeRef, LemonTreeProps>(
         const sortedRenderedIndexes = useMemo(() => {
             const renderedIndexes = new Set<number>()
 
-            for (let index = virtualizedStartIndex; index < virtualizedEndIndex; index++) {
+            for (
+                let index = virtualizedStartIndex;
+                index < Math.min(virtualizedEndIndex, parentIndexesByIndex.length);
+                index++
+            ) {
                 renderedIndexes.add(index)
 
                 let parentIndex = parentIndexesByIndex[index]
@@ -1493,40 +1550,6 @@ const LemonTree = forwardRef<LemonTreeRef, LemonTreeProps>(
 
             return [...renderedIndexes].sort((left, right) => left - right)
         }, [parentIndexesByIndex, virtualizedEndIndex, virtualizedStartIndex])
-
-        const virtualizedSegments = useMemo((): { startIndex: number; items: FlattenedTreeItem[] }[] => {
-            const segments: { startIndex: number; items: FlattenedTreeItem[] }[] = []
-
-            if (sortedRenderedIndexes.length === 0) {
-                return segments
-            }
-
-            let segmentStart = sortedRenderedIndexes[0]
-            let previousIndex = sortedRenderedIndexes[0]
-
-            for (let index = 1; index < sortedRenderedIndexes.length; index++) {
-                const currentIndex = sortedRenderedIndexes[index]
-                if (currentIndex === previousIndex + 1) {
-                    previousIndex = currentIndex
-                    continue
-                }
-
-                segments.push({
-                    startIndex: segmentStart,
-                    items: flattenedVisibleItems.slice(segmentStart, previousIndex + 1),
-                })
-
-                segmentStart = currentIndex
-                previousIndex = currentIndex
-            }
-
-            segments.push({
-                startIndex: segmentStart,
-                items: flattenedVisibleItems.slice(segmentStart, previousIndex + 1),
-            })
-
-            return segments
-        }, [flattenedVisibleItems, sortedRenderedIndexes])
 
         const findItem = (items: TreeDataItem[], itemId: string): TreeDataItem | undefined => {
             for (const item of items) {
@@ -1602,7 +1625,8 @@ const LemonTree = forwardRef<LemonTreeRef, LemonTreeProps>(
                         {
                             // for tree element
                             '--lemon-tree-button-height': 'var(--button-height-base)',
-                            '--lemon-tree-button-icon-offset-top': '5px',
+                            // Centers the 20px (size-5) icon box within the row, whatever the row height resolves to
+                            '--lemon-tree-button-icon-offset-top': 'calc((var(--lemon-tree-button-height) - 20px) / 2)',
                         } as CSSProperties
                     }
                 >
@@ -1626,54 +1650,54 @@ const LemonTree = forwardRef<LemonTreeRef, LemonTreeProps>(
                                             height: `${flattenedVisibleItems.length * virtualizedRowHeight}px`,
                                         }}
                                     >
-                                        {virtualizedSegments.map((segment) => {
+                                        {/* Stable row parents preserve the click target when focus changes the virtual window. */}
+                                        {sortedRenderedIndexes.map((index) => {
+                                            const { item, depth, ariaSetSize, ariaPosInSet } =
+                                                flattenedVisibleItems[index]
                                             return (
                                                 <div
-                                                    key={`segment-${segment.startIndex}`}
+                                                    key={item.id}
                                                     className="absolute inset-x-0 top-0"
                                                     // eslint-disable-next-line react/forbid-dom-props
                                                     style={{
-                                                        transform: `translateY(${segment.startIndex * virtualizedRowHeight}px)`,
+                                                        transform: `translateY(${index * virtualizedRowHeight}px)`,
                                                     }}
                                                 >
-                                                    {segment.items.map(({ item, depth, ariaSetSize, ariaPosInSet }) => (
-                                                        <LemonTreeItemRow
-                                                            key={item.id}
-                                                            item={item}
-                                                            ariaSetSize={ariaSetSize}
-                                                            ariaPosInSet={ariaPosInSet}
-                                                            selectedId={selectedId}
-                                                            handleClick={handleClick}
-                                                            expandedItemIds={expandedItemIdsState}
-                                                            onSetExpandedItemIds={(ids) => {
-                                                                setExpandedItemIdsState(ids)
-                                                                onSetExpandedItemIds?.(ids)
-                                                            }}
-                                                            defaultNodeIcon={defaultNodeIcon}
-                                                            showFolderActiveState={showFolderActiveState}
-                                                            itemSideAction={itemSideAction}
-                                                            isItemEditing={isItemEditing}
-                                                            onItemNameChange={onItemNameChange}
-                                                            isItemDraggable={isItemDraggable}
-                                                            isItemDroppable={isItemDroppable}
-                                                            getItemDropMode={getItemDropMode}
-                                                            onReorderPositionChange={handleReorderPositionChange}
-                                                            enableDragAndDrop={enableDragAndDrop}
-                                                            disableKeyboardInput={(disable) => {
-                                                                setDisableKeyboardInput(disable)
-                                                            }}
-                                                            itemContextMenu={itemContextMenu}
-                                                            selectMode={selectMode}
-                                                            onItemChecked={onItemChecked}
-                                                            isDragging={isDragging}
-                                                            checkedItemCount={checkedItemCount}
-                                                            setFocusToElementFromId={focusElementFromId}
-                                                            depth={depth}
-                                                            size={size}
-                                                            virtualizedRowHeight={virtualizedRowHeight}
-                                                            {...props}
-                                                        />
-                                                    ))}
+                                                    <LemonTreeItemRow
+                                                        item={item}
+                                                        ariaSetSize={ariaSetSize}
+                                                        ariaPosInSet={ariaPosInSet}
+                                                        selectedId={selectedId}
+                                                        handleClick={handleClick}
+                                                        expandedItemIds={expandedItemIdsState}
+                                                        onSetExpandedItemIds={(ids) => {
+                                                            setExpandedItemIdsState(ids)
+                                                            onSetExpandedItemIds?.(ids)
+                                                        }}
+                                                        defaultNodeIcon={defaultNodeIcon}
+                                                        showFolderActiveState={showFolderActiveState}
+                                                        itemSideAction={itemSideAction}
+                                                        isItemEditing={isItemEditing}
+                                                        onItemNameChange={onItemNameChange}
+                                                        isItemDraggable={isItemDraggable}
+                                                        isItemDroppable={isItemDroppable}
+                                                        getItemDropMode={getItemDropMode}
+                                                        onReorderPositionChange={handleReorderPositionChange}
+                                                        enableDragAndDrop={enableDragAndDrop}
+                                                        disableKeyboardInput={(disable) => {
+                                                            setDisableKeyboardInput(disable)
+                                                        }}
+                                                        itemContextMenu={itemContextMenu}
+                                                        selectMode={selectMode}
+                                                        onItemChecked={onItemChecked}
+                                                        isDragging={isDragging}
+                                                        checkedItemCount={checkedItemCount}
+                                                        setFocusToElementFromId={focusElementFromId}
+                                                        depth={depth}
+                                                        size={size}
+                                                        virtualizedRowHeight={virtualizedRowHeight}
+                                                        {...props}
+                                                    />
                                                 </div>
                                             )
                                         })}

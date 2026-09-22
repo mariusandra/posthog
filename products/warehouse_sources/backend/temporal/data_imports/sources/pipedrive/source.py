@@ -1,23 +1,21 @@
 import datetime
-from typing import Optional, cast
+from typing import TYPE_CHECKING, Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
 )
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
-)
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import (
+    ExternalWebhookInfo,
     FieldType,
     ResumableSource,
     VersionDeprecation,
+    WebhookCreationResult,
+    WebhookDeletionResult,
+    WebhookSource,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
     CanonicalDescriptions,
@@ -25,21 +23,36 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.webhook_s3 import WebhookSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.pipedrive import (
     PipedriveSourceConfig,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.pipedrive.pipedrive import (
     PipedriveResumeConfig,
+    create_webhook as create_pipedrive_webhook,
+    delete_webhook as delete_pipedrive_webhook,
+    get_external_webhook_info as get_pipedrive_webhook_info,
     normalize_company_domain,
     pipedrive_source,
     validate_credentials as validate_pipedrive_credentials,
 )
-from products.warehouse_sources.backend.temporal.data_imports.sources.pipedrive.settings import ENDPOINTS
+from products.warehouse_sources.backend.temporal.data_imports.sources.pipedrive.settings import (
+    ENDPOINTS,
+    WEBHOOK_ENTITY_BY_SCHEMA,
+    webhook_schema_names,
+)
 from products.warehouse_sources.backend.types import ExternalDataSourceType
+
+if TYPE_CHECKING:
+    from posthog.cdp.templates.hog_function_template import HogFunctionTemplateDC
 
 
 @SourceRegistry.register
-class PipedriveSource(ResumableSource[PipedriveSourceConfig, PipedriveResumeConfig]):
+class PipedriveSource(
+    ResumableSource[PipedriveSourceConfig, PipedriveResumeConfig],
+    WebhookSource[PipedriveSourceConfig],
+):
     supported_versions = ("v1", "v2")
     default_version = "v2"
     # v1 only differs from v2 in the `activities` endpoint; the vendor deprecated the v1
@@ -54,6 +67,16 @@ class PipedriveSource(ResumableSource[PipedriveSourceConfig, PipedriveResumeConf
         return ExternalDataSourceType.PIPEDRIVE
 
     @property
+    def webhook_template(self) -> Optional["HogFunctionTemplateDC"]:
+        from products.warehouse_sources.backend.temporal.data_imports.sources.pipedrive.webhook_template import template
+
+        return template
+
+    @property
+    def webhook_resource_map(self) -> dict[str, str]:
+        return WEBHOOK_ENTITY_BY_SCHEMA
+
+    @property
     def connection_host_fields(self) -> list[str]:
         # The stored API token is sent to `{company_domain}.pipedrive.com`; retargeting the
         # domain must re-require the token.
@@ -62,10 +85,10 @@ class PipedriveSource(ResumableSource[PipedriveSourceConfig, PipedriveResumeConf
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.PIPEDRIVE,
+            name=ExternalDataSourceType.PIPEDRIVE,
             category=DataWarehouseSourceCategory.CRM,
             label="Pipedrive",
-            releaseStatus=ReleaseStatus.ALPHA,
+            releaseStatus=ReleaseStatus.GA,
             caption="""Enter your Pipedrive API token to sync your Pipedrive CRM data into the PostHog Data warehouse.
 
 You can find your personal API token in Pipedrive under **Settings > Personal preferences > API**. The token inherits your user's permissions, so make sure your user can access the data you want to sync.""",
@@ -80,6 +103,7 @@ You can find your personal API token in Pipedrive under **Settings > Personal pr
                         type=SourceFieldInputConfigType.TEXT,
                         required=True,
                         placeholder="mycompany",
+                        caption="Enter just your Pipedrive subdomain, not a full URL. For acme.pipedrive.com, enter acme.",
                         secret=False,
                     ),
                     SourceFieldInputConfig(
@@ -88,6 +112,40 @@ You can find your personal API token in Pipedrive under **Settings > Personal pr
                         type=SourceFieldInputConfigType.PASSWORD,
                         required=True,
                         placeholder="",
+                        secret=True,
+                    ),
+                ],
+            ),
+            webhookSetupCaption="""PostHog registers one webhook on your Pipedrive account using your API token. Pipedrive does not sign deliveries, so PostHog generates HTTP auth credentials, sets them on the webhook, and rejects any delivery that does not send them back.
+
+**Manual setup** (only needed if automatic registration failed):
+
+1. Go to **Tools and apps > Webhooks** in Pipedrive and click **Create new webhook**
+2. Paste the webhook URL shown below into the **Endpoint URL** field
+3. Set both **Event action** and **Event object** to **All**, and leave the payload version on **v2**
+4. Fill in **HTTP Auth username** and **HTTP Auth password**, then enter the same two values below so PostHog can verify deliveries
+5. Click **Save**
+
+Deletions in Pipedrive are not applied to tables synced by webhook. Switch a table back to a full sync to drop deleted rows.""",
+            webhookFields=cast(
+                list[FieldType],
+                [
+                    SourceFieldInputConfig(
+                        name="http_auth_user",
+                        label="HTTP auth username",
+                        type=SourceFieldInputConfigType.TEXT,
+                        required=True,
+                        placeholder="posthog",
+                        caption="The HTTP auth username set on the Pipedrive webhook.",
+                        secret=False,
+                    ),
+                    SourceFieldInputConfig(
+                        name="http_auth_password",
+                        label="HTTP auth password",
+                        type=SourceFieldInputConfigType.PASSWORD,
+                        required=True,
+                        placeholder="",
+                        caption="The HTTP auth password set on the Pipedrive webhook. PostHog checks both values on every delivery.",
                         secret=True,
                     ),
                 ],
@@ -118,8 +176,15 @@ You can find your personal API token in Pipedrive under **Settings > Personal pr
     ) -> list[SourceSchema]:
         # Full refresh only: Pipedrive's v1 collections have no server-side updated_after
         # filter, and the v2 `updated_since` filter is unverified (no credentials to curl with).
+        webhook_capable = webhook_schema_names(self.resolve_api_version(api_version))
         schemas = [
-            SourceSchema(name=endpoint, supports_incremental=False, supports_append=False, incremental_fields=[])
+            SourceSchema(
+                name=endpoint,
+                supports_incremental=False,
+                supports_append=False,
+                incremental_fields=[],
+                supports_webhooks=endpoint in webhook_capable,
+            )
             for endpoint in list(ENDPOINTS)
         ]
         if names is not None:
@@ -145,12 +210,43 @@ You can find your personal API token in Pipedrive under **Settings > Personal pr
         # (schema_name is None) and only reject when validating a specific schema.
         if status == 403 and schema_name is None:
             return True, None
-        if status in (401, 403):
-            return False, "Invalid Pipedrive API token or insufficient permissions"
-        return False, "Could not validate Pipedrive credentials"
+        if status == 401:
+            return (
+                False,
+                "Your Pipedrive API token was rejected. Copy the token again from your Pipedrive "
+                "personal preferences, then reconnect.",
+            )
+        if status == 403:
+            return (
+                False,
+                "Your Pipedrive user doesn't have permission to read this data. Ask a Pipedrive "
+                "admin to grant access, then try again.",
+            )
+        return (
+            False,
+            "Couldn't validate your Pipedrive credentials. Check your company domain and API token, then try again.",
+        )
 
     def get_resumable_source_manager(self, inputs: SourceInputs) -> ResumableSourceManager[PipedriveResumeConfig]:
         return ResumableSourceManager[PipedriveResumeConfig](inputs, PipedriveResumeConfig)
+
+    def get_webhook_source_manager(self, inputs: SourceInputs) -> WebhookSourceManager:
+        return WebhookSourceManager(inputs, inputs.logger)
+
+    def create_webhook(
+        self, config: PipedriveSourceConfig, webhook_url: str, team_id: int, api_version: str | None = None
+    ) -> WebhookCreationResult:
+        return create_pipedrive_webhook(config.company_domain, config.api_token, webhook_url)
+
+    def get_external_webhook_info(
+        self, config: PipedriveSourceConfig, webhook_url: str, team_id: int, api_version: str | None = None
+    ) -> ExternalWebhookInfo:
+        return get_pipedrive_webhook_info(config.company_domain, config.api_token, webhook_url)
+
+    def delete_webhook(
+        self, config: PipedriveSourceConfig, webhook_url: str, team_id: int, api_version: str | None = None
+    ) -> WebhookDeletionResult:
+        return delete_pipedrive_webhook(config.company_domain, config.api_token, webhook_url)
 
     def source_for_pipeline(
         self,
@@ -166,5 +262,6 @@ You can find your personal API token in Pipedrive under **Settings > Personal pr
             job_id=inputs.job_id,
             api_version=self.resolve_api_version(inputs.api_version),
             resumable_source_manager=resumable_source_manager,
+            webhook_source_manager=self.get_webhook_source_manager(inputs),
             db_incremental_field_last_value=None,  # every Pipedrive endpoint is full refresh
         )

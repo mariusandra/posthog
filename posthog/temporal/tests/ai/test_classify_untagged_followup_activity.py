@@ -2,24 +2,24 @@ from unittest.mock import patch
 
 from django.apps import apps
 from django.test import TestCase
+from django.utils import timezone
 
 from posthog.models.integration import Integration
 from posthog.models.organization import Organization
 from posthog.models.team.team import Team
 from posthog.models.user import User
-from posthog.temporal.ai.slack_app import (
-    PostHogCodeSlackMentionWorkflowInputs,
-    classify_message_is_agent_directed,
-    classify_untagged_followup_activity,
-)
+from posthog.temporal.ai.slack_app import PostHogCodeSlackMentionWorkflowInputs, classify_untagged_followup_activity
 
-from products.slack_app.backend.models import SlackThreadTaskMapping
+from products.slack_app.backend.models import SlackThreadTaskMapping, SlackUserProfileCache
 
 
 class TestClassifyUntaggedFollowupActivity(TestCase):
     """Activity-level tests for the classifier that now lives inside the
-    mention workflow. The activity owns mapping lookup, thread-history fetch,
-    and the LLM call; the webhook handler is no longer involved."""
+    mention workflow. The activity owns mapping lookup and thread-history fetch;
+    the webhook handler is no longer involved.
+
+    The classifier it calls has its own tests next to the model-override one, in
+    ``slack_app/activities/test_classify_message_is_agent_directed.py``."""
 
     def setUp(self):
         self.Task = apps.get_model("tasks", "Task")
@@ -53,6 +53,7 @@ class TestClassifyUntaggedFollowupActivity(TestCase):
             event={},
             integration_id=self.integration.id,
             slack_team_id="T_SLACK",
+            user_id=self.user.id,
             untagged_followup=True,
         )
 
@@ -93,6 +94,28 @@ class TestClassifyUntaggedFollowupActivity(TestCase):
         ):
             assert self._call("thanks team!") is False
 
+    def test_a_reply_that_tags_another_app_never_reaches_the_classifier(self):
+        SlackUserProfileCache.objects.create(
+            integration=self.integration,
+            slack_user_id="U0OTHERAPP",
+            display_name="Other agent",
+            is_bot=True,
+            refreshed_at=timezone.now(),
+        )
+        with (
+            patch("products.slack_app.backend.services.slack_messages.cached_collect_thread_messages", return_value=[]),
+            patch(
+                "products.slack_app.backend.services.slack_user_info.get_cached_bot_user_id",
+                return_value="U0OURBOT",
+            ),
+            patch(
+                "posthog.temporal.ai.slack_app.activities.classifiers.classify_message_is_agent_directed",
+                return_value=True,
+            ) as mock_classify,
+        ):
+            assert self._call("<@U0OTHERAPP> take another look at the export filter") is False
+        mock_classify.assert_not_called()
+
     def test_history_fetch_failure_classifies_on_empty_history(self):
         """A Slack hiccup on ``conversations_replies`` falls back to classifying
         on the message text alone rather than dropping silently."""
@@ -111,58 +134,8 @@ class TestClassifyUntaggedFollowupActivity(TestCase):
         assert mock_classify.call_args[0][2] == []
 
 
-class TestClassifyMessageIsAgentDirected(TestCase):
-    """The Haiku-backed classifier with cheap pre-LLM heuristics. Moved from
-    the API module to the workflow module along with the rest of the LLM
-    work."""
-
-    def test_emoji_only_dropped_without_llm(self):
-        with patch("posthog.temporal.ai.slack_app.activities.classifiers.get_llm_client") as mock_client:
-            assert classify_message_is_agent_directed(":thumbsup: :tada:", "do thing", []) is False
-        mock_client.assert_not_called()
-
-    def test_haiku_directed_true(self):
-        fake_response = type(
-            "Resp",
-            (),
-            {
-                "choices": [
-                    type(
-                        "Choice",
-                        (),
-                        {"message": type("Msg", (), {"content": '{"agent_directed": true}'})()},
-                    )()
-                ]
-            },
-        )()
-        with patch("posthog.temporal.ai.slack_app.activities.classifiers.get_llm_client") as mock_client:
-            mock_client.return_value.chat.completions.create.return_value = fake_response
-            result = classify_message_is_agent_directed("Please also check the auth flow on safari", "fix the bug", [])
-        assert result is True
-
-    def test_haiku_directed_false(self):
-        fake_response = type(
-            "Resp",
-            (),
-            {
-                "choices": [
-                    type(
-                        "Choice",
-                        (),
-                        {"message": type("Msg", (), {"content": '{"agent_directed": false}'})()},
-                    )()
-                ]
-            },
-        )()
-        with patch("posthog.temporal.ai.slack_app.activities.classifiers.get_llm_client") as mock_client:
-            mock_client.return_value.chat.completions.create.return_value = fake_response
-            result = classify_message_is_agent_directed("nice work team, going to lunch now", "fix the bug", [])
-        assert result is False
-
-    def test_haiku_failure_defaults_to_drop(self):
-        """Conservative default: a false positive interrupts the agent on
-        every chit-chat reply; a false negative just means the user re-tags."""
-        with patch("posthog.temporal.ai.slack_app.activities.classifiers.get_llm_client") as mock_client:
-            mock_client.return_value.chat.completions.create.side_effect = RuntimeError("boom")
-            result = classify_message_is_agent_directed("Please also check the auth flow on safari", "fix the bug", [])
-        assert result is False
+# The classifier itself — parsing, the pre-LLM heuristic, the bounded client, and the
+# prompt snapshot — is covered in
+# `posthog/temporal/tests/ai/slack_app/activities/test_classify_message_is_agent_directed.py`,
+# next to the model-override classifier's own tests. This file covers the activity around
+# it: the thread mapping, the history fetch, and what happens when either is missing.

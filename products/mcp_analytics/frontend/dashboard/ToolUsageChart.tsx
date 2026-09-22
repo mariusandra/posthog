@@ -55,11 +55,14 @@ export function ToolUsageChart({
         <Card title="Tool call breakdown">
             <CardState
                 loading={loading}
-                isEmpty={data.tools.length === 0}
-                skeleton={<Skeleton className="h-[260px] w-full" />}
+                // Rows whose buckets fall outside the client's keys still contribute their tool
+                // names, so `tools` can be non-empty with every series zeroed. Checking the counts
+                // rather than the names keeps that rendering as the empty state, not a blank stack.
+                isEmpty={data.tools.every((t) => t.data.every((v) => v === 0))}
+                skeleton={<Skeleton className="min-h-[300px] flex-1" />}
                 empty={<div className="py-6 text-center text-[12px] text-secondary">No tool calls yet.</div>}
             >
-                <div className="flex h-[260px] flex-col">
+                <div className="flex min-h-[300px] flex-1 flex-col">
                     <TimeSeriesBarChart series={series} labels={data.labels} config={config} theme={theme} />
                 </div>
             </CardState>

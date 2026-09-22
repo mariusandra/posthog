@@ -1,8 +1,24 @@
+import random
+from datetime import timedelta
 from typing import Any, Optional
 
+from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
 from posthog.exceptions_capture import capture_exception
+
+from products.tasks.backend.facade.compute_quota import ComputeBillingLimitExceeded
+
+SANDBOX_RATE_LIMIT_BASE_DELAY_SECONDS = 45
+SANDBOX_RATE_LIMIT_MAX_DELAY_SECONDS = 300
+
+
+def sandbox_rate_limit_retry_delay(attempt: int) -> float:
+    ceiling = min(
+        SANDBOX_RATE_LIMIT_BASE_DELAY_SECONDS * 2 ** max(attempt - 1, 0),
+        SANDBOX_RATE_LIMIT_MAX_DELAY_SECONDS,
+    )
+    return random.uniform(ceiling / 2, ceiling)
 
 
 class ProcessTaskError(ApplicationError):
@@ -57,6 +73,32 @@ class TaskRunNotReadyError(ProcessTaskTransientError):
         ProcessTaskError.__init__(self, message, context, None, non_retryable=False)
 
 
+class GitHubRateLimitedError(ProcessTaskTransientError):
+    """GitHub rate-limited a call (or our egress budget shed it before it was sent).
+
+    An expected, recoverable condition rather than a fault. Kept retryable so the
+    activity's retry policy recovers once the limit window passes, but intentionally
+    not captured to error tracking — there is nothing to investigate, and capturing
+    it mints a noisy issue for something we expect to happen. ``retry_after`` (seconds)
+    drives ``next_retry_delay`` so the retry lands after the window instead of burning
+    every attempt inside it, and is folded into the message so the surfaced error names
+    a real wait instead of an empty reset time.
+    """
+
+    def __init__(self, message: str, context: dict[str, Any], retry_after: int):
+        # Bypass ProcessTaskTransientError.__init__ to pass cause=None with capture=False,
+        # skipping the capture_exception() call in ProcessTaskError (mirrors TaskRunNotReadyError).
+        ProcessTaskError.__init__(
+            self,
+            message,
+            context,
+            None,
+            capture=False,
+            non_retryable=False,
+            next_retry_delay=timedelta(seconds=retry_after),
+        )
+
+
 class TaskInvalidStateError(ProcessTaskFatalError):
     pass
 
@@ -64,6 +106,29 @@ class TaskInvalidStateError(ProcessTaskFatalError):
 class SandboxProvisionError(ProcessTaskTransientError):
     """Failed to provision sandbox environment."""
 
+    pass
+
+
+class ComputeBillingLimitError(ProcessTaskError, ComputeBillingLimitExceeded):
+    def __init__(self, context: dict[str, Any], reason: str = "posthog_code_billing_limit_exceeded"):
+        from products.tasks.backend.logic.services.compute_quota import ORGANIZATION_DEACTIVATED_DENIAL_CODE
+
+        self.reason = reason
+        message = (
+            "Your organization has been deactivated."
+            if reason == ORGANIZATION_DEACTIVATED_DENIAL_CODE
+            else "Your organization reached its PostHog Desktop usage limit."
+        )
+        super().__init__(
+            message,
+            {**context, "reason": reason},
+            None,
+            capture=False,
+            non_retryable=True,
+        )
+
+
+class SandboxNetworkPolicyError(ProcessTaskFatalError):
     pass
 
 
@@ -77,6 +142,46 @@ class SandboxExecutionError(ProcessTaskTransientError):
     """Error during sandbox command execution."""
 
     pass
+
+
+class SandboxControlPlaneError(SandboxExecutionError):
+    """The sandbox control plane refused or failed a call, before the sandbox itself saw it.
+
+    The fault belongs to the control plane, not to the run, so these stay retryable and are
+    never captured to error tracking. Capturing one mints an issue nobody can act on, and a
+    fresh one per provider message: the cause is constructed rather than raised, so every
+    occurrence carries its own synthesized traceback and none of them group.
+    """
+
+    def __init__(self, message: str, context: dict[str, Any], retry_delay: Optional[timedelta] = None):
+        ProcessTaskError.__init__(
+            self,
+            message,
+            context,
+            None,
+            capture=False,
+            non_retryable=False,
+            next_retry_delay=retry_delay,
+        )
+
+
+class SandboxRateLimitedError(SandboxControlPlaneError):
+    """The egress proxy in front of the sandbox control plane shed the call.
+
+    Backs off past the limit window so the retry lands after it rather than inside it.
+    """
+
+    def __init__(self, message: str, context: dict[str, Any]):
+        attempt = activity.info().attempt if activity.in_activity() else 1
+        super().__init__(message, context, retry_delay=timedelta(seconds=sandbox_rate_limit_retry_delay(attempt)))
+
+
+class SandboxControlPlaneUnavailableError(SandboxControlPlaneError):
+    """The sandbox control plane answered a call with a gateway status (5xx).
+
+    The activity's own retry policy is the right backoff here. Unlike a rate limit there is
+    no window to wait out, so this does not set a delay of its own.
+    """
 
 
 class SandboxMissingRepositoryError(ProcessTaskFatalError):
@@ -129,6 +234,22 @@ class SnapshotCreationError(ProcessTaskTransientError):
 
 class SnapshotTimeoutError(ProcessTaskTransientError):
     """Transient timeout/connection error while creating a snapshot; safe to retry."""
+
+    pass
+
+
+class SnapshotFileLimitExceededError(ProcessTaskFatalError):
+    """Modal refuses to snapshot a directory/filesystem holding more than its hard file-count
+    cap (1,000,000 files). This is a permanent limit, not a transient blip, so retrying the same
+    snapshot cannot succeed — the caller must shrink the tree (prune node_modules, virtualenvs,
+    and package caches) before it can snapshot.
+
+    Non-retryable and captured to error tracking: it is a named, classified condition (not the
+    generic mystery issue this replaced), and callers with no fallback — the dev-stack image bake,
+    the standalone snapshot activity — need it visible. The resume path recovers by pruning and
+    letting Temporal retry, so it converts this into a transient error itself rather than swallowing
+    the signal.
+    """
 
     pass
 

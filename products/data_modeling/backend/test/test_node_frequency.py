@@ -14,10 +14,12 @@ from products.data_modeling.backend.logic.freshness import (
 )
 from products.data_modeling.backend.logic.node_frequency import (
     build_frequency_graph,
+    get_declared_anchor,
     get_declared_target,
     persist_seed_targets,
     resolve_source_intervals,
     seed_targets,
+    set_declared_anchor,
     set_declared_target,
 )
 from products.data_modeling.backend.models.dag import DAG
@@ -25,6 +27,7 @@ from products.data_modeling.backend.models.datawarehouse_saved_query import Data
 from products.data_modeling.backend.models.edge import Edge
 from products.data_modeling.backend.models.node import Node, NodeType
 from products.data_modeling.backend.test.helpers import (
+    metric_node as _metric_node,
     saved_query_node as _saved_query_node,
     table_node as _table_node,
     warehouse_source_node as _warehouse_source_node,
@@ -64,6 +67,23 @@ class TestFrequencyTargetAccessors(BaseTest):
         node.refresh_from_db()
         self.assertEqual(node.properties["system"]["suspended"], {"duckdb": True})
         self.assertEqual(get_declared_target(node), H1)
+
+    def test_anchor_and_target_share_the_frequency_key_without_clobbering(self):
+        node = self._node()
+        set_declared_target(node, H1)
+        set_declared_anchor(node, 120)
+        node.refresh_from_db()
+        self.assertEqual(get_declared_target(node), H1)
+        self.assertEqual(get_declared_anchor(node), 120)
+        set_declared_anchor(node, None)
+        node.refresh_from_db()
+        self.assertIsNone(get_declared_anchor(node))
+        self.assertEqual(get_declared_target(node), H1)
+
+    @parameterized.expand([("negative", -1), ("full_week", 10080)])
+    def test_anchor_out_of_range_is_rejected(self, _name, anchor):
+        with self.assertRaises(ValueError):
+            set_declared_anchor(self._node(), anchor)
 
 
 @pytest.mark.django_db
@@ -167,10 +187,17 @@ class TestSeedTargets(BaseTest):
         seeds = seed_targets(dag)
         self.assertEqual(seeds, {} if expected is None else {str(node.id): expected})
 
-    def test_source_tables_are_never_seeded(self):
-        dag = DAG.objects.create(team=self.team, name="seed-demo-src", sync_frequency_interval=H1)
-        _table_node(self.team, dag, "events", {"origin": "posthog"})
+    @parameterized.expand(
+        [
+            ("source_table", lambda team, dag: _table_node(team, dag, "events", {"origin": "posthog"})),
+            ("metric", lambda team, dag: _metric_node(team, dag, "weekly_active_accounts")),
+        ]
+    )
+    def test_nodes_that_never_run_are_never_seeded(self, _name, make_node):
+        dag = DAG.objects.create(team=self.team, name=f"seed-demo-{_name}", sync_frequency_interval=H1)
+        make_node(self.team, dag)
         self.assertEqual(seed_targets(dag), {})
+        self.assertEqual(persist_seed_targets(dag), 0)
 
 
 @pytest.mark.django_db

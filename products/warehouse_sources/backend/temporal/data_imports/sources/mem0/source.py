@@ -1,25 +1,25 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
 )
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import (
+    UNVERSIONED_API_VERSION,
+    FieldType,
+    ResumableSource,
+    VersionDeprecation,
 )
-from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
     CanonicalDescriptions,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.mem0 import Mem0SourceConfig
 from products.warehouse_sources.backend.temporal.data_imports.sources.mem0.mem0 import (
     Mem0ResumeConfig,
@@ -27,10 +27,12 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.mem0.mem0 
     validate_credentials as validate_mem0_credentials,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.mem0.settings import (
+    DEFAULT_VERSION,
     ENDPOINTS,
     INCREMENTAL_FIELDS,
     MEM0_ENDPOINTS,
     MEMORIES_ENDPOINT,
+    SUPPORTED_VERSIONS,
 )
 from products.warehouse_sources.backend.types import ExternalDataSourceType
 
@@ -49,6 +51,13 @@ class Mem0Source(ResumableSource[Mem0SourceConfig, Mem0ResumeConfig]):
     lists_tables_without_credentials = True  # static endpoint catalog — safe for public docs
     api_docs_url = "https://docs.mem0.ai/api-reference"
 
+    supported_versions = SUPPORTED_VERSIONS
+    default_version = DEFAULT_VERSION
+    # Mem0 dropped the legacy v1 API generation in its 2.0.0 SDK release; no calendar sunset date is
+    # published, so this is advisory. The legacy "v1" label and the "v3" default resolve to
+    # byte-identical requests here (see settings.py), so repinning is a pure relabel, not a version move.
+    deprecated_versions = (VersionDeprecation(version=UNVERSIONED_API_VERSION, sunset_at=None),)
+
     @property
     def source_type(self) -> ExternalDataSourceType:
         return ExternalDataSourceType.MEM0
@@ -56,7 +65,7 @@ class Mem0Source(ResumableSource[Mem0SourceConfig, Mem0ResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.MEM0,
+            name=ExternalDataSourceType.MEM0,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="Mem0",
             caption="""Enter your Mem0 API key to automatically pull your Mem0 memories, entities, and operation events into the PostHog Data warehouse.

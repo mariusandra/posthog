@@ -1,24 +1,31 @@
 Executes HogQL — PostHog's variant of SQL that supports most of ClickHouse SQL. "HogQL" and "SQL" are used interchangeably.
 
-{guidelines}
-
 ### When to use `execute-sql`
 
-**Use `query-*` tools whenever the question maps to a supported insight type.** These tools produce typed, saveable insights; SQL forfeits that.
-Reach for `execute-sql` only when no `query-*` tool can express the question:
+Use SQL for record inspection, custom calculations, joins, existing SQL, or requests for SQL. SQL results can inform how you construct a later typed query. Typed query tools cannot accept SQL results as input. SQL cases include:
 
-- **Searching or listing existing PostHog entities** — insights, dashboards, cohorts, feature flags, experiments, surveys. No `query-*` tool covers these; query the `system.*` tables.
-- **Multi-event joins or aggregations across event types** that don't fit a single series.
-- **Sophisticated queries beyond `query-*` schemas** — custom grouping, window functions, non-trivial CTEs, data warehouse joins.
-- **Pre-filtering or shaping** a large dataset before running a `query-*` call.
+- **Searching or listing existing PostHog entities** — insights, dashboards, cohorts, feature flags, experiments, surveys. No typed query tool covers these; query the `system.*` tables.
+- **Multi-event joins or aggregations across event types** that do not fit a single series.
+- **Sophisticated queries beyond typed query schemas** — custom grouping, window functions, non-trivial CTEs, data warehouse joins.
 
-If a `query-*` tool fits, use it. Default to `query-*`; SQL is the escape hatch, not the starting point.
+For governed measures, check for a matching approved metric before deriving a new calculation.
+
+Use typed queries when standard PostHog calculation rules or native insight controls matter. Do not approximate standard funnels or retention with SQL.
+
+For a new event-analytics query, prefer a typed query when both methods preserve the requested calculation and output, including simple aggregates. Use SQL directly when the task calls for it, without requiring a failed typed-query attempt. Keep valid existing SQL when it fits the task, and reassess when the task changes.
+
+Both typed queries and SQL can support saved visualizations. A chart or table alone does not determine the method.
+
+{guidelines}
 
 {schema_discovery}
 
 ### Common pitfalls
 
 - **For `system.*` entities, filter `information_schema` by the fully-qualified `table_name`:** use `'system.insights'`, not `'insights'`; the bare name (or a `table_schema = 'system'` split) silently returns zero rows.
+- **HogQL rejects the ClickHouse `SETTINGS` clause outright** — appending `SETTINGS ...` (e.g. to tune `max_execution_time` or `join_algorithm`) always fails with `Unsupported: SelectStmt.settingsClause()`. Don't include it.
+- **`toDate()` takes exactly one argument** — it does not accept ClickHouse's `toDate(value, timezone)` form. Convert timezone first with `toTimeZone()`, then wrap in `toDate()`: `toDate(toTimeZone(timestamp, 'US/Pacific'))`, not `toDate(timestamp, 'US/Pacific')`.
+- **Width-suffixed conversion functions aren't supported** — `toInt64`, `toInt32`, `toFloat64`, `toUInt8`, etc. (and their `OrNull`/`OrZero` variants) always fail. Use the unsuffixed form instead: `toInt()`, `toFloat()`, `toUInt()`, `toIntOrNull()`, `toFloatOrZero()`, and so on.
 
 ### Format SQL for readability
 
@@ -126,12 +133,12 @@ Assistant: I'll search existing insights and dashboards via SQL.
 1. Discover columns: run the schema-discovery step from the workflow above to confirm which columns each table exposes before projecting or ordering by them. Column sets differ per system table — e.g. `system.insights` has `short_id` and `last_modified_at`, but `system.dashboards` has neither (its only timestamp is `created_at`). Without this step I'd be guessing.
 2. Search insights by name (using only confirmed columns): `execute-sql` with `SELECT id, name, short_id, description FROM system.insights WHERE NOT deleted AND (name ILIKE '%revenue%' OR name ILIKE '%payment%') ORDER BY last_modified_at DESC LIMIT 20`.
 3. If results are sparse, broaden to dashboards (re-using the same schema lookup — `system.dashboards` has its own column set, e.g. no `short_id` and no `last_modified_at`): `execute-sql` with `SELECT id, name, description FROM system.dashboards WHERE NOT deleted AND (name ILIKE '%revenue%' OR name ILIKE '%payment%') ORDER BY created_at DESC LIMIT 20`.
-4. Validate promising insights with `insight-retrieve`.
+4. Validate promising insights with `insight-get`.
 5. Summarize with links.
 <reasoning>
 1. Schema discovery is mandatory step 1 of the discovery workflow above; `system.*` tables' column sets differ per entity (e.g. `system.dashboards` has no `last_modified_at` or `short_id` — ordering it by `last_modified_at` fails field resolution).
 2. SQL against `system.*` tables is the fastest way to discover existing entities — no `query-*` tool covers entity search.
 3. ILIKE with multiple terms catches naming variants ("Monthly Revenue", "MRR", "Payment Events").
-4. `insight-retrieve` confirms the insight's query configuration still matches intent.
+4. `insight-get` confirms the insight's query configuration still matches intent.
 </reasoning>
 </example>

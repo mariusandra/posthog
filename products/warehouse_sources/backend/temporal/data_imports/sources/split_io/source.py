@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -20,13 +14,16 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.splitio import (
     SplitIoSourceConfig,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.split_io.settings import (
+    DEFAULT_VERSION,
     ENDPOINTS,
     INCREMENTAL_FIELDS,
     SPLIT_IO_ENDPOINTS,
+    SUPPORTED_VERSIONS,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.split_io.split_io import (
     SplitIoResumeConfig,
@@ -41,6 +38,9 @@ class SplitIoSource(ResumableSource[SplitIoSourceConfig, SplitIoResumeConfig]):
     lists_tables_without_credentials = True  # static endpoint catalog — safe for public docs
     api_docs_url = "https://docs.split.io/reference/introduction"
 
+    supported_versions = SUPPORTED_VERSIONS
+    default_version = DEFAULT_VERSION
+
     @property
     def source_type(self) -> ExternalDataSourceType:
         return ExternalDataSourceType.SPLITIO
@@ -48,7 +48,7 @@ class SplitIoSource(ResumableSource[SplitIoSourceConfig, SplitIoResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.SPLIT_IO,
+            name=ExternalDataSourceType.SPLITIO,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             keywords=["harness", "fme", "feature flags", "experimentation"],
             label="Split.io",

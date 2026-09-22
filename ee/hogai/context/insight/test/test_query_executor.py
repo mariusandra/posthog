@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from freezegun import freeze_time
+import time_machine
 from posthog.test.base import NonAtomicBaseTest
 from unittest.mock import Mock, patch
 
@@ -26,6 +26,8 @@ from posthog.schema import (
     LifecycleQuery,
     PathsFilter,
     PathsQuery,
+    PathsV2Filter,
+    PathsV2Query,
     RetentionFilter,
     RetentionQuery,
     StickinessQuery,
@@ -54,7 +56,7 @@ class TestAssistantQueryExecutor(NonAtomicBaseTest):
 
     def setUp(self):
         super().setUp()
-        with freeze_time("2025-01-20T12:00:00Z"):
+        with time_machine.travel("2025-01-20T12:00:00Z", tick=False):
             self.query_runner = AssistantQueryExecutor(self.team, datetime.now(), user=self.user)
 
     @patch("ee.hogai.context.insight.query_executor.process_query_dict")
@@ -130,6 +132,18 @@ class TestAssistantQueryExecutor(NonAtomicBaseTest):
         mock_process_query.assert_called_once()
 
     @patch("ee.hogai.context.insight.query_executor.process_query_dict")
+    async def test_arun_format_and_capture_hands_back_the_response(self, mock_process_query):
+        response = {"results": [{"count": 100}], "columns": ["count"]}
+        mock_process_query.return_value = response
+
+        query = AssistantHogQLQuery(query="SELECT count() FROM events")
+        result = await self.query_runner.arun_format_and_capture(query)
+
+        self.assertIsInstance(result.formatted, str)
+        self.assertFalse(result.fallback_used)
+        self.assertEqual(result.response, response)
+
+    @patch("ee.hogai.context.insight.query_executor.process_query_dict")
     async def test_run_and_format_query_data_visualization_sql(self, mock_process_query):
         mock_process_query.return_value = {"results": [{"count": 100}, {"count": 200}], "columns": ["count"]}
 
@@ -197,6 +211,31 @@ class TestAssistantQueryExecutor(NonAtomicBaseTest):
         self.assertIsInstance(result, str)
         self.assertTrue(used_fallback)
         # Should NOT capture NotImplementedError
+        mock_capture.assert_not_called()
+
+    @patch("ee.hogai.context.insight.query_executor.capture_exception")
+    @patch("ee.hogai.context.insight.query_executor.process_query_dict")
+    async def test_paths_v2_query_degrades_to_json_fallback(self, mock_process_query: Mock, mock_capture: Mock) -> None:
+        # The assistant has no PathsV2Query formatter yet, so a journeys insight must degrade to
+        # the raw-JSON fallback instead of erroring.
+        results = {
+            "steps": [
+                {
+                    "stepIndex": 0,
+                    "rows": [{"item": {"event": "$pageview", "label": "/home"}, "count": 2}],
+                    "otherCount": 0,
+                    "dropOffCount": 1,
+                }
+            ],
+            "edges": [],
+            "prefixes": [],
+        }
+        mock_process_query.return_value = {"results": results}
+
+        result = await execute_and_format_query(self.team, PathsV2Query(pathsV2Filter=PathsV2Filter()), user=self.user)
+
+        self.assertIn("stepIndex", result)
+        self.assertIn("/home", result)
         mock_capture.assert_not_called()
 
     @patch("ee.hogai.context.insight.query_executor.process_query_dict")
@@ -609,7 +648,7 @@ class TestAssistantQueryExecutorAsync(NonAtomicBaseTest):
 
     def setUp(self):
         super().setUp()
-        with freeze_time("2025-01-20T12:00:00Z"):
+        with time_machine.travel("2025-01-20T12:00:00Z", tick=False):
             self.query_runner = AssistantQueryExecutor(self.team, datetime.now(), user=self.user)
 
     async def test_runs_in_async_context(self):
@@ -635,7 +674,7 @@ class TestExecuteAndFormatQuery(NonAtomicBaseTest):
 
     def setUp(self):
         super().setUp()
-        with freeze_time("2025-01-20T12:00:00Z"):
+        with time_machine.travel("2025-01-20T12:00:00Z", tick=False):
             self.query_runner = AssistantQueryExecutor(self.team, datetime.now(), user=self.user)
 
     @patch("ee.hogai.context.insight.query_executor.process_query_dict")

@@ -3,6 +3,22 @@ from typing import Literal, Optional
 
 from products.warehouse_sources.backend.types import IncrementalField, IncrementalFieldType
 
+# Vendor API versions. Inngest serves its REST API under URL-path-versioned prefixes
+# (`/v1/...`, `/v2/...`) and the per-environment signing key authenticates both. Every resource
+# this source reads lives under a single version — the events walk, cancellations and webhooks are
+# v1-only, while environments and the key inventories are v2-only — so their paths are fixed
+# regardless of a source's pin. New sources default to v2.
+INNGEST_API_VERSION_V1 = "v1"
+INNGEST_API_VERSION_V2 = "v2"
+INNGEST_SUPPORTED_VERSIONS = (INNGEST_API_VERSION_V1, INNGEST_API_VERSION_V2)
+INNGEST_DEFAULT_VERSION = INNGEST_API_VERSION_V2
+
+
+@dataclass(frozen=True)
+class InngestVersionPath:
+    path: str
+    pagination: Literal["events_cursor", "v2_cursor", "none"]
+
 
 @dataclass
 class InngestEndpointConfig:
@@ -28,6 +44,10 @@ class InngestEndpointConfig:
     # Per-schema default overlap window re-read on each incremental run (see SourceSchema).
     default_incremental_lookback_seconds: Optional[int] = None
     should_sync_default: bool = True
+    # For resources Inngest serves under more than one API version, the path + pagination the
+    # source uses per resolved `api_version` pin. Absent → the resource is version-locked to
+    # `path` (its only compatible home) and every pin reads it there.
+    version_paths: dict[str, InngestVersionPath] = field(default_factory=dict)
 
 
 # Endpoint catalog. Inngest's REST API lives at api.inngest.com (v1 + v2), authenticated with a

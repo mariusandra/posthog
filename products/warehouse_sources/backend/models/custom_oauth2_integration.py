@@ -2,6 +2,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 
+from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.db.models import Q
 
@@ -57,9 +58,9 @@ class CustomOAuth2Integration(TeamScopedRootMixin, CreatedMetaFields, UpdatedMet
     # constraint takes a SHARE ROW EXCLUSIVE lock on the parent, which stalls under write traffic. Team
     # scoping is enforced at the app level by TeamScopedRootMixin. The external_data_source FK targets a
     # non-hot table, so it keeps its constraint (and its cascade cleans the row up when the source is deleted).
-    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, db_constraint=False)
+    team = models.ForeignKey("posthog.Team", on_delete=models.CASCADE, db_constraint=False, related_name="+")
     created_by = models.ForeignKey(
-        "posthog.User", on_delete=models.SET_NULL, null=True, blank=True, db_constraint=False
+        "posthog.User", on_delete=models.SET_NULL, null=True, blank=True, db_constraint=False, related_name="+"
     )
     external_data_source = models.ForeignKey(
         "warehouse_sources.ExternalDataSource",
@@ -212,6 +213,11 @@ def get_custom_oauth2_integration(integration_id: str, team_id: int) -> CustomOA
     """Load a custom OAuth2 integration for a team, outside request context (Temporal activities).
 
     Uses `for_team()` — the prescribed fail-closed escape hatch — so a caller can never read another
-    team's credentials by id. Raises `CustomOAuth2Integration.DoesNotExist` when the id isn't this team's.
+    team's credentials by id. Raises `CustomOAuth2Integration.DoesNotExist` when the id isn't this
+    team's, or isn't even a well-formed UUID (a malformed id can never match a row, so every caller
+    already treats this the same as a genuinely missing row).
     """
-    return CustomOAuth2Integration.objects.for_team(team_id).get(id=integration_id)
+    try:
+        return CustomOAuth2Integration.objects.for_team(team_id).get(id=integration_id)
+    except ValidationError as exc:
+        raise CustomOAuth2Integration.DoesNotExist(f"Invalid integration id: {integration_id!r}") from exc

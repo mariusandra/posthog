@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.aircall.aircall import (
     AircallResumeConfig,
@@ -32,6 +26,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.aircall import (
     AircallSourceConfig,
 )
@@ -52,6 +47,7 @@ class AircallSource(ResumableSource[AircallSourceConfig, AircallResumeConfig]):
 
     def get_non_retryable_errors(self) -> dict[str, str | None]:
         return {
+            "400 Client Error: Bad Request for url: https://api.aircall.io": "Aircall rejected the request. Contact support if this keeps happening so we can look into it.",
             "401 Client Error: Unauthorized for url: https://api.aircall.io": "Aircall authentication failed. Please check your API ID and API token.",
             "403 Client Error: Forbidden for url: https://api.aircall.io": "Aircall denied access. Please check that your API key has the required permissions.",
         }
@@ -59,7 +55,7 @@ class AircallSource(ResumableSource[AircallSourceConfig, AircallResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.AIRCALL,
+            name=ExternalDataSourceType.AIRCALL,
             category=DataWarehouseSourceCategory.COMMUNICATION,
             label="Aircall",
             caption="""Enter your Aircall API credentials to pull your Aircall data into the PostHog Data warehouse.

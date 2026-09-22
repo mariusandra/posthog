@@ -10,7 +10,7 @@ import {
     PostHogRateLimitError,
     PostHogValidationError,
 } from '@/lib/errors'
-import { getSearchParamsFromRecord } from '@/lib/utils.js'
+import { getSearchParamsFromRecord, sanitizeHeaders, sanitizeHeaderValue } from '@/lib/utils.js'
 import type {
     ApiEventDefinition,
     ApiOAuthIntrospection,
@@ -44,10 +44,40 @@ const RATE_LIMIT_TOTAL_WAIT_BUDGET_MS = 30_000
 const SSE_DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
 
 // Per-read inactivity timeout: if no chunk (not even a keepalive comment) arrives
-// within this window, the server is assumed dead. Must comfortably exceed the
-// server-side keepalive interval — kept in sync with `SSE_KEEPALIVE_INTERVAL = 15s`
-// in `ee/api/session_summaries.py`. If you change one, check the other.
+// within this window, the server is assumed dead. It must comfortably exceed
+// expected server keepalive intervals.
 const SSE_READ_TIMEOUT_MS = 30_000
+
+// Page size for the `query-*-actors` tools. The ceiling bounds how much of a caller's context
+// window one page can consume; everything past it is reachable by paging with `offset`.
+// Out-of-range values are clamped rather than rejected, because the schema codegen doesn't
+// propagate `@minimum`/`@maximum` on integer fields into the generated zod.
+const ACTORS_DEFAULT_LIMIT = 100
+const ACTORS_MAX_LIMIT = 1000
+
+function clampActorsLimit(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return ACTORS_DEFAULT_LIMIT
+    }
+    return Math.min(Math.max(Math.trunc(value), 1), ACTORS_MAX_LIMIT)
+}
+
+/** The `detail` string from a drf-exceptions-hog error body, when the body carries one. */
+function parseErrorDetail(errorText: string): string | undefined {
+    try {
+        const detail = JSON.parse(errorText)?.detail
+        return typeof detail === 'string' && detail ? detail : undefined
+    } catch {
+        return undefined
+    }
+}
+
+function clampActorsOffset(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return 0
+    }
+    return Math.max(Math.trunc(value), 0)
+}
 
 export interface GroupType {
     group_type: string
@@ -133,6 +163,19 @@ export interface ApiConfig {
      * the agent's task; the API validates it against the token's team.
      */
     taskId?: string | undefined
+    /** One tool call's stated intent, forwarded as `x-posthog-intent`. Set it through `withIntent`. */
+    intent?: string | undefined
+}
+
+// Matches ACTIVITY_LOG_INTENT_MAX_LENGTH in posthog/models/activity_logging/utils.py.
+const MAX_INTENT_HEADER_LENGTH = 500
+
+// The intent rides along on every API call, so a bad value must cost the header, never the call.
+function intentHeaderValue(intent: unknown): string | undefined {
+    if (typeof intent !== 'string') {
+        return undefined
+    }
+    return sanitizeHeaderValue(intent)?.slice(0, MAX_INTENT_HEADER_LENGTH)
 }
 
 type Endpoint = Record<string, any>
@@ -150,6 +193,20 @@ export class ApiClient {
         this.publicBaseUrl = config.publicBaseUrl || config.baseUrl
     }
 
+    /**
+     * A copy of this client that carries one tool call's intent.
+     *
+     * The calls in a JSON-RPC batch run concurrently over one cached client, so writing the
+     * intent onto that client would let a later call overwrite an earlier call's intent.
+     * The copy keeps the prototype, so a `ForwardingApiClient` copy still forwards.
+     */
+    withIntent(intent: string): this {
+        const scoped = Object.create(Object.getPrototypeOf(this) as object) as this
+        Object.assign(scoped, this)
+        scoped.config = { ...this.config, intent }
+        return scoped
+    }
+
     getProjectBaseUrl(projectId: string): string {
         if (projectId === '@current') {
             return this.publicBaseUrl
@@ -158,37 +215,45 @@ export class ApiClient {
         return `${this.publicBaseUrl}/project/${projectId}`
     }
 
-    private async fetch(url: string, options?: RequestInit): Promise<Response> {
+    // Every request, SSE stream and endpoint helper on this class funnels through here, which is what
+    // lets `ForwardingApiClient` re-route a whole client at one seam (see lib/connection-forwarding.ts).
+    protected async fetch(url: string, options?: RequestInit): Promise<Response> {
         const defaultHeaders: HeadersInit = {
             Authorization: `Bearer ${this.config.apiToken}`,
-            'User-Agent': getUserAgent({ clientUserAgent: this.config.clientUserAgent }),
-            ...(this.config.clientUserAgent
-                ? {
-                      // Forward the originating client's User-Agent as a custom header so the
-                      // PostHog API can attach it to analytics events for MCP source attribution.
-                      'x-posthog-mcp-user-agent': this.config.clientUserAgent,
-                  }
-                : {}),
-            // Forward MCP clientInfo fields from the initialize request so the
-            // PostHog API can attach them to analytics events.
-            ...(this.config.mcpClientName ? { 'x-posthog-mcp-client-name': this.config.mcpClientName } : {}),
-            ...(this.config.mcpClientVersion ? { 'x-posthog-mcp-client-version': this.config.mcpClientVersion } : {}),
-            ...(this.config.mcpProtocolVersion
-                ? { 'x-posthog-mcp-protocol-version': this.config.mcpProtocolVersion }
-                : {}),
-            ...(this.config.mcpConsumer ? { 'x-posthog-mcp-consumer': this.config.mcpConsumer } : {}),
-            ...(this.config.oauthClientName ? { 'x-posthog-mcp-oauth-client-name': this.config.oauthClientName } : {}),
-            // Forward MCP session and conversation ids so backend logs and OTLP
-            // spans for downstream API hops can correlate with the same MCP context
-            // the events carry. This is attribute-based correlation only — we do
-            // not forward `traceparent` (the Worker emits no OTLP today), so the
-            // Django-rooted span is not a child of any Worker-side span.
-            ...(this.config.mcpSessionId ? { 'x-posthog-mcp-session-id': this.config.mcpSessionId } : {}),
-            ...(this.config.mcpConversationId
-                ? { 'x-posthog-mcp-conversation-id': this.config.mcpConversationId }
-                : {}),
-            // Forward the sandbox task id so API writes are attributed to the agent's task.
-            ...(this.config.taskId ? { 'X-PostHog-Task-Id': this.config.taskId } : {}),
+            // Every value below originates from the MCP client, so it is sanitized here at
+            // assembly rather than trusted to have been sanitized on the boundary it arrived
+            // on. `oauthClientName` in particular is read straight back from the token cache,
+            // which can still hold a name written before the ingest sanitizer covered it. A
+            // character above U+00FF makes the runtime throw converting headers to a
+            // ByteString, failing the API call itself — losing attribution detail is cheaper.
+            // The composed User-Agent stays out of the batch below: sanitizing it whole would
+            // truncate at the value cap and could slice off our own trailing token, so the
+            // client-supplied input is sanitized before composition instead. The other parts
+            // are code constants and an ASCII-only regex match, already header-safe.
+            'User-Agent': getUserAgent({ clientUserAgent: sanitizeHeaderValue(this.config.clientUserAgent) }),
+            ...sanitizeHeaders({
+                // Forward the originating client's User-Agent as a custom header so the
+                // PostHog API can attach it to analytics events for MCP source attribution.
+                'x-posthog-mcp-user-agent': this.config.clientUserAgent,
+                // Forward MCP clientInfo fields from the initialize request so the
+                // PostHog API can attach them to analytics events.
+                'x-posthog-mcp-client-name': this.config.mcpClientName,
+                'x-posthog-mcp-client-version': this.config.mcpClientVersion,
+                'x-posthog-mcp-protocol-version': this.config.mcpProtocolVersion,
+                'x-posthog-mcp-consumer': this.config.mcpConsumer,
+                'x-posthog-mcp-oauth-client-name': this.config.oauthClientName,
+                // Forward MCP session and conversation ids so backend logs and OTLP
+                // spans for downstream API hops can correlate with the same MCP context
+                // the events carry. This is attribute-based correlation only — we do
+                // not forward `traceparent` (the Worker emits no OTLP today), so the
+                // Django-rooted span is not a child of any Worker-side span.
+                'x-posthog-mcp-session-id': this.config.mcpSessionId,
+                'x-posthog-mcp-conversation-id': this.config.mcpConversationId,
+                // Forward the sandbox task id so API writes are attributed to the agent's task.
+                'X-PostHog-Task-Id': this.config.taskId,
+                // Forward the agent's stated intent so the activity log records why, not just who.
+                'x-posthog-intent': intentHeaderValue(this.config.intent),
+            }),
             'X-PostHog-Client': 'mcp',
         }
         if (options?.body) {
@@ -365,9 +430,81 @@ export class ApiClient {
      * The response body is read by the caller (SSE and JSON paths read it at
      * different points) and passed in as `errorText`.
      */
+    /**
+     * A 404 for a path that names an experiment, answered with DRF's generic detail, means the
+     * experiment itself is missing: `get_object()` fails the same way on the resource and on
+     * every lifecycle action under it. That gets the message naming the recovery path, typed as
+     * a 4xx so `handleToolError` treats it as agent-recoverable instead of capturing an exception
+     * per guessed id. A sub-resource that wrote its own detail (a missing recalculation run) is
+     * answering about itself and passes through untouched.
+     */
+    private buildExperimentNotFoundError(
+        response: Response,
+        errorText: string,
+        url: string,
+        method: string
+    ): PostHogApiError | undefined {
+        const experimentMatch = /\/experiments\/(\d+)(?:\/|$)/.exec(url.split('?')[0]!)
+        if (!experimentMatch) {
+            return undefined
+        }
+        let detail: unknown
+        try {
+            detail = JSON.parse(errorText)?.detail
+        } catch {
+            detail = undefined
+        }
+        if (detail !== undefined && detail !== 'Not found.') {
+            return undefined
+        }
+        const experimentId = experimentMatch[1]
+        console.error(`[API] Experiment ${experimentId} not found on ${method} ${url}`)
+        return new PostHogApiError({
+            status: response.status,
+            statusText: response.statusText,
+            body: errorText,
+            url,
+            method,
+            message:
+                `Experiment ${experimentId} not found in this project. ` +
+                `If the id is correct, the experiment may belong to a different project — ` +
+                `call experiment-list to see experiments accessible with your current API key and project, or switch-project first.`,
+        })
+    }
+
+    /**
+     * PostHog also answers 401 when the token is valid but the account state is not, so the
+     * bare sentinel told those callers to reconnect a credential that was never the problem.
+     * It stays at the front of the message because the re-auth path matches on it, and the
+     * server's reason and the status now ride along.
+     */
+    private buildUnauthorizedError(
+        response: Response,
+        errorText: string,
+        url: string,
+        method: string
+    ): PostHogApiError {
+        const detail = parseErrorDetail(errorText)
+        return new PostHogApiError({
+            status: response.status,
+            statusText: response.statusText,
+            body: errorText,
+            url,
+            method,
+            message: detail ? `${ErrorCode.INVALID_API_KEY}: ${detail}` : ErrorCode.INVALID_API_KEY,
+        })
+    }
+
     private buildApiError(response: Response, errorText: string, url: string, method: string): Error {
+        if (response.status === 404) {
+            const experimentNotFound = this.buildExperimentNotFoundError(response, errorText, url, method)
+            if (experimentNotFound) {
+                return experimentNotFound
+            }
+        }
+
         if (response.status === 401) {
-            return new Error(ErrorCode.INVALID_API_KEY)
+            return this.buildUnauthorizedError(response, errorText, url, method)
         }
 
         if (response.status === 429) {
@@ -477,19 +614,6 @@ export class ApiClient {
 
                 if (!response.ok) {
                     const errorText = await response.text()
-
-                    if (response.status === 404) {
-                        const experimentMatch = /\/experiments\/(\d+)/.exec(url)
-                        if (experimentMatch) {
-                            const experimentId = experimentMatch[1]
-                            console.error(`[API] Experiment ${experimentId} not found on ${method} ${url}`)
-                            throw new Error(
-                                `Experiment ${experimentId} not found in this project. ` +
-                                    `If the id is correct, the experiment may belong to a different project — ` +
-                                    `call experiment-list to see experiments accessible with your current API key and project, or switch-project first.`
-                            )
-                        }
-                    }
 
                     throw this.buildApiError(response, errorText, url, method)
                 }
@@ -661,6 +785,28 @@ export class ApiClient {
                 } catch (error) {
                     return { success: false, error: error as Error }
                 }
+            },
+
+            createEventDefinition: async ({
+                projectId,
+                eventName,
+                data,
+            }: {
+                projectId: string
+                eventName: string
+                data?: {
+                    description?: string
+                    tags?: string[]
+                    verified?: boolean
+                    hidden?: boolean
+                }
+            }): Promise<Result<ApiEventDefinition>> => {
+                const createUrl = `${this.baseUrl}/api/projects/${projectId}/event_definitions/`
+
+                return this.fetchJson<ApiEventDefinition>(createUrl, {
+                    method: 'POST',
+                    body: JSON.stringify({ name: eventName, ...data }),
+                })
             },
 
             updateEventDefinition: async ({
@@ -1256,9 +1402,15 @@ export class ApiClient {
             query: Record<string, unknown>
             results: { columns: string[]; results: any[][] }
             hasMore: boolean
+            limit: number
             offset: number
         }> => {
-            const normalized = normalizeQuery(query)
+            // `limit`/`offset` are page controls on the outer ActorsQuery. The inner
+            // InsightActorsQuery rejects unknown keys, so they have to come off the source
+            // before it gets wrapped.
+            const { limit: requestedLimit, offset: requestedOffset, ...normalized } = normalizeQuery(query)
+            const limit = clampActorsLimit(requestedLimit)
+            const offset = clampActorsOffset(requestedOffset)
             const includeRecordings = Boolean(normalized.includeRecordings)
             const finalSelect = includeRecordings ? [...select, 'matched_recordings'] : [...select]
 
@@ -1266,13 +1418,20 @@ export class ApiClient {
                 kind: 'ActorsQuery',
                 source: normalized,
                 select: finalSelect,
-                orderBy: [...orderBy],
-                limit: 100,
+                // An explicit empty `orderBy` suppresses ActorsQueryRunner's default ordering and
+                // reaches ClickHouse with no ORDER BY, so row order is undefined and consecutive
+                // pages can repeat or skip actors. Omitting the key instead lets the runner order by
+                // the actor id column it selected. The per-tool orders already end in a unique
+                // tiebreak.
+                ...(orderBy.length > 0 ? { orderBy: [...orderBy] } : {}),
+                limit,
+                offset,
             }
 
             const response = await this.request<{
                 results: any[][]
                 hasMore?: boolean
+                limit?: number
                 offset?: number
             }>({
                 method: 'POST',
@@ -1320,7 +1479,8 @@ export class ApiClient {
                 query: wrappedQuery,
                 results: { columns, results },
                 hasMore: response.hasMore ?? false,
-                offset: response.offset ?? 0,
+                limit: response.limit ?? limit,
+                offset: response.offset ?? offset,
             }
         }
 
@@ -1392,7 +1552,8 @@ export class ApiClient {
 
             // Funnel actors project `actor` (+ `matched_recordings` when `includeRecordings`, handled
             // by runActorsQuery). The query carries the step/trends-dropoff selectors on the inner
-            // FunnelsActorsQuery; ordering is backend-determined, so orderBy stays empty.
+            // FunnelsActorsQuery; there is no meaningful ranking, so the backend's own actor-id
+            // ordering applies.
             funnelActors: async ({ query }: { query: Record<string, unknown> }) => runActorsQuery(query, ['actor']),
         }
     }
@@ -1452,6 +1613,17 @@ export class ApiClient {
 
     async getGroupTypes(projectId: string): Promise<GroupType[]> {
         const result = await this.fetchJson<GroupType[]>(`${this.baseUrl}/api/projects/${projectId}/groups_types/`)
+        if (!result.success) {
+            throw new Error(result.error.message)
+        }
+        return result.data
+    }
+
+    /** Every third-party MCP tool the caller can reach, across all their gateway connections. */
+    async getGatewayTools(projectId: string): Promise<Schemas.AvailableToolsResponse> {
+        const result = await this.fetchJson<Schemas.AvailableToolsResponse>(
+            `${this.baseUrl}/api/projects/${projectId}/mcp_server_installations/available_tools/`
+        )
         if (!result.success) {
             throw new Error(result.error.message)
         }

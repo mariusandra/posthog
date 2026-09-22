@@ -1,14 +1,25 @@
 import uuid
+import importlib.util
+from itertools import product
+from pathlib import Path
 
 from posthog.test.base import APIBaseTest
 
-from django.test import SimpleTestCase, override_settings
+from django.test import RequestFactory, SimpleTestCase, override_settings
+from django.urls import URLResolver, resolve
+from django.urls.resolvers import RegexPattern
 
 from parameterized import parameterized
 from rest_framework import status
 
+from posthog import urls
+from posthog.api.playwright_setup import delete_events
+from posthog.frontend_views import home, home_with_region_redirect, region_host_from_current_instance
 from posthog.models.instance_setting import override_instance_config
-from posthog.urls import region_host_from_current_instance
+from posthog.temporal.codec_server import decode_payloads
+from posthog.views import handler500, metrics_view
+
+from products.ai_observability.backend.api.personal_spend import PersonalSpendEUProxyViewSet
 
 
 class TestUrls(APIBaseTest):
@@ -198,3 +209,78 @@ class TestRegionHostFromCurrentInstance(SimpleTestCase):
     )
     def test_region_host_from_current_instance(self, _name, cookie_value, expected):
         self.assertEqual(region_host_from_current_instance(cookie_value), expected)
+
+
+class TestLegacyDuckgresAdminUrls(SimpleTestCase):
+    @parameterized.expand(
+        [
+            (
+                "changelist_with_query",
+                "/admin/posthog/duckgresserver/?q=warehouse&page=2",
+                "/admin/managed_warehouse/duckgresserver/?q=warehouse&page=2",
+            ),
+            ("add", "/admin/posthog/duckgresserver/add/", "/admin/managed_warehouse/duckgresserver/add/"),
+            (
+                "change",
+                "/admin/posthog/duckgresserver/server-id/change/",
+                "/admin/managed_warehouse/duckgresserver/server-id/change/",
+            ),
+            (
+                "delete",
+                "/admin/posthog/duckgresserver/server-id/delete/",
+                "/admin/managed_warehouse/duckgresserver/server-id/delete/",
+            ),
+            (
+                "history",
+                "/admin/posthog/duckgresserver/server-id/history/",
+                "/admin/managed_warehouse/duckgresserver/server-id/history/",
+            ),
+            (
+                "provision",
+                "/admin/posthog/duckgresserver/provision/",
+                "/admin/managed_warehouse/duckgresserver/provision/",
+            ),
+            (
+                "enable_backfill",
+                "/admin/posthog/duckgresserver/server-id/enable-backfill/?source=bookmark",
+                "/admin/managed_warehouse/duckgresserver/server-id/enable-backfill/?source=bookmark",
+            ),
+            (
+                "deprovision",
+                "/admin/posthog/duckgresserver/server-id/deprovision/",
+                "/admin/managed_warehouse/duckgresserver/server-id/deprovision/",
+            ),
+        ]
+    )
+    def test_redirects_to_managed_warehouse_admin(self, _name: str, request_path: str, expected_location: str) -> None:
+        request = RequestFactory().get(request_path)
+        match = resolve(request.path)
+
+        response = match.func(request, *match.args, **match.kwargs)
+
+        assert response.status_code == 302
+        assert response["Location"] == expected_location
+
+
+class TestConditionalRoutes(SimpleTestCase):
+    @parameterized.expand(list(product([False, True], [False, True], ["US", "EU"])))
+    def test_route_gates_and_precedence(self, debug: bool, test: bool, region: str) -> None:
+        with override_settings(DEBUG=debug, TEST=test, CLOUD_DEPLOYMENT=region):
+            spec = importlib.util.spec_from_file_location("posthog._test_urls", Path(urls.__file__))
+            assert spec is not None and spec.loader is not None
+            urlconf = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(urlconf)
+        patterns = urlconf.urlpatterns
+        resolver = URLResolver(RegexPattern(r"^/"), patterns)
+        self.assertIs(resolver.resolve("/_metrics").func, metrics_view if debug else home_with_region_redirect)
+        self.assertIs(resolver.resolve("/delete_events/").func, delete_events if test else home_with_region_redirect)
+        self.assertIs(resolver.resolve("/decode").func, decode_payloads if debug or test else home_with_region_redirect)
+        self.assertEqual(
+            sum(pattern.name == "temporal_decode" for pattern in patterns if hasattr(pattern, "name")),
+            int(debug or test),
+        )
+        spend = resolver.resolve("/api/llm_analytics/@me/spend/")
+        self.assertEqual(getattr(spend.func, "cls", None) is PersonalSpendEUProxyViewSet, region == "EU")
+        self.assertIs(resolver.resolve("/login").func, home)
+        self.assertIs(resolver.resolve("/events").func, home_with_region_redirect)
+        self.assertIs(urlconf.handler500, handler500)

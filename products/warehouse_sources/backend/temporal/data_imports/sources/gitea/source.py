@@ -4,18 +4,12 @@ from typing import TYPE_CHECKING, Optional, cast
 if TYPE_CHECKING:
     from posthog.cdp.templates.hog_function_template import HogFunctionTemplateDC
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import (
     ExternalWebhookInfo,
@@ -33,6 +27,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.mix
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.webhook_s3 import WebhookSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.gitea import GiteaSourceConfig
 from products.warehouse_sources.backend.temporal.data_imports.sources.gitea.gitea import (
@@ -91,7 +86,7 @@ class GiteaSource(
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.GITEA,
+            name=ExternalDataSourceType.GITEA,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="Gitea",
             releaseStatus=ReleaseStatus.ALPHA,

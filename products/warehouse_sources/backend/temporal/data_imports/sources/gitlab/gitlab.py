@@ -9,11 +9,11 @@ import requests
 from structlog.types import FilteringBoundLogger
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.batcher import Batcher
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import SourceResponse
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.batcher import Batcher
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.http import make_tracked_session
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.mixins import _is_host_safe
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.gitlab.settings import (
     GITLAB_ENDPOINTS,
     GitLabEndpointConfig,
@@ -26,6 +26,10 @@ MAX_RETRY_AFTER_SECONDS = 60
 DEFAULT_HOST = "https://gitlab.com"
 HOST_NOT_ALLOWED_ERROR = "GitLab host is not allowed"
 HTTP_NOT_ALLOWED_ERROR = "GitLab host must use HTTPS"
+PROJECT_REF_ERROR = (
+    "PostHog couldn't read a project from that value. Enter group/project (for example, "
+    "mygroup/myproject), the numeric project ID, or the project's GitLab URL."
+)
 
 
 class GitLabRetryableError(Exception):
@@ -74,9 +78,26 @@ def _is_https(host: str | None) -> bool:
     return urlparse(normalize_host(host)).scheme == "https"
 
 
+def normalize_project_ref(project: str) -> str:
+    """Reduce a pasted project value to the ``group/project`` path or numeric id GitLab addresses.
+
+    The project URL is the value people have in front of them, and it names the project
+    unambiguously, so read the path out of it rather than making them retype it. ``/-/`` separates
+    a project path from GitLab's own sub-pages (``/-/issues``, ``/-/tree/main``), and an HTTPS
+    clone URL ends in ``.git``.
+    """
+    ref = (project or "").strip()
+    if "://" in ref:
+        ref = urlparse(ref).path
+    ref = ref.split("/-/", 1)[0].strip("/")
+    if ref.endswith(".git"):
+        ref = ref[: -len(".git")]
+    return ref
+
+
 def _encode_project(project: str) -> str:
     """GitLab accepts either a numeric project id or a URL-encoded ``group/project`` path."""
-    return quote(project.strip().strip("/"), safe="")
+    return quote(normalize_project_ref(project), safe="")
 
 
 def _get_headers(personal_access_token: str) -> dict[str, str]:
@@ -189,6 +210,15 @@ def validate_credentials(
         return False, "Missing personal access token"
     if not project or not project.strip():
         return False, "Missing project id or path"
+
+    # GitLab addresses a project by its numeric id or a group/project path. A bare group name, or a
+    # stray leading, trailing, or doubled slash otherwise URL-encodes into a nonsense path, 404s,
+    # and gets reported as "not found or not accessible with this token", which points the user at
+    # the token rather than the format.
+    project_ref = normalize_project_ref(project)
+    segments = project_ref.split("/")
+    if not project_ref.isdigit() and (len(segments) < 2 or not all(segments)):
+        return False, PROJECT_REF_ERROR
 
     host_only = _host_only(host)
     if not host_only:

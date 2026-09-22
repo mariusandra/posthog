@@ -7,7 +7,7 @@ from posthog.models.app_metrics2.sql import APP_METRICS2_DATA_TABLE_SQL, APP_MET
 from posthog.temporal.common.asyncpa import InvalidMessageFormat
 from posthog.temporal.common.clickhouse import ClickHouseClient, ClickHouseError
 
-from products.batch_exports.backend.temporal.spmc import slice_record_batch
+from products.batch_exports.backend.temporal.pipeline.producer import slice_record_batch
 
 
 @retry(
@@ -72,6 +72,7 @@ async def create_clickhouse_tables_and_views(clickhouse_client):
 
 async def truncate_events(clickhouse_client):
     await execute_query(clickhouse_client, "TRUNCATE TABLE IF EXISTS sharded_events")
+    await execute_query(clickhouse_client, "TRUNCATE TABLE IF EXISTS sharded_events_json")
     await execute_query(clickhouse_client, "TRUNCATE TABLE IF EXISTS distributed_events_recent")
     await execute_query(clickhouse_client, "TRUNCATE TABLE IF EXISTS events_recent")
     await execute_query(clickhouse_client, "TRUNCATE TABLE IF EXISTS sharded_events_recent")

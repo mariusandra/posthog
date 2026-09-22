@@ -141,7 +141,8 @@ const TAB_KEEP_ALIVE: TabKeepAliveEntry[] = [
     {
         name: 'experiments-list',
         pattern: /\/experiments\/?$/,
-        mount: async () => (await import('scenes/experiments/experimentsLogic')).experimentsLogic.mount(),
+        mount: async () =>
+            (await import('products/experiments/frontend/scenes/experimentsLogic')).experimentsLogic.mount(),
     },
     {
         name: 'notebooks-list',

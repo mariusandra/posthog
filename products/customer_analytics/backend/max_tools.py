@@ -10,12 +10,19 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from posthog.exceptions_capture import capture_exception
 from posthog.models import OrganizationMembership
-from posthog.rbac.user_access_control import AccessControlLevel
 from posthog.scopes import APIScopeObject
 
-from products.customer_analytics.backend.facade.api import _set_tags
+from products.access_control.backend.facade.user_access_control import AccessControlLevel
+from products.customer_analytics.backend.facade.api import (
+    AccountConflictError,
+    _set_tags,
+    create_account,
+    update_account,
+)
+from products.customer_analytics.backend.facade.enums import AccountRelationshipSource
 from products.customer_analytics.backend.logic import relationships as relationships_logic
 from products.customer_analytics.backend.models import Account, AccountRelationshipDefinition
+from products.notebooks.backend.facade.content import build_markdown_notebook_content, is_markdown_notebook_content
 from products.notebooks.backend.models import Notebook, ResourceNotebook
 
 from ee.hogai.tool import MaxTool
@@ -116,7 +123,9 @@ UPSERT_ACCOUNT_TOOL_DESCRIPTION = dedent("""
     # Relationships
     Pass `relationships` to assign users to the account's relationships (CSM, Account executive, or
     any definition the team has created), keyed by definition name: the value is the PostHog user id,
-    or null to end the current assignment. Only the named definitions are changed.
+    or null to end the current assignment. Only the named definitions are changed. A controlled
+    relationship that Customer analytics manages for the account cannot be changed through this
+    tool; the change is made from the account page.
 
     # Tags
     Pass `tags` to set the account's tags. On update this REPLACES the existing tag set.
@@ -214,7 +223,7 @@ class UpsertAccountTool(MaxTool):
         properties = action.properties.model_dump(exclude_unset=True) if action.properties is not None else {}
         try:
             account = await self._create_account(action, properties)
-        except IntegrityError:
+        except AccountConflictError:
             return f"An account with external_id '{action.external_id}' already exists for this team.", {
                 "error": "duplicate_external_id",
             }
@@ -273,15 +282,14 @@ class UpsertAccountTool(MaxTool):
     @sync_to_async
     def _create_account(self, action: CreateAccountAction, properties: dict[str, Any]) -> Account:
         with transaction.atomic():
-            account = Account.objects.create_account(
+            account = create_account(
                 team=self._team,
                 created_by=self._user,
                 name=action.name,
                 external_id=(action.external_id or None),
                 properties=properties,
+                tags=action.tags,
             )
-            if action.tags is not None:
-                _set_tags(action.tags, account, actor=self._user)
             if action.relationships:
                 self._apply_relationship_assignments(account, action.relationships)
         return account
@@ -298,7 +306,7 @@ class UpsertAccountTool(MaxTool):
             properties.update(action.properties.model_dump(exclude_unset=True))
             update_kwargs["properties"] = properties
         with transaction.atomic():
-            account = Account.objects.update_account(account, **update_kwargs)
+            account = update_account(account, **update_kwargs)
             if action.tags is not None:
                 _set_tags(action.tags, account, actor=self._user)
             if action.relationships:
@@ -328,17 +336,26 @@ class UpsertAccountTool(MaxTool):
         missing = sorted(user_ids - memberships.keys())
         if missing:
             raise RelationshipAssignmentError(f"User {missing[0]} is not a member of this organization.")
-        for name, user_id in assignments.items():
-            definition = definitions[name]
-            if user_id is None:
-                relationships_logic.end_active(team_id=self._team.id, account=account, definition=definition)
-                continue
-            relationships_logic.assign(
-                team_id=self._team.id,
-                account=account,
-                definition=definition,
-                user=memberships[user_id].user,
-                created_by=self._user,
+        actor = relationships_logic.Actor(source=AccountRelationshipSource.AI, user=self._user)
+        try:
+            for name, user_id in assignments.items():
+                definition = definitions[name]
+                if user_id is None:
+                    relationships_logic.end_active(
+                        team_id=self._team.id, account=account, definition=definition, actor=actor
+                    )
+                    continue
+                relationships_logic.assign(
+                    team_id=self._team.id,
+                    account=account,
+                    definition=definition,
+                    user=memberships[user_id].user,
+                    actor=actor,
+                )
+        except relationships_logic.ManagedRolePolicyError:
+            raise RelationshipAssignmentError(
+                "This relationship is controlled in Customer analytics and is changed from the account page, "
+                "not through this tool."
             )
 
 
@@ -358,6 +375,20 @@ UPSERT_ACCOUNT_NOTEBOOK_TOOL_DESCRIPTION = dedent("""
 
 def _tiptap_doc(markdown: str) -> dict[str, Any]:
     return {"type": "doc", "content": markdown_to_tiptap_nodes(markdown) or [{"type": "paragraph"}]}
+
+
+def _updated_note_content(stored_content: Any, markdown: str) -> dict[str, Any]:
+    """A note written before the markdown editor keeps its rich-text document. The editor picks
+    its mode from the stored document, so a format change moves an open session to the other
+    editor and discards the unsaved work in it. An empty ``doc`` opens the rich-text editor too,
+    so it counts as one; a null or shapeless document has no format to keep."""
+    is_rich_text_document = (
+        isinstance(stored_content, dict)
+        and stored_content.get("type") == "doc"
+        and isinstance(stored_content.get("content"), list)
+        and not is_markdown_notebook_content(stored_content)
+    )
+    return _tiptap_doc(markdown) if is_rich_text_document else build_markdown_notebook_content(markdown)
 
 
 class CreateAccountNotebookAction(BaseModel):
@@ -476,7 +507,7 @@ class UpsertAccountNotebookTool(MaxTool):
                 visibility=Notebook.Visibility.INTERNAL,
                 title=action.title[:256],
                 text_content=action.content,
-                content=_tiptap_doc(action.content),
+                content=build_markdown_notebook_content(action.content),
             )
             ResourceNotebook.objects.create(notebook=notebook, account=account)
         return notebook
@@ -492,7 +523,7 @@ class UpsertAccountNotebookTool(MaxTool):
                 locked.title = action.title[:256]
                 update_fields.append("title")
             if action.content is not None:
-                locked.content = _tiptap_doc(action.content)
+                locked.content = _updated_note_content(locked.content, action.content)
                 locked.text_content = action.content
                 locked.version = locked.version + 1
                 update_fields += ["content", "text_content", "version"]

@@ -1,24 +1,20 @@
 import os
-import json
 import uuid
 import typing
-import asyncio
 import secrets
-import contextlib
 import collections.abc
 
 import pytest
-
-from django.conf import settings
 
 import aioboto3
 import structlog
 import pytest_asyncio
 import botocore.exceptions
 
+from posthog.models.integration import Integration
 from posthog.temporal.tests.utils.models import acreate_batch_export, adelete_batch_export
 
-from products.batch_exports.backend.tests.temporal.utils.s3 import create_test_client, delete_all_from_s3
+from products.batch_exports.backend.tests.temporal.utils.s3 import aws_role, create_test_client, delete_all_from_s3
 
 if typing.TYPE_CHECKING:
     from types_aiobotocore_s3 import S3Client
@@ -27,7 +23,6 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.django_db]
 
 LOGGER = structlog.get_logger()
 TEST_ROOT_BUCKET = "test-batch-exports"
-ARN = str
 TEST_REGION = os.getenv("TEST_S3_BUCKET_REGION", "us-east-1")
 
 
@@ -91,9 +86,21 @@ def file_format(request) -> str:
         return f"JSONLines"
 
 
+@pytest.fixture
+def legacy_parquet_extension(request) -> bool:
+    """Whether Parquet files keep the compression codec in their extension.
+
+    Defaults to True to match an export whose Temporal schedule predates the setting.
+    """
+    try:
+        return request.param
+    except AttributeError:
+        return True
+
+
 @pytest_asyncio.fixture
-async def minio_client(bucket_name):
-    """Manage an S3 client to interact with a MinIO bucket.
+async def object_storage_client(bucket_name):
+    """Manage an S3 client to interact with a local object storage bucket.
 
     Yields the client after creating a bucket. Upon resuming, we delete
     the contents and the bucket itself.
@@ -102,14 +109,29 @@ async def minio_client(bucket_name):
         "s3",
         aws_access_key_id="object_storage_root_user",
         aws_secret_access_key="object_storage_root_password",
-    ) as minio_client:
-        await minio_client.create_bucket(Bucket=bucket_name)
+    ) as object_storage_client:
+        await object_storage_client.create_bucket(Bucket=bucket_name)
 
-        yield minio_client
+        yield object_storage_client
 
-        await delete_all_from_s3(minio_client, bucket_name, key_prefix="")
+        await delete_all_from_s3(object_storage_client, bucket_name, key_prefix="")
 
-        await minio_client.delete_bucket(Bucket=bucket_name)
+        await object_storage_client.delete_bucket(Bucket=bucket_name)
+
+
+@pytest_asyncio.fixture
+async def gcs_integration(ateam):
+    """An s3-compatible Integration pointing at GCS, using the AWS credentials in the environment."""
+    return await Integration.objects.acreate(
+        team_id=ateam.pk,
+        kind=Integration.IntegrationKind.S3_COMPATIBLE,
+        integration_id=f"gcs-{uuid.uuid4()}",
+        config={"name": "gcs-test", "endpoint_url": "https://storage.googleapis.com"},
+        sensitive_config={
+            "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID"),
+            "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY"),
+        },
+    )
 
 
 @pytest_asyncio.fixture
@@ -122,19 +144,21 @@ async def s3_compatible_batch_export(
     exclude_events,
     temporal_client,
     file_format,
+    legacy_parquet_extension,
+    s3_compatible_integration,
 ):
     destination_data = {
         "type": "S3Compatible",
+        # Credentials and the endpoint URL come from the integration.
+        "integration_id": s3_compatible_integration.id,
         "config": {
             "bucket_name": bucket_name,
             "region": "us-east-1",
             "prefix": s3_key_prefix,
-            "aws_access_key_id": "object_storage_root_user",
-            "aws_secret_access_key": "object_storage_root_password",
-            "endpoint_url": settings.OBJECT_STORAGE_ENDPOINT,
             "compression": compression,
             "exclude_events": exclude_events,
             "file_format": file_format,
+            "legacy_parquet_extension": legacy_parquet_extension,
         },
     }
 
@@ -420,68 +444,3 @@ async def destination_aws_role_arn(
         policy_name="S3BucketAccess",
     ) as arn:
         yield arn
-
-
-@contextlib.asynccontextmanager
-async def aws_role(
-    session: aioboto3.Session,
-    role_name: str,
-    /,
-    *,
-    description: str,
-    trust_policy: dict,
-    role_policy: dict | None = None,
-    policy_name: str | None = None,
-    max_attempts: int = 5,
-    delay: int | float = 3.0,
-) -> collections.abc.AsyncIterator[ARN]:
-    async with session.client("iam") as iam:
-        attempt = 0
-
-        for attempt in range(max_attempts):
-            try:
-                resp = await iam.create_role(
-                    RoleName=role_name,
-                    MaxSessionDuration=3600,
-                    AssumeRolePolicyDocument=json.dumps(trust_policy),
-                    Description=description,
-                )
-
-            except botocore.exceptions.ClientError as exc:
-                if (
-                    exc.response["Error"]["Code"] != "MalformedPolicyDocument"
-                    or "Invalid principal" not in exc.response["Error"]["Message"]
-                ) and exc.response["Error"]["Code"] != "EntityAlreadyExists":
-                    raise pytest.skip(f"Failed with an unknown error when creating role: {type(exc)} {exc}")
-
-                if attempt >= max_attempts:
-                    raise pytest.skip("Failed multiple times to create role")
-
-                await asyncio.sleep(delay)
-
-            except (
-                botocore.exceptions.NoCredentialsError,
-                botocore.exceptions.PartialCredentialsError,
-            ):
-                raise pytest.skip("Credentials error when attempting to create role")
-
-            else:
-                break
-
-        if role_policy is not None and policy_name is not None:
-            await iam.put_role_policy(
-                RoleName=role_name,
-                PolicyName=policy_name,
-                PolicyDocument=json.dumps(role_policy),
-            )
-
-        yield resp["Role"]["Arn"]
-
-        try:
-            resp = await iam.list_role_policies(RoleName=role_name)
-            for policy_name in resp.get("PolicyNames", []):
-                await iam.delete_role_policy(RoleName=role_name, PolicyName=policy_name)
-            await iam.delete_role(RoleName=role_name)
-
-        except Exception:
-            LOGGER.warning("Test role clean-up failed", name=role_name, arn=resp["Role"]["Arn"], exc_info=True)

@@ -7,10 +7,13 @@ import weakref
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 import redis
+import redis.exceptions as redis_exceptions
 from redis import asyncio as aioredis
+from redis.asyncio.retry import Retry
+from redis.backoff import ExponentialBackoff
 
 
-_client_map: Dict[str, Any] = {}
+_client_map: Dict[str | tuple[str, float, float], Any] = {}
 _test_async_client_map: Dict[str, Any] = {}  # For test mode, where we don't need per-loop isolation
 _test_fake_server_map: Dict[str, Any] = {}  # Shared FakeServer per url so sync + async fake clients see one store
 
@@ -23,14 +26,29 @@ def _get_test_fake_server(redis_url: str):
     return _test_fake_server_map[redis_url]
 
 
-def get_client(redis_url: Optional[str] = None) -> redis.Redis:
-    """Return a *synchronous* Redis client (singleton per redis_url)."""
+def get_client(
+    redis_url: Optional[str] = None,
+    *,
+    socket_timeout: Optional[float] = None,
+    socket_connect_timeout: Optional[float] = None,
+) -> redis.Redis:
+    """Return a synchronous Redis client, cached by URL and optional timeouts."""
 
     redis_url = redis_url or settings.REDIS_URL
     if redis_url is None:
         raise ImproperlyConfigured("REDIS_URL is not configured")
 
-    if not _client_map.get(redis_url):
+    client_socket_timeout = settings.REDIS_SOCKET_TIMEOUT_SECONDS if socket_timeout is None else socket_timeout
+    client_socket_connect_timeout = (
+        settings.REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS if socket_connect_timeout is None else socket_connect_timeout
+    )
+    cache_key: str | tuple[str, float, float] = (
+        redis_url
+        if socket_timeout is None and socket_connect_timeout is None
+        else (redis_url, client_socket_timeout, client_socket_connect_timeout)
+    )
+
+    if not _client_map.get(cache_key):
         if settings.TEST:
             # This import is only used in tests, we don't want to import it in production
             import fakeredis
@@ -40,8 +58,8 @@ def get_client(redis_url: Optional[str] = None) -> redis.Redis:
             client = redis.from_url(
                 redis_url,
                 db=0,
-                socket_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
-                socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
+                socket_timeout=client_socket_timeout,
+                socket_connect_timeout=client_socket_connect_timeout,
             )
         else:
             client = None
@@ -49,9 +67,9 @@ def get_client(redis_url: Optional[str] = None) -> redis.Redis:
         if client is None:
             raise ImproperlyConfigured("Redis not configured!")
 
-        _client_map[redis_url] = client
+        _client_map[cache_key] = client
 
-    return _client_map[redis_url]
+    return _client_map[cache_key]
 
 
 _loop_clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[str, Any]]" = weakref.WeakKeyDictionary()
@@ -145,6 +163,10 @@ def get_async_client(redis_url: Optional[str] = None):
                 db=0,
                 socket_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
                 socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
+                # Retry transient connect/timeout blips a couple of times with a
+                # short exponential backoff instead of failing the caller outright.
+                retry=Retry(ExponentialBackoff(cap=0.5, base=0.05), retries=2),
+                retry_on_error=[redis_exceptions.ConnectionError, redis_exceptions.TimeoutError],
             )
             pool_map[redis_url] = client
 

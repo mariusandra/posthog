@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import pytest
-from freezegun import freeze_time
+import time_machine
 from posthog.test.base import APIBaseTest
 from unittest.mock import ANY, MagicMock, patch
 
@@ -15,8 +15,10 @@ from django.contrib.sessions.middleware import SessionMiddleware
 from django.core import mail
 from django.core.asgi import get_asgi_application
 from django.core.cache import cache
+from django.db import connection
 from django.http import HttpResponse
 from django.test import RequestFactory, SimpleTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from asgiref.sync import sync_to_async
@@ -34,6 +36,7 @@ from social_django.models import UserSocialAuth
 from two_factor.utils import totp_digits
 
 from posthog.api.authentication import password_reset_token_generator, social_login_notification
+from posthog.api.email_verification import is_email_verification_disabled
 from posthog.auth import (
     InternalAPIUser,
     OAuthAccessTokenAuthentication,
@@ -88,7 +91,15 @@ class TestLoginPrecheckAPI(APIBaseTest):
         response = self.client.post("/api/login/precheck", {"email": "any_user_name_here@witw.app"})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(
-            response.json(), {"sso_enforcement": None, "saml_available": False, "webauthn_credentials": []}
+            response.json(),
+            {
+                "sso_enforcement": None,
+                "saml_available": False,
+                "oidc_available": False,
+                "webauthn_credentials": [],
+                "password_login_available": True,
+                "social_providers": [],
+            },
         )
 
     def test_login_precheck_with_sso_enforced_with_invalid_license(self):
@@ -104,7 +115,15 @@ class TestLoginPrecheckAPI(APIBaseTest):
         response = self.client.post("/api/login/precheck", {"email": "spain@witw.app"})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(
-            response.json(), {"sso_enforcement": None, "saml_available": False, "webauthn_credentials": []}
+            response.json(),
+            {
+                "sso_enforcement": None,
+                "saml_available": False,
+                "oidc_available": False,
+                "webauthn_credentials": [],
+                "password_login_available": True,
+                "social_providers": [],
+            },
         )
 
     def test_login_precheck_returns_webauthn_credentials_for_user_with_verified_passkey(self):
@@ -131,6 +150,34 @@ class TestLoginPrecheckAPI(APIBaseTest):
         self.assertEqual(len(response_data["webauthn_credentials"]), 1)
         self.assertEqual(response_data["webauthn_credentials"][0]["type"], "public-key")
         self.assertEqual(response_data["webauthn_credentials"][0]["transports"], ["internal", "hybrid"])
+
+    def test_login_precheck_offers_only_the_resolved_accounts_passkeys(self):
+        from webauthn.helpers import bytes_to_base64url
+
+        from posthog.models.webauthn_credential import WebauthnCredential
+
+        abandoned = User.objects.create_and_join(self.organization, "twin@posthog.com", None)
+        in_use = User.objects.create_and_join(self.organization, "twin-alt@posthog.com", self.CONFIG_PASSWORD)
+        User.objects.filter(pk=in_use.pk).update(email="Twin@posthog.com", last_login=timezone.now())
+        for owner, credential_id in ((abandoned, b"abandoned-credential"), (in_use, b"in-use-credential")):
+            WebauthnCredential.objects.create(
+                user=owner,
+                credential_id=credential_id,
+                label="Passkey",
+                public_key=b"test-public-key",
+                algorithm=-7,
+                counter=0,
+                transports=["internal"],
+                verified=True,
+            )
+
+        response = self.client.post("/api/login/precheck", {"email": "twin@posthog.com"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [credential["id"] for credential in response.json()["webauthn_credentials"]],
+            [bytes_to_base64url(b"in-use-credential")],
+        )
 
     def test_login_precheck_does_not_return_unverified_webauthn_credentials(self):
         from posthog.models.webauthn_credential import WebauthnCredential
@@ -191,6 +238,134 @@ class TestLoginPrecheckAPI(APIBaseTest):
 
         self.assertEqual(len(response_data["webauthn_credentials"]), 2)
 
+    def test_login_precheck_reports_password_login_available_for_user_with_password(self):
+        User.objects.create_and_join(self.organization, "with_password@posthog.com", self.CONFIG_PASSWORD)
+
+        response = self.client.post("/api/login/precheck", {"email": "with_password@posthog.com"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["password_login_available"], True)
+
+    def test_login_precheck_reports_password_login_unavailable_for_passwordless_user(self):
+        User.objects.create_and_join(self.organization, "no_password@posthog.com", None)
+
+        response = self.client.post("/api/login/precheck", {"email": "no_password@posthog.com"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.json(),
+            {
+                "sso_enforcement": None,
+                "saml_available": False,
+                "oidc_available": False,
+                "webauthn_credentials": [],
+                "password_login_available": False,
+                "social_providers": [],
+            },
+        )
+
+    def test_login_precheck_reports_password_login_unavailable_for_blank_password(self):
+        # `has_usable_password()` is True for an empty password, so this exercises the `bool(...)` half
+        # of the check — a blank password is not something anyone can log in with.
+        user = User.objects.create_and_join(self.organization, "blank_password@posthog.com", None)
+        User.objects.filter(pk=user.pk).update(password="")
+
+        response = self.client.post("/api/login/precheck", {"email": "blank_password@posthog.com"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["password_login_available"], False)
+
+    def test_login_precheck_returns_linked_social_provider_configured_on_instance(self):
+        user = User.objects.create_and_join(self.organization, "github_user@posthog.com", None)
+        UserSocialAuth.objects.create(user=user, provider="github", uid="12345")
+
+        with self.settings(SOCIAL_AUTH_GITHUB_KEY="key", SOCIAL_AUTH_GITHUB_SECRET="secret"):
+            response = self.client.post("/api/login/precheck", {"email": "github_user@posthog.com"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["password_login_available"], False)
+        self.assertEqual(response.json()["social_providers"], ["github"])
+
+    def test_login_precheck_omits_linked_social_provider_not_configured_on_instance(self):
+        # Offering this provider would render a button that can't work.
+        user = User.objects.create_and_join(self.organization, "github_user@posthog.com", None)
+        UserSocialAuth.objects.create(user=user, provider="github", uid="12345")
+
+        with self.settings(SOCIAL_AUTH_GITHUB_KEY=None, SOCIAL_AUTH_GITHUB_SECRET=None):
+            response = self.client.post("/api/login/precheck", {"email": "github_user@posthog.com"})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["social_providers"], [])
+
+    def test_login_precheck_treats_unknown_email_as_password_login_available(self):
+        # An unknown email must be indistinguishable from a user who has a password, so a typo is
+        # never a dead end and we don't leak which addresses have accounts.
+        response = self.client.post("/api/login/precheck", {"email": "nobody@posthog.com"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["password_login_available"], True)
+        self.assertEqual(response.json()["social_providers"], [])
+
+    def test_login_precheck_treats_inactive_passwordless_user_as_unknown(self):
+        user = User.objects.create_and_join(self.organization, "deactivated@posthog.com", None)
+        user.is_active = False
+        user.save()
+
+        response = self.client.post("/api/login/precheck", {"email": "deactivated@posthog.com"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["password_login_available"], True)
+
+    def test_login_precheck_is_rate_limited_by_ip(self):
+        cache.clear()
+        # Don't leave 30 throttle entries behind for whatever test runs next.
+        self.addCleanup(cache.clear)
+        with self.settings(E2E_TESTING=False):
+            for i in range(30):
+                response = self.client.post("/api/login/precheck", {"email": f"enumerate-{i}@posthog.com"})
+                self.assertEqual(response.status_code, status.HTTP_200_OK, f"request {i} was throttled early")
+
+            response = self.client.post("/api/login/precheck", {"email": "enumerate-30@posthog.com"})
+            self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    def test_login_precheck_is_not_rate_limited_for_the_callers_own_email(self):
+        # The time-sensitive re-auth modal prechecks the logged-in user's own email on a timer, and it
+        # tells them nothing they don't already have.
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.client.force_login(self.user)
+
+        with self.settings(E2E_TESTING=False):
+            for i in range(35):
+                response = self.client.post("/api/login/precheck", {"email": self.user.email.upper()})
+                self.assertEqual(response.status_code, status.HTTP_200_OK, f"request {i} was throttled")
+
+    def test_login_precheck_is_rate_limited_for_an_authenticated_caller_probing_other_emails(self):
+        # Being signed in with any account must not buy unlimited enumeration of other people's
+        # sign-in methods — the endpoint is `AllowAny` and has no ownership check.
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.client.force_login(self.user)
+
+        with self.settings(E2E_TESTING=False):
+            for i in range(30):
+                response = self.client.post("/api/login/precheck", {"email": f"victim-{i}@posthog.com"})
+                self.assertEqual(response.status_code, status.HTTP_200_OK, f"request {i} was throttled early")
+
+            response = self.client.post("/api/login/precheck", {"email": "victim-30@posthog.com"})
+            self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    def test_login_precheck_describes_the_account_login_would_authenticate(self):
+        # `User.email` is only unique case-*sensitively*, so variations can coexist. Precheck must
+        # describe the same account login would authenticate: the one still in use, whichever case
+        # the person types.
+        User.objects.create_and_join(self.organization, "casey@posthog.com", None)
+        with_password = User.objects.create_and_join(self.organization, "casey-alt@posthog.com", self.CONFIG_PASSWORD)
+        # `create_user` normalizes the address to lowercase, so write the variation in directly — the
+        # accounts this guards against predate that normalization.
+        User.objects.filter(pk=with_password.pk).update(email="Casey@posthog.com", last_login=timezone.now())
+
+        for typed_email in ("Casey@posthog.com", "casey@posthog.com"):
+            with self.subTest(email=typed_email):
+                response = self.client.post("/api/login/precheck", {"email": typed_email})
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertEqual(response.json()["password_login_available"], True)
+
 
 class TestLoginAPI(APIBaseTest):
     """
@@ -199,6 +374,20 @@ class TestLoginAPI(APIBaseTest):
     """
 
     CONFIG_AUTO_LOGIN = False
+
+    def test_login_resolves_the_email_through_the_indexed_lower_fold(self):
+        self.user.is_email_verified = True
+        self.user.save()
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.post("/api/login", {"email": self.CONFIG_EMAIL, "password": self.CONFIG_PASSWORD})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # `posthog_user` has an expression index on `LOWER(email)` only, so an `UPPER` comparison
+        # from `email__iexact` falls back to a sequential scan on every login attempt.
+        user_lookups = [q["sql"] for q in queries.captured_queries if 'FROM "posthog_user"' in q["sql"]]
+        self.assertTrue(user_lookups)
+        self.assertFalse([sql for sql in user_lookups if "UPPER(" in sql])
 
     @patch("posthoganalytics.capture")
     def test_user_logs_in_with_email_and_password(self, mock_capture):
@@ -225,50 +414,191 @@ class TestLoginAPI(APIBaseTest):
             },
         )
 
-    @patch("posthog.api.authentication.is_email_available", return_value=True)
-    @patch("posthog.api.authentication.EmailVerifier.create_token_and_send_email_verification")
-    def test_email_unverified_user_cant_log_in_if_email_available(
-        self, mock_send_email_verification, mock_is_email_available
-    ):
-        self.user.is_email_verified = False
+    def test_login_refused_for_blocked_member_when_org_requires_verified_domain(self):
+        # A blocked member has no recovery action a session would enable, so they get a clear
+        # refusal instead of a fully gated app.
+        self.user.is_email_verified = True
         self.user.save()
-        self.assertEqual(self.user.is_email_verified, False)
+        self.organization.enforce_verified_domains = True
+        self.organization.save()
+        OrganizationDomain.objects.create(
+            domain="hogflix.com", organization=self.organization, verified_at=timezone.now()
+        )
+
         response = self.client.post("/api/login", {"email": self.CONFIG_EMAIL, "password": self.CONFIG_PASSWORD})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["code"], "verified_domain_required")
+        self.assertEqual(self.client.get("/api/users/@me/").status_code, status.HTTP_401_UNAUTHORIZED)
 
-        # Test that we're not logged in
+    def test_blocked_admin_can_log_in_gated_and_recover_via_the_escape_hatch(self):
+        # The full recovery loop: a blocked admin whose session expired logs back in (gated to the
+        # whitelist), disables the setting through the escape hatch, and regains full access.
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        self.user.is_email_verified = True
+        self.user.save()
+        self.organization.enforce_verified_domains = True
+        self.organization.save()
+        OrganizationDomain.objects.create(
+            domain="hogflix.com", organization=self.organization, verified_at=timezone.now()
+        )
+
+        response = self.client.post("/api/login", {"email": self.CONFIG_EMAIL, "password": self.CONFIG_PASSWORD})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.client.get("/api/users/@me/").status_code, status.HTTP_200_OK)  # whitelisted
+        gated = self.client.get(f"/api/projects/{self.team.id}/")
+        self.assertEqual(gated.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(gated.json()["code"], "verified_domain_required")
+
+        response = self.client.patch(f"/api/organizations/{self.organization.id}/", {"enforce_verified_domains": False})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(self.client.get(f"/api/projects/{self.team.id}/").status_code, status.HTTP_200_OK)
+
+    def test_login_moves_user_to_an_organization_that_admits_them(self):
+        # A contractor in several orgs must not be locked out of all of them because one turned the
+        # setting on — they land in an org that still admits them instead of being refused.
+        self.user.is_email_verified = True
+        self.user.save()
+        permitted_org = Organization.objects.create(name="Permitted org")
+        Team.objects.create(organization=permitted_org, name="Permitted project")
+        OrganizationMembership.objects.create(organization=permitted_org, user=self.user)
+        self.organization.enforce_verified_domains = True
+        self.organization.save()
+        OrganizationDomain.objects.create(
+            domain="hogflix.com", organization=self.organization, verified_at=timezone.now()
+        )
+
+        response = self.client.post("/api/login", {"email": self.CONFIG_EMAIL, "password": self.CONFIG_PASSWORD})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.current_organization, permitted_org)
+
+    def test_live_session_is_cut_off_when_domain_enforcement_is_enabled(self):
+        # Enforcement is re-checked per request, like 2FA, so flipping the setting on takes effect for
+        # members who are already logged in and can't be walked around by switching organization.
+        self.client.force_login(self.user)
+        self.assertEqual(self.client.get(f"/api/projects/{self.team.id}/").status_code, status.HTTP_200_OK)
+
+        self.organization.enforce_verified_domains = True
+        self.organization.save()
+        OrganizationDomain.objects.create(
+            domain="hogflix.com", organization=self.organization, verified_at=timezone.now()
+        )
+
+        response = self.client.get(f"/api/projects/{self.team.id}/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.json()["code"], "verified_domain_required")
+
+    def _second_org_with_team(self) -> tuple[Organization, Team]:
+        org = Organization.objects.create(name="Permitted org")
+        team = Team.objects.create(organization=org, name="Permitted project")
+        OrganizationMembership.objects.create(organization=org, user=self.user)
+        return org, team
+
+    def _enforce_current_test_org(self) -> None:
+        self.organization.enforce_verified_domains = True
+        self.organization.save()
+        OrganizationDomain.objects.create(
+            domain="hogflix.com", organization=self.organization, verified_at=timezone.now()
+        )
+
+    def test_cross_org_member_cannot_reach_enforced_org_via_direct_api_access(self):
+        # The current organization is a UI preference routing never validates, so enforcement must
+        # hold against the URL-resolved organization — otherwise a member of a permitted org keeps
+        # full API access to the enforcing one by simply not making it current.
+        permitted_org, permitted_team = self._second_org_with_team()
+        self.user.current_organization = permitted_org
+        self.user.current_team = permitted_team
+        self.user.save()
+        self._enforce_current_test_org()
+        self.client.force_login(self.user)
+
+        response = self.client.get(f"/api/projects/{self.team.id}/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.json()["code"], "verified_domain_required")
+
+        response = self.client.get(f"/api/projects/{permitted_team.id}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_personal_api_key_cannot_reach_enforced_org(self):
+        # Personal API keys never pass through session authentication, so this exercises the
+        # permission-layer gate: the same key works against a permitted org and not the enforcing one.
+        _, permitted_team = self._second_org_with_team()
+        self._enforce_current_test_org()
+        key_value = generate_random_token_personal()
+        PersonalAPIKey.objects.create(
+            label="Test key", user=self.user, secure_value=hash_key_value(key_value), scopes=["*"]
+        )
+
+        response = self.client.get(f"/api/projects/{self.team.id}/", HTTP_AUTHORIZATION=f"Bearer {key_value}")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.json()["code"], "verified_domain_required")
+
+        response = self.client.get(f"/api/projects/{permitted_team.id}/", HTTP_AUTHORIZATION=f"Bearer {key_value}")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def _blocked_admin_parked_in_permitted_org(self) -> None:
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+        permitted_org, permitted_team = self._second_org_with_team()
+        self.user.current_organization = permitted_org
+        self.user.current_team = permitted_team
+        self.user.save()
+        self._enforce_current_test_org()
+        self.client.force_login(self.user)
+
+    def test_cross_org_admin_permission_chain_enforced_except_the_escape_hatch(self):
+        # OrganizationViewSet's update chain comes from dangerously_get_permissions, which must not
+        # skip domain enforcement — but the escape hatch (disabling the setting) must work through
+        # it, or a blocked admin could never recover the organization.
+        self._blocked_admin_parked_in_permitted_org()
+
+        response = self.client.patch(f"/api/organizations/{self.organization.id}/", {"name": "New name"})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.json()["code"], "verified_domain_required")
+
+        response = self.client.patch(f"/api/organizations/{self.organization.id}/", {"enforce_verified_domains": False})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.organization.refresh_from_db()
+        self.assertFalse(self.organization.enforce_verified_domains)
+
+    def test_cross_org_admin_cannot_create_invites_for_enforcing_org(self):
+        # Invite creation also runs on a custom permission chain; a member the org no longer admits
+        # must not be able to act in it, even when inviting a verified-domain email.
+        self._blocked_admin_parked_in_permitted_org()
+
+        response = self.client.post(
+            f"/api/organizations/{self.organization.id}/invites/", {"target_email": "new@hogflix.com"}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.json()["code"], "verified_domain_required")
+
+    @patch("posthog.api.authentication.is_email_available", return_value=True)
+    @patch("posthog.api.email_verification.send_email_verification_code")
+    def test_email_unverified_login_returns_verify_email_pending_with_uuid(
+        self, mock_send_code, mock_is_email_available
+    ):
+        # The signup code flow blocks login with the user uuid in `detail`, so the frontend can
+        # route to /verify_email/<uuid> where the code entry form lives.
+        self.user.is_email_verified = False
+        self.user.save()
+        response = self.client.post("/api/login", {"email": self.CONFIG_EMAIL, "password": self.CONFIG_PASSWORD})
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(response.json()["code"], "verify_email_pending")
+        self.assertEqual(response.json()["detail"], str(self.user.uuid))
+        mock_send_code.assert_called_once()
+
         response = self.client.get("/api/users/@me/")
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
-        mock_is_email_available.assert_called_once()
-
-        # Assert the email was sent.
-        mock_send_email_verification.assert_called_once_with(self.user, None)
-
-    @parameterized.expand(
-        [
-            # A relative `next` (e.g. an /oauth/authorize continuation) must be forwarded so the
-            # verification link can resume the flow.
-            ("safe_relative_next", "/oauth/authorize/?client_id=x", "/oauth/authorize/?client_id=x"),
-            # An off-origin `next` must be dropped.
-            ("unsafe_off_origin_next", "https://evil.example.com/steal", None),
-        ]
-    )
-    @patch("posthog.api.authentication.is_email_available", return_value=True)
-    @patch("posthog.api.authentication.EmailVerifier.create_token_and_send_email_verification")
-    def test_email_verification_link_carries_safe_next(
-        self, _name, next_input, expected, mock_send_email_verification, mock_is_email_available
-    ):
-        self.user.is_email_verified = False
-        self.user.save()
-        self.client.post(
-            "/api/login",
-            {"email": self.CONFIG_EMAIL, "password": self.CONFIG_PASSWORD, "next": next_input},
-        )
-        mock_send_email_verification.assert_called_once_with(self.user, expected)
+    @patch("posthog.ph_client.posthoganalytics.get_feature_flag", side_effect=RuntimeError("flags down"))
+    @patch("posthog.ph_client.posthoganalytics.feature_enabled", side_effect=RuntimeError("flags down"))
+    def test_verification_flag_failure_reads_as_verification_required(self, _mock_enabled, _mock_get):
+        assert is_email_verification_disabled(self.user) is False
 
     @patch("posthog.api.authentication.is_email_available", return_value=True)
-    @patch("posthog.api.authentication.EmailVerifier.create_token_and_send_email_verification")
+    @patch("posthog.api.authentication.email_verification_code_verifier.send_code")
     @patch("posthog.api.authentication.is_email_verification_disabled", return_value=True)
     def test_email_unverified_user_can_log_in_if_email_available_but_verification_disabled_flag_is_true(
         self, mock_is_verification_disabled, mock_send_email_verification, mock_is_email_available
@@ -290,7 +620,7 @@ class TestLoginAPI(APIBaseTest):
         mock_send_email_verification.assert_not_called()
 
     @patch("posthog.api.authentication.is_email_available", return_value=True)
-    @patch("posthog.api.authentication.EmailVerifier.create_token_and_send_email_verification")
+    @patch("posthog.api.authentication.email_verification_code_verifier.send_code")
     def test_email_unverified_null_user_can_log_in_if_email_available(
         self, mock_send_email_verification, mock_is_email_available
     ):
@@ -305,7 +635,7 @@ class TestLoginAPI(APIBaseTest):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         mock_is_email_available.assert_called_once()
         # Assert the email was sent.
-        mock_send_email_verification.assert_called_once_with(self.user, None)
+        mock_send_email_verification.assert_called_once_with(self.user)
 
     @patch("posthoganalytics.capture")
     def test_user_cant_login_with_incorrect_password(self, mock_capture):
@@ -440,12 +770,61 @@ class TestDevLoginAPI(APIBaseTest):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.json(), {"success": True})
 
+    @override_settings(DEBUG=True, ALLOW_DEV_LOGIN=True)
+    def test_dev_login_list_puts_seeded_then_recently_used_accounts_first(self):
+        User.objects.create_and_join(self.organization, "aaa-never@posthog.com", None)
+        recently_used = User.objects.create_and_join(self.organization, "zzz-recent@posthog.com", None)
+        recently_used.last_login = timezone.now()
+        recently_used.save()
+        # Seeded by setup_dev, and never logged in as — it still belongs on top.
+        User.objects.create_and_join(self.organization, "test@posthog.com", None)
+
+        response = self.client.get("/api/login/dev")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        emails = [user["email"] for user in response.json()["users"]]
+        self.assertEqual(emails[:2], ["test@posthog.com", "zzz-recent@posthog.com"])
+
     @override_settings(DEBUG=True, ALLOW_DEV_LOGIN=False)
     def test_dev_login_hidden_when_allow_dev_login_disabled(self):
         response = self.client.get("/api/login/dev")
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
         response = self.client.post("/api/login/dev", {"email": self.user.email})
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @override_settings(DEBUG=True, ALLOW_DEV_LOGIN=True)
+    def test_dev_login_create_fresh_account(self):
+        user_count = User.objects.count()
+        organization_count = Organization.objects.count()
+
+        response = self.client.post("/api/login/dev", {"create_fresh_account": True})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json(), {"success": True})
+
+        self.assertEqual(User.objects.count(), user_count + 1)
+        self.assertEqual(Organization.objects.count(), organization_count + 1)
+
+        new_user = User.objects.latest("id")
+        self.assertTrue(new_user.is_email_verified)
+        self.assertTrue(new_user.check_password("12345678"))
+        self.assertIsNotNone(new_user.organization)
+
+        # Logged in as the fresh user
+        response = self.client.get("/api/users/@me")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["email"], new_user.email)
+
+    @override_settings(DEBUG=True, ALLOW_DEV_LOGIN=False)
+    def test_dev_login_create_fresh_account_hidden_when_not_allowed(self):
+        response = self.client.post("/api/login/dev", {"create_fresh_account": True})
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @override_settings(DEBUG=True, ALLOW_DEV_LOGIN=False)
+    def test_dev_login_disabled_returns_404_regardless_of_body(self):
+        # A body that would normally fail field validation (no email, no
+        # create_fresh_account) must still surface as 404, not a 400, so the
+        # endpoint's existence isn't leaked by request-shape differences.
+        response = self.client.post("/api/login/dev", {})
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     @override_settings(DEBUG=False, ALLOW_DEV_LOGIN=True)
@@ -525,7 +904,7 @@ class TestTwoFactorAPI(APIBaseTest):
     def test_2fa_expired(self):
         self.user.totpdevice_set.create(name="default", key=random_hex(), digits=6)  # type: ignore
 
-        with freeze_time("2023-01-01T10:00:00"):
+        with time_machine.travel("2023-01-01T10:00:00", tick=False):
             response = self.client.post(
                 "/api/login",
                 {"email": self.CONFIG_EMAIL, "password": self.CONFIG_PASSWORD},
@@ -541,7 +920,7 @@ class TestTwoFactorAPI(APIBaseTest):
                 },
             )
 
-        with freeze_time("2023-01-01T10:30:00"):
+        with time_machine.travel("2023-01-01T10:30:00", tick=False):
             response = self.client.post("/api/login/token", {"token": "abcdefg"})
             self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
             self.assertEqual(
@@ -1217,7 +1596,7 @@ class TestPasswordResetAPI(APIBaseTest):
 
     # Password reset request
 
-    @freeze_time("2021-10-05T12:00:00")
+    @time_machine.travel("2021-10-05T12:00:00", tick=False)
     @patch("posthoganalytics.capture")
     def test_anonymous_user_can_request_password_reset(self, mock_capture):
         set_instance_setting("EMAIL_HOST", "localhost")
@@ -1268,6 +1647,22 @@ class TestPasswordResetAPI(APIBaseTest):
         # Email should still be sent
         self.assertEqual(len(mail.outbox), 1)
         self.assertSetEqual({",".join(outmail.to) for outmail in mail.outbox}, {self.CONFIG_EMAIL})
+
+    def test_password_reset_reaches_the_account_login_would_authenticate(self):
+        set_instance_setting("EMAIL_HOST", "localhost")
+        abandoned = User.objects.create_and_join(self.organization, "casey@posthog.com", None)
+        in_use = User.objects.create_and_join(self.organization, "casey-alt@posthog.com", self.CONFIG_PASSWORD)
+        # `create_user` normalizes the address to lowercase, so write the variation in directly — the
+        # accounts this guards against predate that normalization.
+        User.objects.filter(pk=in_use.pk).update(email="Casey@posthog.com", last_login=timezone.now())
+
+        with self.settings(CELERY_TASK_ALWAYS_EAGER=True, SITE_URL="https://my.posthog.net"):
+            response = self.client.post("/api/reset/", {"email": "casey@posthog.com"})
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertSetEqual({",".join(outmail.to) for outmail in mail.outbox}, {"Casey@posthog.com"})
+        abandoned.refresh_from_db()
+        self.assertIsNone(abandoned.requested_password_reset_at)
 
     def test_reset_with_sso_available(self):
         """
@@ -1401,7 +1796,7 @@ class TestPasswordResetAPI(APIBaseTest):
     def test_invalid_token_returns_error(self):
         valid_token = password_reset_token_generator.make_token(self.user)
 
-        with freeze_time(timezone.now() - timedelta(seconds=86_401)):
+        with time_machine.travel(timezone.now() - timedelta(seconds=86_401), tick=False):
             # tokens expire after one day
             expired_token = password_reset_token_generator.make_token(self.user)
 
@@ -1525,7 +1920,7 @@ class TestPasswordResetAPI(APIBaseTest):
     def test_cant_reset_password_with_invalid_token(self):
         valid_token = password_reset_token_generator.make_token(self.user)
 
-        with freeze_time(timezone.now() - timedelta(seconds=86_401)):
+        with time_machine.travel(timezone.now() - timedelta(seconds=86_401), tick=False):
             # tokens expire after one day
             expired_token = password_reset_token_generator.make_token(self.user)
 
@@ -1696,7 +2091,7 @@ class TestPersonalAPIKeyAuthentication(APIBaseTest):
             scopes=["*"],
         )
 
-        with freeze_time("2021-08-25T22:10:14.252"):
+        with time_machine.travel("2021-08-25T22:10:14.252", tick=False):
             response = self.client.get(
                 f"/api/projects/{self.team.pk}/feature_flags/", headers={"authorization": f"Bearer {personal_api_key}"}
             )
@@ -1719,7 +2114,7 @@ class TestPersonalAPIKeyAuthentication(APIBaseTest):
             scopes=["*"],
         )
 
-        with freeze_time("2022-08-25T22:00:14.252"):
+        with time_machine.travel("2022-08-25T22:00:14.252", tick=False):
             response = self.client.get(
                 f"/api/projects/{self.team.pk}/feature_flags/", headers={"authorization": f"Bearer {personal_api_key}"}
             )
@@ -1742,7 +2137,7 @@ class TestPersonalAPIKeyAuthentication(APIBaseTest):
             scopes=["*"],
         )
 
-        with freeze_time("2021-08-26T22:00:14.252"):
+        with time_machine.travel("2021-08-26T22:00:14.252", tick=False):
             response = self.client.get(
                 f"/api/projects/{self.team.pk}/feature_flags/", headers={"authorization": f"Bearer {personal_api_key}"}
             )
@@ -1761,7 +2156,7 @@ class TestPersonalAPIKeyAuthentication(APIBaseTest):
             label="X", user=self.user, secure_value=hash_key_value(personal_api_key), scopes=["*"]
         )
 
-        with freeze_time("2022-08-25T22:00:14.252"):
+        with time_machine.travel("2022-08-25T22:00:14.252", tick=False):
             response = self.client.get(
                 f"/api/projects/{self.team.pk}/feature_flags/", headers={"authorization": f"Bearer {personal_api_key}"}
             )
@@ -1784,7 +2179,7 @@ class TestPersonalAPIKeyAuthentication(APIBaseTest):
             scopes=["*"],
         )
 
-        with freeze_time("2021-08-25T21:14:14.252"):
+        with time_machine.travel("2021-08-25T21:14:14.252", tick=False):
             response = self.client.get(
                 f"/api/projects/{self.team.pk}/feature_flags/", headers={"authorization": f"Bearer {personal_api_key}"}
             )
@@ -1806,7 +2201,7 @@ class TestPersonalAPIKeyAuthentication(APIBaseTest):
             scopes=["*"],
         )
 
-        with freeze_time("2021-08-24T21:14:14.252"):
+        with time_machine.travel("2021-08-24T21:14:14.252", tick=False):
             response = self.client.get(
                 f"/api/projects/{self.team.pk}/feature_flags/", headers={"authorization": f"Bearer {personal_api_key}"}
             )
@@ -1822,15 +2217,15 @@ class TestTimeSensitivePermissions(APIBaseTest):
         self.organization_membership.level = OrganizationMembership.Level.ADMIN
         self.organization_membership.save()
         now = datetime.now()
-        with freeze_time(now):
+        with time_machine.travel(now, tick=False):
             res = self.client.patch("/api/organizations/@current", {"name": "new name"})
             assert res.status_code == 200
 
-        with freeze_time(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE - 100)):
+        with time_machine.travel(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE - 100), tick=False):
             res = self.client.patch("/api/organizations/@current", {"name": "new name"})
             assert res.status_code == 200
 
-        with freeze_time(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10)):
+        with time_machine.travel(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10), tick=False):
             res = self.client.patch("/api/organizations/@current", {"name": "new name"})
             assert res.status_code == 403
             assert res.json() == {
@@ -1845,15 +2240,15 @@ class TestTimeSensitivePermissions(APIBaseTest):
 
     def test_user_after_timeout_modifications_require_reauthentication(self):
         now = datetime.now()
-        with freeze_time(now):
+        with time_machine.travel(now, tick=False):
             res = self.client.patch("/api/users/@me", {"first_name": "new name"})
             assert res.status_code == 200
 
-        with freeze_time(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE - 100)):
+        with time_machine.travel(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE - 100), tick=False):
             res = self.client.patch("/api/users/@me", {"first_name": "new name"})
             assert res.status_code == 200
 
-        with freeze_time(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10)):
+        with time_machine.travel(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10), tick=False):
             res = self.client.patch("/api/users/@me", {"first_name": "new name"})
             assert res.status_code == 403
             assert res.json() == {
@@ -1868,11 +2263,11 @@ class TestTimeSensitivePermissions(APIBaseTest):
 
     def test_user_can_update_theme_without_recent_authentication(self):
         now = datetime.now()
-        with freeze_time(now):
+        with time_machine.travel(now, tick=False):
             res = self.client.patch("/api/users/@me", {"theme_mode": "dark"})
             assert res.status_code == 200
 
-        with freeze_time(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10)):
+        with time_machine.travel(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10), tick=False):
             res = self.client.patch("/api/users/@me", {"theme_mode": "light"})
             assert res.status_code == 200
 
@@ -1888,14 +2283,14 @@ class TestTimeSensitivePermissions(APIBaseTest):
         OrganizationMembership.objects.create(organization=new_org, user=self.user)
 
         now = datetime.now()
-        with freeze_time(now):
+        with time_machine.travel(now, tick=False):
             res = self.client.patch(
                 "/api/users/@me",
                 {"set_current_organization": str(new_org.id)},
             )
             assert res.status_code == 200
 
-        with freeze_time(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10)):
+        with time_machine.travel(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10), tick=False):
             res = self.client.patch(
                 "/api/users/@me",
                 {"set_current_organization": str(self.organization.id)},
@@ -1911,13 +2306,13 @@ class TestTimeSensitivePermissions(APIBaseTest):
     )
     def test_user_can_update_non_sensitive_fields_without_recent_authentication(self, _name, payload):
         now = datetime.now()
-        with freeze_time(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10)):
+        with time_machine.travel(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10), tick=False):
             res = self.client.patch("/api/users/@me", payload, format="json")
             assert res.status_code != 403, f"Field update should not require re-authentication, got: {res.json()}"
 
     def test_user_can_update_hedgehog_config_without_recent_authentication(self):
         now = datetime.now()
-        with freeze_time(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10)):
+        with time_machine.travel(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10), tick=False):
             res = self.client.patch(
                 "/api/users/@me/hedgehog_config",
                 {"enabled": True, "color": "red"},
@@ -1930,10 +2325,20 @@ class TestTimeSensitivePermissions(APIBaseTest):
 
         dashboard = Dashboard.objects.create(team=self.team, name="Test")
         now = datetime.now()
-        with freeze_time(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10)):
+        with time_machine.travel(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10), tick=False):
             res = self.client.post(
                 "/api/users/@me/scene_personalisation",
                 {"scene": "Person", "dashboard": dashboard.id},
+                format="json",
+            )
+            assert res.status_code == 200
+
+    def test_user_can_mark_a_product_intro_seen_without_recent_authentication(self):
+        now = datetime.now()
+        with time_machine.travel(now + timedelta(seconds=settings.SESSION_SENSITIVE_ACTIONS_AGE + 10), tick=False):
+            res = self.client.patch(
+                "/api/users/@me/product_intro_seen",
+                {"product_key": "posthog_ai_onboarding"},
                 format="json",
             )
             assert res.status_code == 200

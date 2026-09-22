@@ -5,19 +5,26 @@ analytics runner; keeping them here means a runner is just its query shape plus
 its harness-label SQL.
 """
 
+import json
+from collections.abc import Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING
 
 import posthoganalytics
 
+from posthog.schema import EmptyPropertyFilter, EventPropertyFilter, PersonPropertyFilter, SessionPropertyFilter
+
 from posthog.hogql import ast
+from posthog.hogql.errors import QueryError
 from posthog.hogql.parser import parse_expr
+from posthog.hogql.property import property_to_expr
 
 from posthog.hogql_queries.utils.query_date_range import QueryDateRange
-from posthog.rbac.user_access_control import UserAccessControl, UserAccessControlError
+
+from products.access_control.backend.facade.user_access_control import UserAccessControl, UserAccessControlError
 
 if TYPE_CHECKING:
-    from posthog.schema import DateRange
+    from posthog.schema import AnyPropertyFilterDiscriminated, DateRange, IntervalType
 
     from posthog.models.team import Team
     from posthog.models.user import User
@@ -32,6 +39,14 @@ MCP_ANALYTICS_FEATURE_FLAG = "mcp-analytics"
 # scopes to one tool, so the expression lives OnceAndOnlyOnce.
 EFFECTIVE_TOOL_SQL = (
     "coalesce(nullIf(toString(properties.$mcp_exec_tool_call_name), ''), toString(properties.$mcp_tool_name))"
+)
+# The description of the *effective* tool: for single-exec calls the inner tool's
+# $mcp_exec_tool_call_description, else the directly-registered $mcp_tool_description.
+# Without this, an inner tool's description would resolve to the exec wrapper's text
+# (another tool's description) — a tool-level disclosure.
+EFFECTIVE_DESCRIPTION_SQL = (
+    "coalesce(nullIf(toString(properties.$mcp_exec_tool_call_description), ''), "
+    "toString(properties.$mcp_tool_description))"
 )
 # Marker the posthog-node MCP analytics SDK stamps on the events it sends.
 NEW_SDK_SOURCE = "posthog_mcp_analytics"
@@ -51,6 +66,39 @@ def tool_scope_exprs(tool: str) -> list[ast.Expr]:
     ]
 
 
+def shared_filter_exprs(
+    team: "Team",
+    properties: "Sequence[AnyPropertyFilterDiscriminated] | None",
+    filter_test_accounts: bool | None,
+) -> list[ast.Expr]:
+    """Property filters plus, when enabled, the team's default test-account exclusions.
+
+    Every MCP analytics runner that accepts the dashboard's shared property filters and
+    "Filter out internal and test users" switch applies them through this one expression,
+    so the two behave identically everywhere they're wired in.
+    """
+    all_properties = [
+        property_filter for property_filter in properties or [] if not isinstance(property_filter, EmptyPropertyFilter)
+    ]
+    if any(
+        not isinstance(property_filter, EventPropertyFilter | PersonPropertyFilter | SessionPropertyFilter)
+        for property_filter in all_properties
+    ):
+        raise QueryError("Only event, person, and session property filters are supported.")
+    if filter_test_accounts:
+        all_properties += team.test_account_filters or []
+    return [property_to_expr(all_properties, team)] if all_properties else []
+
+
+def display_person_properties(*, email: str, name: str) -> str:
+    """JSON of only the person fields a row's person cell renders, omitting blanks.
+
+    Shared by every runner that returns a person alongside a row, so none of them
+    ships the whole ``person.properties`` blob to the client.
+    """
+    return json.dumps({k: v for k, v in (("email", email), ("name", name)) if v})
+
+
 def validate_mcp_analytics_access(team: "Team", user: "User") -> bool:
     org_id = str(team.organization_id)
     enabled = posthoganalytics.feature_enabled(
@@ -66,10 +114,15 @@ def validate_mcp_analytics_access(team: "Team", user: "User") -> bool:
     return UserAccessControl(user=user, team=team).assert_access_level_for_resource("mcp_analytics", "viewer")
 
 
-def mcp_query_date_range(team: "Team", date_range: "DateRange | None") -> QueryDateRange:
+def mcp_query_date_range(
+    team: "Team", date_range: "DateRange | None", interval: "IntervalType | None" = None
+) -> QueryDateRange:
+    # Runners that bucket should pass their interval: QueryDateRange only leaves a relative
+    # date_from untruncated at minute and second granularity, so without it a "last hour" window
+    # starts at the top of the hour and pulls up to an extra interval of calls.
     return QueryDateRange(
         date_range=date_range,
         team=team,
-        interval=None,
+        interval=interval,
         now=datetime.now(team.timezone_info),
     )

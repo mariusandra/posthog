@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.clari.clari import (
     ClariResumeConfig,
@@ -32,6 +26,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.clari import ClariSourceConfig
 from products.warehouse_sources.backend.types import ExternalDataSourceType
 
@@ -57,12 +52,12 @@ class ClariSource(ResumableSource[ClariSourceConfig, ClariResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.CLARI,
+            name=ExternalDataSourceType.CLARI,
             category=DataWarehouseSourceCategory.SALES,
             label="Clari",
             caption="""Connect your Clari account to pull your revenue data into the PostHog Data warehouse.
 
-Generate an API key in Clari under your account's API settings. The forecast ID is in the URL when viewing a forecast tab in Clari (e.g. `app.clari.com/forecast/<forecast-id>`). Note: Clari retains audit events for ~30 days and caps forecast exports at roughly 1,000 per rolling 30 days, so avoid very frequent syncs of the forecast table.""",
+Generate an API key in Clari under your account's API settings. The forecast ID is in the URL when viewing a forecast tab in Clari (e.g. `app.clari.com/forecast/<forecast-id>`). Note: Clari retains audit events for ~30 days and limits bulk exports per rolling 30 days, so avoid very frequent syncs of the forecast and activity tables. The first activity sync covers the past year.""",
             iconPath="/static/services/clari.png",
             docsUrl="https://posthog.com/docs/cdp/sources/clari",
             releaseStatus=ReleaseStatus.ALPHA,

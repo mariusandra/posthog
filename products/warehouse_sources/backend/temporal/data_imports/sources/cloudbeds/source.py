@@ -1,19 +1,15 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
 )
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
-)
 from products.warehouse_sources.backend.temporal.data_imports.sources.cloudbeds.cloudbeds import (
+    CLOUDBEDS_API_VERSION_V1_2,
+    CLOUDBEDS_API_VERSION_V1_3,
     CloudbedsResumeConfig,
     cloudbeds_source,
     validate_credentials,
@@ -33,6 +29,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.cloudbeds import (
     CloudbedsSourceConfig,
 )
@@ -42,8 +39,10 @@ from products.warehouse_sources.backend.types import ExternalDataSourceType
 @SourceRegistry.register
 class CloudbedsSource(ResumableSource[CloudbedsSourceConfig, CloudbedsResumeConfig]):
     lists_tables_without_credentials = True  # static endpoint catalog - safe for public docs
-    supported_versions = ("v1.2",)
-    default_version = "v1.2"
+    # v1.2 and v1.3 serve the same methods and response shapes; the version is just the
+    # `/api/<version>` URL segment, threaded into the request layer via resolve_api_version.
+    supported_versions = (CLOUDBEDS_API_VERSION_V1_2, CLOUDBEDS_API_VERSION_V1_3)
+    default_version = CLOUDBEDS_API_VERSION_V1_3
     api_docs_url = "https://developers.cloudbeds.com/reference"
 
     @property
@@ -59,11 +58,11 @@ class CloudbedsSource(ResumableSource[CloudbedsSourceConfig, CloudbedsResumeConf
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.CLOUDBEDS,
+            name=ExternalDataSourceType.CLOUDBEDS,
             category=DataWarehouseSourceCategory.PRODUCTIVITY,
             label="Cloudbeds",
             releaseStatus=ReleaseStatus.ALPHA,
-            caption="""Enter your Cloudbeds API key to pull your properties, reservations, guests, rooms, room types, and transactions into the PostHog Data warehouse.
+            caption="""Enter your Cloudbeds API key to pull your properties, reservations and their rate details, guests, rooms, room types, transactions, rate plans, and staff users into the PostHog Data warehouse.
 
 You can create an API key under **Settings → API credentials** in [Cloudbeds](https://hotels.cloudbeds.com). Note that Cloudbeds API keys expire after 30 days of inactivity, so a key that has not been used recently may need to be regenerated.
 
@@ -129,8 +128,9 @@ If your account manages multiple properties, enter the ID of the property you wa
         api_version: str | None = None,
     ) -> tuple[bool, str | None]:
         # One probe validates the token itself; per-endpoint OAuth scopes surface at sync time via
-        # get_non_retryable_errors.
-        return validate_credentials(config.api_key, config.property_id)
+        # get_non_retryable_errors. getHotels is served under both versions, so the probe runs on the
+        # instance's resolved pin (default_version pre-creation).
+        return validate_credentials(config.api_key, self.resolve_api_version(api_version), config.property_id)
 
     def get_resumable_source_manager(self, inputs: SourceInputs) -> ResumableSourceManager[CloudbedsResumeConfig]:
         return ResumableSourceManager[CloudbedsResumeConfig](inputs, CloudbedsResumeConfig)
@@ -150,6 +150,7 @@ If your account manages multiple properties, enter the ID of the property you wa
             team_id=inputs.team_id,
             job_id=inputs.job_id,
             resumable_source_manager=resumable_source_manager,
+            api_version=self.resolve_api_version(inputs.api_version),
             property_id=config.property_id,
             db_incremental_field_last_value=None,  # every Cloudbeds endpoint is full refresh
         )

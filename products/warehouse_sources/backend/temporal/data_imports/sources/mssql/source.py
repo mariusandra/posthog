@@ -2,20 +2,20 @@ from typing import Optional, cast
 
 from sshtunnel import BaseSSHTunnelForwarderError
 
-from posthog.schema import (
+from posthog.exceptions_capture import capture_exception
+
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
     SourceFieldSSHTunnelConfig,
 )
-
-from posthog.exceptions_capture import capture_exception
-
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.mixins import (
+    HostNotAllowedError,
     SSHTunnelMixin,
+    TemporaryHostResolutionError,
     ValidateDatabaseHostMixin,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
@@ -61,6 +61,22 @@ class MSSQLSource(SQLSource[MSSQLSourceConfig], SSHTunnelMixin, ValidateDatabase
     def source_type(self) -> ExternalDataSourceType:
         return ExternalDataSourceType.MSSQL
 
+    def get_retryable_errors(self) -> set[str]:
+        return {
+            # DB-Lib error 20017 — the SQL Server closed the TCP connection during query
+            # execution (server restart, query timeout, or a brief network interruption).
+            # A fresh connection from the next Temporal retry resolves it; keep it out of
+            # error tracking so it doesn't surface as noise.
+            "Unexpected EOF from the server",
+            # pymssql's own InterfaceError, raised when `Cursor.execute` calls `cancel()` to
+            # clear pending results and finds the connection already dead (`assert_connected`
+            # in pymssql's `_mssql.pyx`). It's the same underlying DBPROCESS-death class as the
+            # 20017 case above — the driver's own retry loop tried to reuse a connection that
+            # died between opening and the query running — just surfaced through a different
+            # internal code path. A fresh connection from the next Temporal retry resolves it.
+            "Not connected to any MS SQL server",
+        }
+
     def get_non_retryable_errors(self) -> dict[str, str | None]:
         return {
             # Azure SQL error 40615 — the server-level firewall rejected PostHog's client IP. This
@@ -100,6 +116,13 @@ class MSSQLSource(SQLSource[MSSQLSourceConfig], SSHTunnelMixin, ValidateDatabase
             # whose definition selects a column that's no longer present. Fixed source-data shape,
             # so retrying won't help.
             "Invalid column name": "One of the columns being synced no longer exists in your SQL Server. A column was likely dropped or renamed, or a view's definition references a column that's no longer present. Fix the column or view definition at the source, then re-enable the sync.",
+            # SQL Server error 209 — a name in the object we select from resolves to more than one
+            # column. Our SELECT reads a single qualified object and only ever names columns
+            # discovered from information_schema, so the ambiguity is inside a view body: most often
+            # a `SELECT *` over a join that went stale when a base table gained a same-named column.
+            # The view keeps failing until it is refreshed or rewritten, so retrying replays the
+            # identical 209. Match the stable error text, not the column name that follows it.
+            "Ambiguous column name": "A view you're syncing has a column name that exists in more than one of the tables it reads, so SQL Server can't resolve it. Fix or refresh the view definition at the source, then re-enable the sync.",
             # SQL Server error 245 — an implicit type conversion fails on a specific row's value
             # (e.g. converting the varchar 'SFDR' to int). Our SELECT does no casts and the
             # incremental predicate only ever compares like types, so this conversion lives in the
@@ -123,11 +146,11 @@ class MSSQLSource(SQLSource[MSSQLSourceConfig], SSHTunnelMixin, ValidateDatabase
             # gateway-configuration class as "Could not establish session to SSH gateway" above.
             _SSH_HANDSHAKE_EOF_ERROR: "Could not connect to your SSH tunnel — the gateway accepted the connection but closed it during the SSH handshake. Check that the SSH host and port point to an SSH server (not the database port), that the bastion is running and reachable, and that PostHog's IP addresses are allowed through its firewall, then re-enable the sync.",
             # Raised from the shared `_decimal_array_from_values` fallback in
-            # `pipelines/pipeline/utils.py` when a numeric/decimal/money value exceeds Delta
+            # `pipelines/core/arrow_utils.py` when a numeric/decimal/money value exceeds Delta
             # Lake's decimal budget (precision > 76 or scale > 32). Fixed source-data shape —
             # retrying won't help.
             "Cannot build decimal array from values": "One of your numeric columns contains values that exceed our decimal storage limits (max precision 76, max scale 32). Please constrain the column with a lower precision/scale, cast it to text in a view, or round the values at the source.",
-            # Raised from the shared `evolve_pyarrow_schema` in `pipelines/pipeline/utils.py`
+            # Raised from the shared `evolve_pyarrow_schema` in `pipelines/core/arrow_utils.py`
             # when an integer column's source type was widened (e.g. `INT` → `BIGINT`) after the
             # destination table was created with the narrower type. Delta Lake can't widen an
             # existing column in place, so retrying won't help — the table must be reset and
@@ -171,9 +194,11 @@ class MSSQLSource(SQLSource[MSSQLSourceConfig], SSHTunnelMixin, ValidateDatabase
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.MSSQL,
+            name=ExternalDataSourceType.MSSQL,
             category=DataWarehouseSourceCategory.DATABASES,
-            keywords=["sql server", "sql", "mssql"],
+            # This connector is also how you connect Azure SQL Database, but nothing in the label
+            # or name carries "Azure", so a search for it fuzzy-matched unrelated sources instead.
+            keywords=["sql server", "sql", "mssql", "azure", "azure sql", "azure sql database"],
             label="Microsoft SQL Server",
             caption="Enter your Microsoft SQL Server/Azure SQL Server credentials to automatically pull your SQL data into the PostHog Data warehouse.",
             iconPath="/static/services/sql-azure.png",
@@ -194,7 +219,13 @@ class MSSQLSource(SQLSource[MSSQLSourceConfig], SSHTunnelMixin, ValidateDatabase
                         label="Host",
                         type=SourceFieldInputConfigType.TEXT,
                         required=True,
-                        placeholder="localhost",
+                        placeholder="db.example.com",
+                        caption=(
+                            "Must be reachable from the public internet. Add PostHog's egress IP addresses to your "
+                            "firewall allowlist (see the docs above) and use a public host. `localhost` and private "
+                            "IPs (10.x, 172.16-31.x, 192.168.x) can't be reached. For a database that can't be "
+                            "exposed publicly, enable the SSH tunnel below."
+                        ),
                         secret=False,
                     ),
                     SourceFieldInputConfig(
@@ -259,6 +290,10 @@ class MSSQLSource(SQLSource[MSSQLSourceConfig], SSHTunnelMixin, ValidateDatabase
 
         try:
             self.get_schemas(config, team_id, api_version=api_version)
+        except (HostNotAllowedError, TemporaryHostResolutionError) as e:
+            # The host policy refused the host, or its lookup never answered. Both carry their own
+            # user-facing wording and neither is a PostHog defect, so they are not captured.
+            return False, str(e)
         except OperationalError as e:
             error_msg = " ".join(str(n) for n in e.args)
             for key, value in MSSQLErrors.items():

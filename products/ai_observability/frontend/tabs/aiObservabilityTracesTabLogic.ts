@@ -16,6 +16,7 @@ import { LLM_TRACES_PAGE_SIZE } from '../utils'
 
 export interface AIObservabilityTracesTabLogicProps {
     tabId?: string
+    logicKey?: string
     personId?: string
     group?: {
         groupKey: string
@@ -90,15 +91,19 @@ export type aiObservabilityTracesTabLogicType = MakeLogicType<
 
 export const aiObservabilityTracesTabLogic = kea<aiObservabilityTracesTabLogicType>([
     path(['products', 'ai_observability', 'frontend', 'tabs', 'aiObservabilityTracesTabLogic']),
-    key((props: AIObservabilityTracesTabLogicProps) =>
-        props?.tabId
-            ? `${props.tabId}::${props?.personId || 'aiObservabilityScene'}`
-            : props?.personId || 'aiObservabilityScene'
+    key(
+        (props: AIObservabilityTracesTabLogicProps) =>
+            `${props.logicKey || props.personId || 'aiObservabilityScene'}::${props.tabId || ''}`
     ),
     props({} as AIObservabilityTracesTabLogicProps),
     connect((props: AIObservabilityTracesTabLogicProps) => ({
         values: [
-            aiObservabilitySharedLogic({ tabId: props.tabId, personId: props.personId, group: props.group }),
+            aiObservabilitySharedLogic({
+                tabId: props.tabId,
+                logicKey: props.logicKey,
+                personId: props.personId,
+                group: props.group,
+            }),
             ['dateFilter', 'shouldFilterTestAccounts', 'shouldFilterSupportTraces', 'propertyFilters', 'searchQuery'],
             groupsModel,
             ['groupsTaxonomicTypes'],

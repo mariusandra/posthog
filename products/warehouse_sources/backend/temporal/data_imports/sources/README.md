@@ -15,19 +15,21 @@ has one. Optionally set `keywords` (a list of lowercase search aliases, e.g. `["
 alternate spellings users might search.
 
 ```python
-from posthog.schema import DataWarehouseSourceCategory
+from products.warehouse_sources.backend.facade.source_config import DataWarehouseSourceCategory
+from products.warehouse_sources.backend.types import ExternalDataSourceType
 
 return SourceConfig(
-    name=SchemaExternalDataSourceType.STRIPE,
+    name=ExternalDataSourceType.STRIPE,
     category=DataWarehouseSourceCategory.PAYMENTS___BILLING,
     keywords=["billing", "subscriptions"],
     ...
 )
 ```
 
-The category list lives in `frontend/src/queries/schema/schema-general.ts` (`dataWarehouseSourceCategories`);
-`pnpm run schema:build` regenerates the Python enum. See the `implementing-warehouse-sources` skill for the
-full list of buckets and guidance on picking one.
+The category list is backend-owned: `DataWarehouseSourceCategory` in
+`products/warehouse_sources/backend/facade/source_config.py` is the source of truth, and `hogli build:openapi`
+regenerates the frontend type from it. See the `implementing-warehouse-sources` skill for the full list of
+buckets and guidance on picking one.
 
 ## Source fields
 
@@ -35,7 +37,7 @@ The fields shown on the frontend are all backend driven. We have a collection of
 
 The frontend logic for rendering the below fields can be found in `frontend/src/scenes/data-warehouse/external/forms/SourceForm.tsx`.
 
-All of the below are defined in `posthog/schema.py` with a union of them defined as `FieldType` in `products/warehouse_sources/backend/temporal/data_imports/sources/common/base.py`. Check out the other sources for examples of how we implement these.
+All of the below are defined in `products/warehouse_sources/backend/facade/source_config.py` with a union of them defined as `FieldType` in `products/warehouse_sources/backend/temporal/data_imports/sources/common/base.py`. Check out the other sources for examples of how we implement these.
 
 #### `SourceFieldInputConfig`
 
@@ -75,7 +77,7 @@ We have a bunch of examples already in the sources directory of how we build up 
 - It's okay to yield items one at a time if that's how the source logic is handled (excluding pyarrow tables). The pipeline will buffer the incoming items until it has a reasonable amount before running the pipeline over the dataset
 - If you are returning a `pyarrow.Table` object, then please make sure that there is a reasonable limit on how many rows that get held in memory. For most of our sources, we limit this to either 200 MiB or 5,000 rows.
 
-We have some helper methods for returning a `pyarrow.Table` from the source, such as `table_from_iterator()` and `table_from_py_list()` from `products/warehouse_sources/backend/temporal/data_imports/pipelines/pipeline/utils.py`. The pipeline will ultimately convert everything to a `pyarrow.Table` using these methods
+We have some helper methods for returning a `pyarrow.Table` from the source, such as `table_from_iterator()` and `table_from_py_list()` from `products/warehouse_sources/backend/temporal/data_imports/pipelines/core/arrow_utils.py`. The pipeline will ultimately convert everything to a `pyarrow.Table` using these methods
 
 #### `primary_keys`
 
@@ -93,7 +95,10 @@ If you can request how many rows are about to be imported (this is usually more 
 
 #### `has_duplicate_primary_keys`
 
-Also optional, setting this to `True` will stop the pipeline from syncing any data and give the user feedback that they can't sync until they no longer have duplicate primary keys. Again, this is more of a problem with database sources than API backed sources. But, the point of this is to ensure we don't try to merge incremental data with duplicate merge keys as this blows up the memory usage of our pods and kills them with OOM errors.
+Also optional, setting this to `True` will stop the pipeline from syncing any data and give the user feedback that they can't sync until they no longer have duplicate primary keys.
+This is for the case where duplicates signal a likely mistake the user can fix — e.g. a database source fell back to a declared key that turns out not to be unique on the live table, so a merge would silently keep an arbitrary row per key instead of the one the user expects.
+
+Don't set this for a source whose primary key is inherently non-unique by design and isn't user-configurable — e.g. an aggregated report API whose dimensions can collide on blank values (Adjust, AppsFlyer, Clari, Pingdom's alerts endpoint). There's no key the user could pick instead, so blocking the sync leaves it permanently unusable. The pipeline already dedupes a batch on its primary key before merging (keeping the last occurrence), which is exactly the right behavior for that case, so just leave `has_duplicate_primary_keys` unset and let the sync proceed normally.
 
 ### Partitioning
 
@@ -130,9 +135,10 @@ If your source uses OAuth (SourceFieldOauthConfig):
    YOUR_SOURCE_CLIENT_SECRET = get_from_env("YOUR_SOURCE_CLIENT_SECRET", "")
    ```
 
-2. **Integration Kind**: Add your integration to `posthog/models/integration.py`:
+2. **Integration Kind**: Add your integration to the `posthog/models/integration/` package.
+   Its `__init__.py` only re-exports the public surface, so edit the defining modules below.
 
-   **a) Add to `IntegrationKind` enum:**
+   **a) Add to the `IntegrationKind` enum in `model.py`:**
 
    ```python
    class IntegrationKind(models.TextChoices):
@@ -140,7 +146,7 @@ If your source uses OAuth (SourceFieldOauthConfig):
        YOUR_SOURCE = "your-source"
    ```
 
-   **b) Add to `OauthIntegration.supported_kinds` list:**
+   **b) Add to the `OauthIntegration.supported_kinds` list in `oauth.py`:**
 
    ```python
    supported_kinds = [
@@ -149,7 +155,7 @@ If your source uses OAuth (SourceFieldOauthConfig):
    ]
    ```
 
-   **c) Add OAuth config in `oauth_config_for_kind()` method:**
+   **c) Add OAuth config in the `oauth_config_for_kind()` method, also in `oauth.py`:**
 
    ```python
    elif kind == "your-source":
@@ -186,7 +192,7 @@ If your source uses OAuth (SourceFieldOauthConfig):
 
 - "Kind not configured" → Check environment variables are set
 - Source not listed → Verify step 8 (source registration)
-- Frontend errors → Run `pnpm schema:build`
+- Frontend errors → Run `hogli build:openapi`
 
 ## Mixins
 
@@ -194,7 +200,7 @@ We have a handful of mixins available for your source classes. Add these to your
 
 #### `SSHTunnelMixin`
 
-Provides a `with_ssh_tunnel()` context that opens a tunnel to a target and provides you with a host/port to connect to with your source.
+Provides a `with_ssh_tunnel()` context that opens a tunnel to a target and provides you with a host/port to connect to with your source. It checks the SSH host and the database host on every open, not only when the source is created, so a DNS record that changes after setup cannot point a later sync at a private address. The database host is yielded as the hostname, so a client that can dial one address while presenting another name (libpq `host`/`hostaddr`, a pre-opened socket for pymysql) should also pin the addresses it validated, the way the Postgres, Redshift and MySQL clients do.
 
 We also expose a `make_ssh_tunnel_func()` that does the same as the above, but instead returns a function to be passed to open the tunnel at a later time. This is helpful if your source logic doesn't actually live in your source class directly.
 
@@ -204,7 +210,7 @@ Provides a simple `get_oauth_integration()` method to pull the `Integration` obj
 
 #### `ValidateDatabaseHostMixin`
 
-Provides `is_database_host_valid()` to validate that the source isn't trying to access local IP addresses in our internal VPC on AWS (unless if the user is using a SSH tunnel).
+Provides `is_database_host_valid()` to validate that the source isn't trying to access local IP addresses in our internal VPC on AWS (unless if the user is using a SSH tunnel). This runs when a source is created or updated; the connection-time check lives in `with_ssh_tunnel()` above. A source that dials the host itself, without the tunnel mixin, calls `pinned_connect_host()` on its connect path instead. A raw socket has no egress proxy in front of it, so a stored host is otherwise never re-checked. `TemporalIOSource` is the example.
 
 ## Non-Retryable Errors
 

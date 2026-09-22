@@ -1,6 +1,9 @@
 import time
 import datetime as dt
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any, Protocol
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from posthog.schema import (
@@ -18,6 +21,7 @@ from posthog.hogql import ast
 from posthog.hogql.constants import HogQLGlobalSettings, LimitContext
 from posthog.hogql.parser import parse_expr, parse_select
 from posthog.hogql.query import execute_hogql_query
+from posthog.hogql.visitor import CloningVisitor
 
 from posthog.clickhouse.client.connection import Workload
 from posthog.clickhouse.query_tagging import Feature, Product, tag_queries
@@ -26,7 +30,26 @@ from posthog.models import Team
 
 from products.logs.backend.alert_utils import MAX_BYTES_TO_READ
 from products.logs.backend.logs_query_runner import LIVE_LOGS_CHECKPOINT_QUERY, LogsFilterBuilder
-from products.logs.backend.models import LogsAlertConfiguration
+
+
+class AlertQuerySubject(Protocol):
+    """What the query layer needs from an alert.
+
+    A `Protocol` rather than a concrete type so `LogsAlertConfiguration` satisfies it as it
+    stands, and so a caller holding a configuration from elsewhere can build the query without
+    a model instance. The query layer reads no other field: everything about thresholds,
+    windows and cadence is the caller's to resolve before it gets here.
+    """
+
+    # Read-only, so a frozen dataclass satisfies this as readily as the model does.
+    @property
+    def id(self) -> UUID: ...
+
+    @property
+    def team_id(self) -> int: ...
+
+    @property
+    def filters(self) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -41,7 +64,7 @@ class BucketedCount:
     count: int
 
 
-def _build_logs_query(alert: LogsAlertConfiguration, date_range: DateRange) -> LogsQuery:
+def _build_logs_query(alert: AlertQuerySubject, date_range: DateRange) -> LogsQuery:
     filters = alert.filters
     filter_group = filters.get("filterGroup")
     if filter_group:
@@ -53,8 +76,8 @@ def _build_logs_query(alert: LogsAlertConfiguration, date_range: DateRange) -> L
         )
     return LogsQuery(
         dateRange=date_range,
-        serviceNames=filters.get("serviceNames", []),
-        severityLevels=filters.get("severityLevels", []),
+        serviceNames=filters.get("serviceNames") or [],
+        severityLevels=filters.get("severityLevels") or [],
         filterGroup=pg,
         kind="LogsQuery",
     )
@@ -115,7 +138,7 @@ def _tag_alert_query(*, team: Team, alert_config_id: str, source: str) -> None:
 def build_alert_where_expr(
     *,
     team: Team,
-    alert: LogsAlertConfiguration,
+    alert: AlertQuerySubject,
     date_from: dt.datetime,
     date_to: dt.datetime,
 ) -> ast.Expr:
@@ -153,6 +176,24 @@ def build_alert_where_expr(
     )
 
 
+class _StripIndexHints(CloningVisitor):
+    """Return a copy of the expression with indexHint(...) calls replaced by true.
+
+    indexHint always evaluates to 1; it exists only so index analysis sees the
+    wrapped expression. See `BatchedAlertCheckQuery.__init__` for why the
+    hoisted predicate copies must not carry it.
+    """
+
+    def visit_call(self, node: ast.Call) -> ast.Expr:
+        if node.name == "indexHint":
+            return ast.Constant(value=True)
+        return super().visit_call(node)
+
+
+def _strip_index_hints(expr: ast.Expr) -> ast.Expr:
+    return _StripIndexHints().visit(expr)
+
+
 class AlertCheckQuery:
     """Lightweight count query against the logs ClickHouse cluster for alert checks.
 
@@ -175,7 +216,7 @@ class AlertCheckQuery:
         self,
         *,
         team: Team,
-        alert: LogsAlertConfiguration,
+        alert: AlertQuerySubject,
         date_from: dt.datetime,
         date_to: dt.datetime,
     ) -> None:
@@ -329,6 +370,10 @@ class BatchedAlertCheckQuery:
     scan, not by the predicate count. See
     [tmp/logs-alerting/per-team-batching-test.sql](../../../tmp/logs-alerting/per-team-batching-test.sql)
     for cost validation.
+
+    The outer WHERE also carries the OR of all per-alert predicates, so rows
+    matching no alert are pruned via the primary key and skip indexes before
+    any countIf column is evaluated.
     """
 
     SETTINGS = AlertCheckQuery.SETTINGS
@@ -337,10 +382,11 @@ class BatchedAlertCheckQuery:
         self,
         *,
         team: Team,
-        alerts: list[LogsAlertConfiguration],
+        alerts: Sequence[AlertQuerySubject],
         date_from: dt.datetime,
         date_to: dt.datetime,
         projection_eligible: bool | None = None,
+        max_execution_time: int | None = None,
     ) -> None:
         if not alerts:
             raise ValueError("BatchedAlertCheckQuery requires at least one alert")
@@ -350,6 +396,16 @@ class BatchedAlertCheckQuery:
         self.alerts = list(alerts)
         self.date_from = date_from
         self.date_to = date_to
+        # A caller that runs several of these inside one deadline needs each query to end before
+        # the deadline does. Throw rather than break: a partial count could resolve an alert that
+        # is actually breaching, and the caller already handles a failed cohort.
+        self._settings = (
+            self.SETTINGS
+            if max_execution_time is None
+            else self.SETTINGS.model_copy(
+                update={"max_execution_time": max_execution_time, "timeout_overflow_mode": "throw"}
+            )
+        )
         self._alert_where_exprs: list[ast.Expr] = [
             build_alert_where_expr(team=team, alert=alert, date_from=date_from, date_to=date_to)
             for alert in self.alerts
@@ -362,10 +418,16 @@ class BatchedAlertCheckQuery:
             else all(is_projection_eligible(a.filters) for a in self.alerts)
         )
 
-        # Outer WHERE owns the time-based pruning so CH can skip parts/granules
-        # before evaluating any countIf. Per-alert exprs include redundant
-        # time/timestamp clauses inside countIf — harmless but worth noting if
-        # you're reading EXPLAIN output and counting predicate evaluations.
+        # Outer WHERE owns the pruning so CH can skip parts/granules before
+        # evaluating any countIf: the time bounds, plus the OR of every alert's
+        # predicate. The disjunction is
+        # result-equivalent because a row matching no alert's predicate
+        # contributes to no countIf, but it lets CH prune with the primary key
+        # (service_name) and the attributes bloom-filter skip indexes, which
+        # cannot see predicates inside countIf. Per-alert exprs therefore appear
+        # redundantly both here and inside their countIf, which is deliberate
+        # and worth remembering when reading EXPLAIN output and counting
+        # predicate evaluations.
         self._outer_where = parse_expr(
             "toStartOfDay(time_bucket) >= toStartOfDay({date_from})"
             " AND toStartOfDay(time_bucket) <= toStartOfDay({date_to})"
@@ -376,6 +438,20 @@ class BatchedAlertCheckQuery:
                 "date_to": ast.Constant(value=date_to),
             },
         )
+        # The hoisted copies must differ from the countIf copies in two ways.
+        # They must be fresh instances, because the resolver annotates nodes
+        # in place and sharing one instance at two positions in the query
+        # tree is an aliasing hazard. And they must not carry indexHint(...)
+        # wrappers: ClickHouse dedupes an expression that appears in both
+        # the WHERE clause and a countIf argument, and when that shared
+        # expression contains indexHint the filter step constant-folds one
+        # use but not the other and the query fails with ILLEGAL_COLUMN
+        # ("non constant in source stream but must be constant in result").
+        # Dropping the hint loses nothing here: the real predicate sits in
+        # the WHERE clause where the planner can use it directly.
+        hoisted_exprs = [_strip_index_hints(e) for e in self._alert_where_exprs]
+        hoisted = hoisted_exprs[0] if len(hoisted_exprs) == 1 else ast.Or(exprs=hoisted_exprs)
+        self._outer_where = ast.And(exprs=[self._outer_where, hoisted])
 
     def execute_bucketed(self, interval_minutes: int, *, limit: int = 10_000) -> BatchedBucketedResult:
         """Run the batched query and split results back per-alert.
@@ -386,37 +462,7 @@ class BatchedAlertCheckQuery:
         """
         self._tag()
 
-        time_field = (
-            ast.Call(name="toStartOfMinute", args=[ast.Field(chain=["timestamp"])])
-            if self._all_projection_eligible
-            else ast.Field(chain=["timestamp"])
-        )
-
-        select_columns: list[ast.Expr] = [
-            ast.Alias(
-                alias="bucket",
-                expr=ast.Call(
-                    name="toStartOfInterval",
-                    args=[time_field, ast.Call(name="toIntervalMinute", args=[ast.Constant(value=interval_minutes)])],
-                ),
-            ),
-        ]
-        for i, alert_expr in enumerate(self._alert_where_exprs):
-            select_columns.append(
-                ast.Alias(
-                    alias=f"alert_{i}",
-                    expr=ast.Call(name="countIf", args=[alert_expr]),
-                )
-            )
-
-        query = ast.SelectQuery(
-            select=select_columns,
-            select_from=ast.JoinExpr(table=ast.Field(chain=["logs"])),
-            where=self._outer_where,
-            group_by=[ast.Field(chain=["bucket"])],
-            order_by=[ast.OrderExpr(expr=ast.Field(chain=["bucket"]), order="ASC")],
-            limit=ast.Constant(value=limit),
-        )
+        query = self._build_bucketed_query(interval_minutes, limit)
 
         start_ms = time.monotonic_ns() // 1_000_000
         response = self._run_query(query)
@@ -448,23 +494,7 @@ class BatchedAlertCheckQuery:
         return self._execute_count_per_range(ranges)
 
     def _execute_count_per_range(self, ranges: list[tuple[dt.datetime, dt.datetime]]) -> BatchedBucketedResult:
-        select_columns: list[ast.Expr] = [
-            ast.Alias(
-                alias=f"alert_{alert_i}_period_{period_i}",
-                expr=ast.Call(
-                    name="countIf",
-                    args=[ast.And(exprs=[alert_expr, _timestamp_in_range(start, end)])],
-                ),
-            )
-            for alert_i, alert_expr in enumerate(self._alert_where_exprs)
-            for period_i, (start, end) in enumerate(ranges)
-        ]
-
-        query = ast.SelectQuery(
-            select=select_columns,
-            select_from=ast.JoinExpr(table=ast.Field(chain=["logs"])),
-            where=self._outer_where,
-        )
+        query = self._build_count_per_range_query(ranges)
 
         start_ms = time.monotonic_ns() // 1_000_000
         response = self._run_query(query)
@@ -482,13 +512,65 @@ class BatchedAlertCheckQuery:
             ]
         return BatchedBucketedResult(per_alert=per_alert, query_duration_ms=duration_ms)
 
+    def _build_bucketed_query(self, interval_minutes: int, limit: int) -> ast.SelectQuery:
+        time_field = (
+            ast.Call(name="toStartOfMinute", args=[ast.Field(chain=["timestamp"])])
+            if self._all_projection_eligible
+            else ast.Field(chain=["timestamp"])
+        )
+
+        select_columns: list[ast.Expr] = [
+            ast.Alias(
+                alias="bucket",
+                expr=ast.Call(
+                    name="toStartOfInterval",
+                    args=[time_field, ast.Call(name="toIntervalMinute", args=[ast.Constant(value=interval_minutes)])],
+                ),
+            ),
+        ]
+        for i, alert_expr in enumerate(self._alert_where_exprs):
+            select_columns.append(
+                ast.Alias(
+                    alias=f"alert_{i}",
+                    expr=ast.Call(name="countIf", args=[alert_expr]),
+                )
+            )
+
+        return ast.SelectQuery(
+            select=select_columns,
+            select_from=ast.JoinExpr(table=ast.Field(chain=["logs"])),
+            where=self._outer_where,
+            group_by=[ast.Field(chain=["bucket"])],
+            order_by=[ast.OrderExpr(expr=ast.Field(chain=["bucket"]), order="ASC")],
+            limit=ast.Constant(value=limit),
+        )
+
+    def _build_count_per_range_query(self, ranges: list[tuple[dt.datetime, dt.datetime]]) -> ast.SelectQuery:
+        select_columns: list[ast.Expr] = [
+            ast.Alias(
+                alias=f"alert_{alert_i}_period_{period_i}",
+                expr=ast.Call(
+                    name="countIf",
+                    args=[ast.And(exprs=[alert_expr, _timestamp_in_range(start, end)])],
+                ),
+            )
+            for alert_i, alert_expr in enumerate(self._alert_where_exprs)
+            for period_i, (start, end) in enumerate(ranges)
+        ]
+
+        return ast.SelectQuery(
+            select=select_columns,
+            select_from=ast.JoinExpr(table=ast.Field(chain=["logs"])),
+            where=self._outer_where,
+        )
+
     def _run_query(self, query: ast.SelectQuery) -> HogQLQueryResponse:
         return execute_hogql_query(
             query_type="alert_check",
             query=query,
             team=self.team,
             workload=Workload.LOGS,
-            settings=self.SETTINGS,
+            settings=self._settings,
             limit_context=LimitContext.QUERY,
             modifiers=HogQLQueryModifiers(convertToProjectTimezone=False),
         )

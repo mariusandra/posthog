@@ -10,14 +10,23 @@ from parameterized import parameterized
 from requests import Response
 
 from products.warehouse_sources.backend.temporal.data_imports.sources.cal_com.cal_com import (
-    CAL_COM_BASE_URL,
     CalComResumeConfig,
     cal_com_source,
+    check_organization_access,
+    resolve_organization_id,
     validate_credentials,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.cal_com.settings import (
+    BOOKING_ATTENDEES_ENDPOINT,
     CAL_COM_ENDPOINTS,
+    CAL_COM_HOSTS,
     ENDPOINTS,
+)
+
+US_BASE_URL = CAL_COM_HOSTS["us"]
+ORG_ID = 77
+REJECTED_MESSAGE = (
+    "Cal.com rejected this API key. Check the key, and check that the selected region matches your Cal.com account."
 )
 
 # RESTClient builds its session via make_tracked_session in the rest_client module.
@@ -32,7 +41,7 @@ def _response(body: Any, status_code: int = 200, url: str | None = None, reason:
     resp = Response()
     resp.status_code = status_code
     resp.reason = reason
-    resp.url = url or f"{CAL_COM_BASE_URL}/bookings"
+    resp.url = url or f"{US_BASE_URL}/bookings"
     resp._content = json.dumps(body).encode()
     return resp
 
@@ -300,14 +309,42 @@ class TestErrorHandling:
         session = MockSession.return_value
         _wire(
             session,
-            [_response({}, status_code=status, url=f"{CAL_COM_BASE_URL}/bookings?limit=100", reason=reason)],
+            [_response({}, status_code=status, url=f"{US_BASE_URL}/bookings?limit=100", reason=reason)],
         )
 
         with pytest.raises(requests.HTTPError) as exc_info:
             _rows(_source("bookings"))
 
         # The base URL must be in the message so `get_non_retryable_errors()` can match on it.
-        assert f"{status} Client Error: {reason} for url: {CAL_COM_BASE_URL}/bookings" in str(exc_info.value)
+        assert f"{status} Client Error: {reason} for url: {US_BASE_URL}/bookings" in str(exc_info.value)
+
+
+class TestRegionHost:
+    @parameterized.expand(
+        [
+            ("us", "us", "https://api.cal.com/v2/bookings"),
+            ("eu", "eu", "https://api.cal.eu/v2/bookings"),
+            # An account created before the region field existed has no stored value.
+            ("unset", None, "https://api.cal.com/v2/bookings"),
+        ]
+    )
+    @mock.patch(CLIENT_SESSION_PATCH)
+    def test_region_selects_the_api_host(self, _name: str, region: str | None, expected_url: str, MockSession) -> None:
+        session = MockSession.return_value
+        requested_urls: list[str] = []
+
+        def _prepare(request: Any) -> mock.MagicMock:
+            requested_urls.append(request.url)
+            return mock.MagicMock()
+
+        session.headers = {}
+        session.prepare_request.side_effect = _prepare
+        session.send.side_effect = [_page([{"id": 1}], next_cursor=None, has_more=False)]
+
+        kwargs: dict[str, Any] = {} if region is None else {"region": region}
+        _rows(_source("bookings", **kwargs))
+
+        assert requested_urls == [expected_url]
 
 
 class TestValidateCredentials:
@@ -322,8 +359,8 @@ class TestValidateCredentials:
     @parameterized.expand(
         [
             ("ok", 200, True, None),
-            ("unauthorized", 401, False, "Invalid Cal.com API key"),
-            ("forbidden", 403, False, "Invalid Cal.com API key"),
+            ("unauthorized", 401, False, REJECTED_MESSAGE),
+            ("forbidden", 403, False, REJECTED_MESSAGE),
             ("server_error", 500, False, "Cal.com returned HTTP 500"),
         ]
     )
@@ -337,15 +374,29 @@ class TestValidateCredentials:
         with mock.patch(CAL_COM_SESSION_PATCH, return_value=session):
             assert validate_credentials("cal_live_key") == (False, "Could not connect to Cal.com")
 
+    @parameterized.expand(
+        [
+            ("us", "us", "https://api.cal.com/v2/me"),
+            ("eu", "eu", "https://api.cal.eu/v2/me"),
+        ]
+    )
+    def test_probes_the_host_for_the_selected_region(self, _name: str, region: str, expected_url: str) -> None:
+        # An EU key probed against the US host comes back 401, which reads as a bad key.
+        session = self._session(mock.MagicMock(status_code=200))
+        with mock.patch(CAL_COM_SESSION_PATCH, return_value=session):
+            assert validate_credentials("cal_live_key", region) == (True, None)
+
+        assert session.get.call_args.args[0] == expected_url
+
 
 class TestCalComSourceResponse:
     @parameterized.expand([(e,) for e in ENDPOINTS])
     @mock.patch(CLIENT_SESSION_PATCH)
-    def test_source_response_shape(self, endpoint: str, MockSession) -> None:
+    def test_every_endpoint_builds_a_response_named_after_its_schema(self, endpoint: str, MockSession) -> None:
+        # The name is the Delta subdirectory: a wrong one writes where nothing reads.
         MockSession.return_value.headers = {}
-        response = _source(endpoint)
+        response = _source(endpoint, organization_id=ORG_ID)
         assert response.name == endpoint
-        assert response.primary_keys == ["id"]
 
     @mock.patch(CLIENT_SESSION_PATCH)
     def test_bookings_partitions_on_stable_created_at(self, MockSession) -> None:
@@ -356,10 +407,314 @@ class TestCalComSourceResponse:
         # Bookings arrive newest-first, so the watermark must only commit after a complete sync.
         assert response.sort_mode == "desc"
 
-    @parameterized.expand([(e,) for e in ENDPOINTS if e != "bookings"])
+    def test_partition_keys_are_creation_timestamps(self) -> None:
+        # Partitioning on an updated-at style field rewrites every partition on every sync.
+        keys = [config.partition_key for config in CAL_COM_ENDPOINTS.values() if config.partition_key]
+        assert [key for key in keys if "updated" in key.lower()] == []
+
+    def test_fanned_out_endpoints_key_on_their_parent_too(self) -> None:
+        # A key unique only within one parent seeds duplicates every later merge multi-matches.
+        children = [name for name, config in CAL_COM_ENDPOINTS.items() if config.fanout] + [BOOKING_ATTENDEES_ENDPOINT]
+        assert [name for name in children if len(CAL_COM_ENDPOINTS[name].primary_keys) < 2] == []
+
+
+class TestOrganizationEndpoints:
+    @parameterized.expand(
+        [
+            ("organization_memberships", f"{US_BASE_URL}/organizations/{ORG_ID}/memberships"),
+            ("organization_users", f"{US_BASE_URL}/organizations/{ORG_ID}/users"),
+            ("routing_forms", f"{US_BASE_URL}/organizations/{ORG_ID}/routing-forms"),
+        ]
+    )
     @mock.patch(CLIENT_SESSION_PATCH)
-    def test_full_refresh_endpoints_do_not_partition(self, endpoint: str, MockSession) -> None:
-        MockSession.return_value.headers = {}
-        response = _source(endpoint)
-        assert response.partition_mode is None
-        assert response.sort_mode == "asc"
+    def test_resolved_org_id_replaces_the_path_placeholder(self, endpoint: str, expected_url: str, MockSession) -> None:
+        session = MockSession.return_value
+        requested_urls: list[str] = []
+
+        def _prepare(request: Any) -> mock.MagicMock:
+            requested_urls.append(request.url)
+            return mock.MagicMock()
+
+        session.headers = {}
+        session.prepare_request.side_effect = _prepare
+        session.send.side_effect = [_response({"data": [{"id": 1}]})]
+
+        assert _rows(_source(endpoint, organization_id=ORG_ID)) == [{"id": 1}]
+        assert requested_urls == [expected_url]
+
+    @parameterized.expand(
+        [
+            ("organization_memberships",),
+            ("organization_users",),
+            ("routing_forms",),
+            # Reached through an organization-scoped parent rather than its own path.
+            ("routing_form_responses",),
+        ]
+    )
+    def test_organization_tables_refuse_to_sync_without_one(self, endpoint: str) -> None:
+        with pytest.raises(ValueError, match="not in a Cal.com organization"):
+            _source(endpoint)
+
+    @mock.patch(CLIENT_SESSION_PATCH)
+    def test_org_listings_walk_skip_and_take(self, MockSession) -> None:
+        session = MockSession.return_value
+        page_size = CAL_COM_ENDPOINTS["organization_users"].page_size
+        full_page = [{"id": i} for i in range(page_size)]
+        params = _wire(session, [_response({"data": full_page}), _response({"data": [{"id": "last"}]})])
+
+        rows = _rows(_source("organization_users", organization_id=ORG_ID))
+
+        assert len(rows) == page_size + 1
+        assert [p["skip"] for p in params] == [0, page_size]
+        assert params[0]["take"] == page_size
+
+    @mock.patch(CLIENT_SESSION_PATCH)
+    def test_routing_forms_sort_matches_the_chosen_cursor(self, MockSession) -> None:
+        # A sort that disagrees with the cursor corrupts the watermark.
+        session = MockSession.return_value
+        params = _wire(session, [_response({"data": [{"id": "f1"}]})])
+
+        _rows(
+            _source(
+                "routing_forms",
+                organization_id=ORG_ID,
+                should_use_incremental_field=True,
+                db_incremental_field_last_value=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+                incremental_field="updatedAt",
+            )
+        )
+
+        assert params[0]["sortUpdatedAt"] == "asc"
+        assert params[0]["afterUpdatedAt"] == "2026-01-02T03:04:05.000Z"
+
+    @mock.patch(CLIENT_SESSION_PATCH)
+    def test_routing_forms_sort_by_creation_on_a_full_refresh(self, MockSession) -> None:
+        session = MockSession.return_value
+        params = _wire(session, [_response({"data": [{"id": "f1"}]})])
+
+        _rows(_source("routing_forms", organization_id=ORG_ID))
+
+        assert params[0]["sortCreatedAt"] == "asc"
+        assert "afterCreatedAt" not in params[0]
+
+
+class TestFanoutEndpoints:
+    @mock.patch(CLIENT_SESSION_PATCH)
+    def test_team_memberships_fetch_once_per_team(self, MockSession) -> None:
+        session = MockSession.return_value
+        requested_urls: list[str] = []
+
+        def _prepare(request: Any) -> mock.MagicMock:
+            requested_urls.append(request.url)
+            return mock.MagicMock()
+
+        session.headers = {}
+        session.prepare_request.side_effect = _prepare
+        session.send.side_effect = [
+            _response({"data": [{"id": 10}, {"id": 11}]}),
+            _response({"data": [{"id": 1, "teamId": 10}]}),
+            _response({"data": [{"id": 2, "teamId": 11}]}),
+        ]
+
+        rows = _rows(_source("team_memberships"))
+
+        assert rows == [{"id": 1, "teamId": 10}, {"id": 2, "teamId": 11}]
+        assert requested_urls == [
+            f"{US_BASE_URL}/teams",
+            f"{US_BASE_URL}/teams/10/memberships",
+            f"{US_BASE_URL}/teams/11/memberships",
+        ]
+
+    @mock.patch(CLIENT_SESSION_PATCH)
+    def test_a_team_removed_mid_sync_does_not_fail_the_run(self, MockSession) -> None:
+        session = MockSession.return_value
+        _wire(
+            session,
+            [
+                _response({"data": [{"id": 10}, {"id": 11}]}),
+                _response({}, status_code=404, reason="Not Found"),
+                _response({"data": [{"id": 2, "teamId": 11}]}),
+            ],
+        )
+
+        assert _rows(_source("team_memberships")) == [{"id": 2, "teamId": 11}]
+
+    @mock.patch(CLIENT_SESSION_PATCH)
+    def test_routing_form_responses_filter_each_form_at_the_watermark(self, MockSession) -> None:
+        session = MockSession.return_value
+        params = _wire(
+            session,
+            [
+                _response({"data": [{"id": "f1"}]}),
+                _response({"data": [{"id": 1, "formId": "f1"}]}),
+            ],
+        )
+
+        rows = _rows(
+            _source(
+                "routing_form_responses",
+                organization_id=ORG_ID,
+                should_use_incremental_field=True,
+                db_incremental_field_last_value=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+                incremental_field="createdAt",
+            )
+        )
+
+        assert rows == [{"id": 1, "formId": "f1"}]
+        # The parent listing takes no watermark of its own; only the child is windowed.
+        assert params[1]["afterCreatedAt"] == "2026-01-02T03:04:05.000Z"
+        assert params[1]["sortCreatedAt"] == "asc"
+
+
+class TestBookingAttendees:
+    BOOKING = {"uid": "bk1", "createdAt": "2026-01-01T00:00:00.000Z", "updatedAt": "2026-01-05T00:00:00.000Z"}
+
+    def _attendee_session(self, *responses: Response) -> mock.MagicMock:
+        session = mock.MagicMock()
+        session.get.side_effect = list(responses)
+        return session
+
+    @mock.patch(CLIENT_SESSION_PATCH)
+    @mock.patch(CAL_COM_SESSION_PATCH)
+    def test_attendee_rows_carry_the_booking_they_belong_to(self, MockCalSession, MockClientSession) -> None:
+        # Without these the table cannot be joined to bookings or synced incrementally.
+        _wire(MockClientSession.return_value, [_page([self.BOOKING])])
+        MockCalSession.return_value = self._attendee_session(
+            _response({"data": [{"id": 5, "email": "guest@example.com", "absent": True}]})
+        )
+
+        rows = _rows(_source(BOOKING_ATTENDEES_ENDPOINT))
+
+        assert rows == [
+            {
+                "id": 5,
+                "email": "guest@example.com",
+                "absent": True,
+                "bookingUid": "bk1",
+                "bookingCreatedAt": "2026-01-01T00:00:00.000Z",
+                "bookingUpdatedAt": "2026-01-05T00:00:00.000Z",
+            }
+        ]
+
+    @mock.patch(CLIENT_SESSION_PATCH)
+    @mock.patch(CAL_COM_SESSION_PATCH)
+    def test_each_hop_sends_the_version_that_endpoint_requires(self, MockCalSession, MockClientSession) -> None:
+        # Attendees 404 without 2024-08-13; the bookings listing needs 2026-05-01.
+        client_session = MockClientSession.return_value
+        _wire(client_session, [_page([self.BOOKING])])
+        attendee_session = self._attendee_session(_response({"data": []}))
+        MockCalSession.return_value = attendee_session
+
+        _rows(_source(BOOKING_ATTENDEES_ENDPOINT))
+
+        assert client_session.headers["cal-api-version"] == "2026-05-01"
+        assert attendee_session.get.call_args.kwargs["headers"]["cal-api-version"] == "2024-08-13"
+        assert attendee_session.get.call_args.args[0] == f"{US_BASE_URL}/bookings/bk1/attendees"
+
+    @mock.patch(CLIENT_SESSION_PATCH)
+    @mock.patch(CAL_COM_SESSION_PATCH)
+    def test_a_booking_removed_mid_sync_does_not_fail_the_run(self, MockCalSession, MockClientSession) -> None:
+        _wire(MockClientSession.return_value, [_page([self.BOOKING, {**self.BOOKING, "uid": "bk2"}])])
+        MockCalSession.return_value = self._attendee_session(
+            _response({}, status_code=404, reason="Not Found"),
+            _response({"data": [{"id": 6}]}),
+        )
+
+        assert [row["bookingUid"] for row in _rows(_source(BOOKING_ATTENDEES_ENDPOINT))] == ["bk2"]
+
+    @mock.patch(CLIENT_SESSION_PATCH)
+    @mock.patch(CAL_COM_SESSION_PATCH)
+    def test_incremental_sync_bounds_the_bookings_walk(self, MockCalSession, MockClientSession) -> None:
+        # Without the window every sync re-reads every booking's attendees, one request each.
+        params = _wire(MockClientSession.return_value, [_page([self.BOOKING])])
+        MockCalSession.return_value = self._attendee_session(_response({"data": [{"id": 5}]}))
+
+        _rows(
+            _source(
+                BOOKING_ATTENDEES_ENDPOINT,
+                should_use_incremental_field=True,
+                db_incremental_field_last_value=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+                incremental_field="bookingUpdatedAt",
+            )
+        )
+
+        assert params[0]["afterUpdatedAt"] == "2026-01-02T03:04:05.000Z"
+
+    @mock.patch(CLIENT_SESSION_PATCH)
+    @mock.patch(CAL_COM_SESSION_PATCH)
+    def test_resumes_at_the_bookings_page_it_stopped_on(self, MockCalSession, MockClientSession) -> None:
+        params = _wire(MockClientSession.return_value, [_page([self.BOOKING])])
+        MockCalSession.return_value = self._attendee_session(_response({"data": [{"id": 5}]}))
+
+        manager = _make_manager(CalComResumeConfig(cursor="c2"))
+        _rows(_source(BOOKING_ATTENDEES_ENDPOINT, manager))
+
+        assert params[0]["cursor"] == "c2"
+
+    @mock.patch(CLIENT_SESSION_PATCH)
+    @mock.patch(CAL_COM_SESSION_PATCH)
+    def test_checkpoints_only_after_a_pages_attendees_are_yielded(self, MockCalSession, MockClientSession) -> None:
+        # Saving before the fan-out would skip a page's attendees entirely after a crash.
+        _wire(
+            MockClientSession.return_value,
+            [_page([self.BOOKING], next_cursor="c2", has_more=True), _page([{**self.BOOKING, "uid": "bk2"}])],
+        )
+        MockCalSession.return_value = self._attendee_session(
+            _response({"data": [{"id": 5}]}),
+            _response({"data": [{"id": 6}]}),
+        )
+
+        manager = _make_manager()
+        saved_at: list[list[str]] = []
+        yielded: list[str] = []
+        manager.save_state.side_effect = lambda state: saved_at.append(list(yielded))
+
+        for page in _source(BOOKING_ATTENDEES_ENDPOINT, manager).items():
+            yielded.extend(row["bookingUid"] for row in page)
+
+        assert saved_at == [["bk1"]]
+
+    @mock.patch(CLIENT_SESSION_PATCH)
+    @mock.patch(CAL_COM_SESSION_PATCH)
+    def test_unexpected_payload_shape_fails_loudly(self, MockCalSession, MockClientSession) -> None:
+        _wire(MockClientSession.return_value, [_page([self.BOOKING])])
+        MockCalSession.return_value = self._attendee_session(_response({"status": "success"}))
+
+        with pytest.raises(ValueError, match="matched nothing"):
+            _rows(_source(BOOKING_ATTENDEES_ENDPOINT))
+
+
+class TestOrganizationLookup:
+    def _session(self, response: Any) -> mock.MagicMock:
+        session = mock.MagicMock()
+        session.get.return_value = response
+        return session
+
+    @parameterized.expand(
+        [
+            ("in_an_organization", {"id": 1, "organizationId": 77}, 77),
+            ("personal_account", {"id": 1}, None),
+            ("explicit_null", {"id": 1, "organizationId": None}, None),
+        ]
+    )
+    def test_organization_id_comes_from_the_keys_own_profile(
+        self, _name: str, profile: dict[str, Any], expected: int | None
+    ) -> None:
+        session = self._session(_response({"data": profile}))
+        with mock.patch(CAL_COM_SESSION_PATCH, return_value=session):
+            assert resolve_organization_id("cal_live_key") == expected
+
+    @parameterized.expand(
+        [
+            ("admin", 200, None),
+            # A plain org member gets a valid-key 403; the fix is a different key, not a retry.
+            ("member", 403, "organization member without admin access"),
+        ]
+    )
+    def test_organization_access_probe(self, _name: str, status: int, expected: str | None) -> None:
+        session = self._session(mock.MagicMock(status_code=status))
+        with mock.patch(CAL_COM_SESSION_PATCH, return_value=session):
+            reason = check_organization_access("cal_live_key", ORG_ID)
+
+        assert (reason is None) if expected is None else (expected in (reason or ""))
+        assert session.get.call_args.args[0] == f"{US_BASE_URL}/organizations/{ORG_ID}/memberships"

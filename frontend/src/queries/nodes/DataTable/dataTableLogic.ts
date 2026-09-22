@@ -134,7 +134,11 @@ export interface dataTableLogicMeta {
     key: string
     __keaTypeGenInternalSelectorTypes: {
         context: (arg: any) => any
-        expandedRows: (expandedRowsFor: (tabId: string | undefined, vizKey: string) => number[], arg: any) => number[]
+        expandedRows: (
+            expandedRowsFor: (tabId: string | undefined, vizKey: string) => number[], // tabUiStateLogic
+            arg: any,
+            arg2: any
+        ) => number[]
         sourceKind: (query: DataTableNode) => NodeKind | null
         sourceFeatures: (query: DataTableNode, arg: any) => Set<QueryFeature>
         orderBy: (query: DataTableNode, sourceFeatures: Set<QueryFeature>) => string[] | null

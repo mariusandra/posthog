@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -20,6 +14,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.mux import MuxSourceConfig
 from products.warehouse_sources.backend.temporal.data_imports.sources.mux.mux import (
     DEFAULT_VALIDATION_PATH,
@@ -49,7 +44,7 @@ class MuxSource(ResumableSource[MuxSourceConfig, MuxResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.MUX,
+            name=ExternalDataSourceType.MUX,
             category=DataWarehouseSourceCategory.ANALYTICS,
             label="Mux",
             releaseStatus=ReleaseStatus.ALPHA,
@@ -101,6 +96,16 @@ Grant the following read permissions:
             # fixed by retrying. Match the stable status text and base host, not the per-request path.
             "401 Client Error: Unauthorized for url: https://api.mux.com": "Your Mux access token is invalid or has been revoked. Create a new access token in your Mux dashboard, then reconnect.",
             "403 Client Error: Forbidden for url: https://api.mux.com": "Your Mux access token is missing the read permissions needed to sync this data. Grant Mux Video, Mux Data and Mux System read access, then reconnect.",
+            # A Mux Data endpoint returns a 400 with `type: invalid_timeframe` when the requested
+            # `timeframe[]` window reaches past the history the account keeps. Mux Data retention
+            # depends on the plan, so the same window can succeed for one account and be rejected by
+            # another; the request never becomes valid on retry. The REST engine appends the Mux error
+            # `type` to the message as `code=invalid_timeframe`, so match that.
+            "code=invalid_timeframe": (
+                "Mux rejected the time range this sync requested as invalid. This usually means the range "
+                "reaches further back than your Mux plan keeps. Check your Mux Data retention window, or "
+                "contact PostHog support if this keeps happening."
+            ),
         }
 
     def get_schemas(

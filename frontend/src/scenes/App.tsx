@@ -7,7 +7,6 @@ import { Slide, ToastContainer } from 'react-toastify'
 import { PostHogProvider } from '@posthog/react'
 
 import { DesktopLinkContextMenu } from 'lib/components/DesktopLinkContextMenu/DesktopLinkContextMenu'
-import { ProductEmptyStateGate } from 'lib/components/ProductEmptyState/ProductEmptyStateGate'
 import { productSetupPreloadLogic } from 'lib/components/ProductEmptyState/productSetupPreloadLogic'
 import { MOCK_NODE_PROCESS } from 'lib/constants'
 import { useCancelAnimationsOnUnmount } from 'lib/hooks/useCancelAnimationsOnUnmount'
@@ -18,18 +17,30 @@ import { autofillReleaseLogic } from 'lib/memory/autofillReleaseLogic'
 import { OAuthCallback } from 'lib/oauth/OAuthCallback'
 import { oauthLogic } from 'lib/oauth/oauthLogic'
 import { isDesktopApp } from 'lib/utils/isDesktopApp'
-import { retryImport } from 'lib/utils/retryImport'
+import { retryImport, lazyWithRetry } from 'lib/utils/retryImport'
 import { appLogic } from 'scenes/appLogic'
 import { appScenes } from 'scenes/appScenes'
 import { sceneLogic } from 'scenes/sceneLogic'
 import { userLogic } from 'scenes/userLogic'
 
+import { AppLoadError } from '~/layout/AppLoadError'
 import { ErrorBoundary } from '~/layout/ErrorBoundary'
 import { themeLogic } from '~/layout/navigation-3000/themeLogic'
 
+import { AuthenticatedShellFallback } from './AuthenticatedShellFallback'
 import { ChunkLoadErrorBoundary } from './ChunkLoadErrorBoundary'
 
 const AuthenticatedShell = React.lazy(() => retryImport(() => import('./AuthenticatedShell')))
+
+// Lazy for the same reason as AuthenticatedShell: the gate renders SceneTitleSection, whose static
+// graph is most of the authenticated navigation. Importing it here put ~3.7 MiB of logged-in UI on
+// the boot path that /login and /signup preload. Its dependencies already ship with the shell, so
+// for logged-in users this chunk is small and is prefetched alongside the shell below.
+const ProductEmptyStateGate = lazyWithRetry(() =>
+    import('lib/components/ProductEmptyState/ProductEmptyStateGate').then((m) => ({
+        default: m.ProductEmptyStateGate,
+    }))
+)
 
 window.process = MOCK_NODE_PROCESS
 
@@ -126,13 +137,8 @@ export function App(): JSX.Element | null {
 
 function AppScene(): JSX.Element | null {
     const { user } = useValues(userLogic)
-    const {
-        activeSceneId,
-        activeExportedScene,
-        activeSceneComponentParamsWithTabId,
-        activeSceneLogicPropsWithTabId,
-        sceneConfig,
-    } = useValues(sceneLogic)
+    const { activeSceneId, activeExportedScene, activeSceneComponentParams, activeSceneLogicProps, sceneConfig } =
+        useValues(sceneLogic)
     const { showingDelayedSpinner } = useValues(appLogic)
     const { isDarkModeOn } = useValues(themeLogic)
 
@@ -148,7 +154,10 @@ function AppScene(): JSX.Element | null {
                 ? window.requestIdleCallback.bind(window)
                 : (cb: () => void) => setTimeout(cb, 200)
         idle(() => {
-            void import('./AuthenticatedShell').catch(() => {
+            void Promise.all([
+                import('./AuthenticatedShell'),
+                import('lib/components/ProductEmptyState/ProductEmptyStateGate'),
+            ]).catch(() => {
                 /* prefetch is best-effort; the real Suspense load will surface failures */
             })
         })
@@ -167,18 +176,22 @@ function AppScene(): JSX.Element | null {
     let sceneElement: JSX.Element
     if (activeExportedScene?.component) {
         const { component: SceneComponent, emptyState } = activeExportedScene
-        const sceneNode = <SceneComponent user={user} {...activeSceneComponentParamsWithTabId} />
+        const sceneNode = <SceneComponent user={user} {...activeSceneComponentParams} />
 
         // Scenes that declare an empty state are gated behind the product's
         // setup screen until the product has data (or the user skips).
         const resolvedNode = emptyState ? (
-            <ProductEmptyStateGate emptyState={emptyState}>{sceneNode}</ProductEmptyStateGate>
+            <Suspense fallback={<SpinnerOverlay sceneLevel visible={showingDelayedSpinner} />}>
+                <ProductEmptyStateGate emptyState={emptyState} params={activeSceneComponentParams}>
+                    {sceneNode}
+                </ProductEmptyStateGate>
+            </Suspense>
         ) : (
             sceneNode
         )
 
         sceneElement = (
-            <SceneAnimationRoot key={`scene-${activeSceneId}-${activeSceneLogicPropsWithTabId.tabId}`}>
+            <SceneAnimationRoot key={`scene-${activeSceneId}-${activeSceneLogicProps.tabId}`}>
                 {resolvedNode}
             </SceneAnimationRoot>
         )
@@ -188,9 +201,9 @@ function AppScene(): JSX.Element | null {
 
     const sceneContent = activeExportedScene?.logic ? (
         <BindLogic
-            key={`bind-${activeSceneLogicPropsWithTabId.tabId}`}
+            key={`bind-${activeSceneLogicProps.tabId}`}
             logic={activeExportedScene.logic}
-            props={activeSceneLogicPropsWithTabId}
+            props={activeSceneLogicProps}
         >
             {sceneElement}
         </BindLogic>
@@ -199,10 +212,7 @@ function AppScene(): JSX.Element | null {
     )
 
     const wrappedSceneElement = (
-        <ErrorBoundary
-            key={`error-${activeSceneLogicPropsWithTabId.tabId}`}
-            exceptionProps={{ feature: activeSceneId }}
-        >
+        <ErrorBoundary key={`error-${activeSceneLogicProps.tabId}`} exceptionProps={{ feature: activeSceneId }}>
             {/* Keep chunk-load failures out of the scene error reporter so stale assets reload once instead. */}
             <ChunkLoadErrorBoundary>{sceneContent}</ChunkLoadErrorBoundary>
         </ErrorBoundary>
@@ -218,15 +228,8 @@ function AppScene(): JSX.Element | null {
     }
 
     return (
-        <ChunkLoadErrorBoundary>
-            <Suspense
-                fallback={
-                    // SpinnerOverlay is already imported here — no new lazy deps vs skeleton.
-                    <div className="relative h-screen">
-                        <SpinnerOverlay sceneLevel />
-                    </div>
-                }
-            >
+        <ChunkLoadErrorBoundary fallback={(error) => <AppLoadError error={error} />}>
+            <Suspense fallback={<AuthenticatedShellFallback showSpinner={showingDelayedSpinner} />}>
                 <AuthenticatedShell>{wrappedSceneElement}</AuthenticatedShell>
             </Suspense>
         </ChunkLoadErrorBoundary>

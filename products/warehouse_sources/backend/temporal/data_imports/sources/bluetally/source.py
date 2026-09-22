@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.bluetally.bluetally import (
     BluetallyResumeConfig,
@@ -29,6 +23,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.bluetally import (
     BluetallySourceConfig,
 )
@@ -55,7 +50,7 @@ class BluetallySource(ResumableSource[BluetallySourceConfig, BluetallyResumeConf
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.BLUETALLY,
+            name=ExternalDataSourceType.BLUETALLY,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="BlueTally",
             releaseStatus=ReleaseStatus.ALPHA,
@@ -138,8 +133,8 @@ If your account has multi-tenancy enabled, also enter the tenant ID the key shou
         schema_name: Optional[str] = None,
         api_version: str | None = None,
     ) -> tuple[bool, str | None]:
-        path = BLUETALLY_ENDPOINTS[schema_name].path if schema_name in BLUETALLY_ENDPOINTS else "/assets"
-        if validate_bluetally_credentials(config.api_key, config.tenant_id, path):
+        endpoint = schema_name if schema_name in BLUETALLY_ENDPOINTS else "assets"
+        if validate_bluetally_credentials(config.api_key, config.tenant_id, endpoint):
             return True, None
 
         return False, "Invalid BlueTally API key"

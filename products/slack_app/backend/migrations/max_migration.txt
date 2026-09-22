@@ -1,1 +1,1 @@
-0011_slacksettings_permission_modes
+0018_drop_slacksettings_ai_preferences_column

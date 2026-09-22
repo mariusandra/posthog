@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from urllib.parse import quote
 
-from freezegun import freeze_time
+import time_machine
 from posthog.test.base import BaseTest
 from unittest.mock import MagicMock, patch
 
@@ -316,6 +316,30 @@ class TestValidateManifestUrls(SimpleTestCase):
         ok, err = validate_manifest_urls(manifest, team_id=999)
         assert not ok, err
 
+    def test_rejects_base_url_with_http_method_prefix(self):
+        # A user who pastes "POST https://..." from API docs used to get an unhelpful
+        # "missing a hostname" — the message must instead tell them to drop the method.
+        manifest = _minimal_manifest(base_url="POST https://api.example.com/v1")
+        ok, err = validate_manifest_urls(manifest, team_id=999)
+        assert not ok
+        assert "Remove the HTTP method" in (err or "")
+
+    @parameterized.expand(
+        [
+            ("leading", '"https://api.example.com/v1'),
+            ("wrapped", '"https://api.example.com/v1"'),
+            ("single", "'https://api.example.com/v1'"),
+        ]
+    )
+    def test_rejects_base_url_with_quote_marks(self, _name: str, base_url: str):
+        # A quote kept from a copied code sample used to surface an unhelpful "missing a hostname"
+        # that echoed the pasted value back — the message must name the quote instead.
+        manifest = _minimal_manifest(base_url=base_url)
+        ok, err = validate_manifest_urls(manifest, team_id=999)
+        assert not ok
+        assert "Remove the quote marks" in (err or "")
+        assert base_url not in (err or "")
+
     @override_settings(CLOUD_DEPLOYMENT="US")
     @patch(
         "products.warehouse_sources.backend.temporal.data_imports.sources.custom.source._is_host_safe",
@@ -410,6 +434,24 @@ class TestCustomSourceAssembleManifest(SimpleTestCase):
         config = CustomSourceConfig(manifest_json=json.dumps(_minimal_manifest()))
         manifest = source._assemble_manifest(config)
         assert manifest["client"]["base_url"] == "https://api.example.com"
+
+    def test_accepts_already_parsed_manifest_object(self):
+        # The create/validate API can hand us the manifest as an already-parsed object rather than a
+        # JSON string; that used to reach json.loads(dict) and raise an uncaught TypeError.
+        source = CustomSource()
+        config = CustomSourceConfig(manifest_json=_minimal_manifest())  # type: ignore[arg-type]
+        manifest = source._assemble_manifest(config)
+        assert manifest["client"]["base_url"] == "https://api.example.com"
+
+    def test_does_not_mutate_manifest_object_when_injecting_secrets(self):
+        # A dict manifest is deep-copied before secret injection so credentials never leak back into
+        # the caller's (persisted, redacted) config.
+        stored = _minimal_manifest()
+        source = CustomSource()
+        config = CustomSourceConfig(manifest_json=stored, auth_token="ya29.secret")  # type: ignore[arg-type]
+        assembled = source._assemble_manifest(config)
+        assert assembled["client"]["auth"]["token"] == "ya29.secret"
+        assert "token" not in stored["client"]["auth"]
 
     @parameterized.expand(
         [
@@ -559,7 +601,7 @@ class TestCustomSourceOAuth2IntegrationWiring(BaseTest):
         fresh = CustomOAuth2Integration.objects.for_team(self.team.pk).get(pk=integration.pk)
         assert fresh.sensitive_config["refresh_token"] == "rotated-RT"
 
-    @freeze_time("2025-01-01T00:00:00Z")
+    @time_machine.travel("2025-01-01T00:00:00Z", tick=False)
     @patch(f"{AUTH_MODULE}.make_tracked_session")
     def test_reuses_cached_token_without_minting(self, mock_session):
         # A still-valid cached token means no mint at all — the manifest is seeded straight from the row.
@@ -576,7 +618,7 @@ class TestCustomSourceOAuth2IntegrationWiring(BaseTest):
         # No refresh material is seeded — the engine treats it as a static bearer and never mints.
         assert "refresh_token" not in auth
 
-    @freeze_time("2025-01-01T00:00:00Z")
+    @time_machine.travel("2025-01-01T00:00:00Z", tick=False)
     @patch(f"{AUTH_MODULE}.make_tracked_session")
     def test_post_injection_manifest_builds_static_bearer_that_never_mints(self, mock_session):
         # End-to-end seam: feed the injected client.auth through the engine's own auth construction
@@ -852,7 +894,7 @@ class TestCustomSourceOAuth2SecretAdoption(BaseTest):
         # expiry, or the row would just reuse the still-valid cached access token without minting.
         self._mock_mint(mock_token_session, mock_probe_session, rotated="rotated-RT-1")
         first_config = self._static_config()
-        with freeze_time("2025-01-01T00:00:00Z"):
+        with time_machine.travel("2025-01-01T00:00:00Z", tick=False):
             ok, err = CustomSource().validate_credentials(
                 first_config, team_id=self.team.pk, owner_user_id=self.user.pk
             )
@@ -860,7 +902,7 @@ class TestCustomSourceOAuth2SecretAdoption(BaseTest):
 
         self._mock_mint(mock_token_session, mock_probe_session, rotated="rotated-RT-2")
         second_config = self._static_config()
-        with freeze_time("2025-01-01T02:00:00Z"):
+        with time_machine.travel("2025-01-01T02:00:00Z", tick=False):
             ok, err = CustomSource().validate_credentials(
                 second_config, team_id=self.team.pk, owner_user_id=self.user.pk
             )
@@ -1066,24 +1108,29 @@ class TestCustomSourceValidateCredentials(SimpleTestCase):
         assert ok, err
         assert err is None
 
-    @patch.object(
-        OAuth2Auth,
-        "_obtain_token",
-        side_effect=OAuth2AuthRequestError(
-            "HTTP 401 from the OAuth2 token endpoint: invalid_client: bad creds",
-            error_code="invalid_client",
-            is_permanent=True,
-        ),
+    @parameterized.expand(
+        [
+            ("invalid_client", "client ID or secret"),
+            ("invalid_scope", "scopes"),
+            ("some_provider_code", "client ID, secret, token URL"),
+            (None, "client ID, secret, token URL"),
+        ]
     )
-    def test_oauth2_probe_permanent_token_error_blocks_with_clear_message(self, _mock_mint):
-        # A bad client_secret / token_url must fail at create time with a pointed token-endpoint
-        # message — not the generic "resource unreachable" of the data probe.
+    def test_oauth2_probe_permanent_token_error_blocks_with_clear_message(self, error_code, expected_fragment):
+        # A bad client_secret / token_url must fail at create time with copy that names the field
+        # to change — not the provider's raw status-and-code text, and not the generic "resource
+        # unreachable" of the data probe. An unmapped or absent code falls back to the whole
+        # credential set.
+        mint_error = OAuth2AuthRequestError("raw provider text", error_code=error_code, is_permanent=True)
         source = CustomSource()
         config = CustomSourceConfig(manifest_json=json.dumps(_oauth2_manifest()), auth_oauth2_client_secret="cs")
-        ok, err = source.validate_credentials(config, team_id=999)
+
+        with patch.object(OAuth2Auth, "_obtain_token", side_effect=mint_error):
+            ok, err = source.validate_credentials(config, team_id=999)
+
         assert not ok
-        assert "OAuth2 token endpoint rejected" in (err or "")
-        assert "invalid_client" in (err or "")
+        assert expected_fragment in (err or "")
+        assert "raw provider text" not in (err or "")
 
     @patch("products.warehouse_sources.backend.temporal.data_imports.sources.custom.source.make_tracked_session")
     @patch.object(
@@ -1102,7 +1149,7 @@ class TestCustomSourceValidateCredentials(SimpleTestCase):
         assert ok, err
         mock_session.assert_not_called()
 
-    @freeze_time("2025-01-01T00:00:00Z")
+    @time_machine.travel("2025-01-01T00:00:00Z", tick=False)
     @patch("products.warehouse_sources.backend.temporal.data_imports.sources.custom.source.make_tracked_session")
     def test_oauth2_minted_token_joins_probe_redaction(self, mock_session):
         # The pre-mint runs before the probe session is built, so the freshly-minted access token
@@ -1546,6 +1593,16 @@ class TestManifestRequestHosts(SimpleTestCase):
     def test_unparseable_returns_empty(self, _name, raw):
         assert manifest_request_hosts(raw) == frozenset()
 
+    def test_parsed_object_manifest_reports_hosts(self):
+        # _assemble_manifest accepts a dict manifest, so the re-entry gate must extract hosts from a
+        # dict too — otherwise an update PATCHing a dict manifest that retargets a new host slips past
+        # the gate as "no hosts" and the stored credential is sent to the new host without re-entry.
+        manifest = {
+            "client": {"base_url": "https://api.example.com"},
+            "resources": [{"name": "r", "endpoint": {"path": "https://attacker.example.net/data"}}],
+        }
+        assert manifest_request_hosts(manifest) == frozenset({"api.example.com", "attacker.example.net"})
+
     def test_oauth2_token_url_host_is_tracked(self):
         # The token endpoint receives the stored client_secret, so its host must be in the
         # re-entry set — otherwise an editor who can't read the secret could repoint token_url
@@ -1753,6 +1810,25 @@ class TestCustomSourceNonRetryableErrors(SimpleTestCase):
         non_retryable = CustomSource().get_non_retryable_errors()
         assert any(key in str(ctx.exception) for key in non_retryable)
 
+    def test_http_407_proxy_auth_is_classified_non_retryable(self):
+        # A proxy that refuses the request (the egress proxy blocking a disallowed address, or an
+        # upstream proxy needing credentials) returns 407 deterministically, so retrying can't fix
+        # it. Build the real requests HTTPError raise_for_status() produces, so this breaks if the
+        # matched substring drifts. Route through the classifier's message so a regression that
+        # leaves it None (raw driver text) is caught too. The URL is a placeholder.
+        response = Response()
+        response.status_code = 407
+        response.reason = "Proxy Authentication Required"
+        response.url = "https://api.example.com/data"
+        with self.assertRaises(requests.exceptions.HTTPError) as ctx:
+            response.raise_for_status()
+
+        non_retryable = CustomSource().get_non_retryable_errors()
+        matches = [friendly for key, friendly in non_retryable.items() if key in str(ctx.exception)]
+        assert matches
+        assert matches[0] is not None
+        assert "proxy" in matches[0].lower()
+
     def test_non_json_response_message_is_classified_non_retryable(self):
         # The REST client raises RESTClientNonRetryableError when a configured endpoint
         # returns non-JSON (an HTML/plain-text error page) on a 2xx. Build the real error the
@@ -1762,6 +1838,26 @@ class TestCustomSourceNonRetryableErrors(SimpleTestCase):
 
         non_retryable = CustomSource().get_non_retryable_errors()
         assert any(key in str(error) for key in non_retryable)
+
+    def test_dns_resolution_failure_message_is_classified_non_retryable(self):
+        # `_is_host_safe` raises this exact message when a manifest's base_url doesn't
+        # resolve via DNS — a permanent, deterministic failure until the manifest is
+        # edited. Build the real message `validate_manifest_urls` raises (prefix +
+        # `_is_host_safe`'s wording) so this breaks if either side's wording drifts
+        # from the classifier's key.
+        with patch(
+            "products.warehouse_sources.backend.temporal.data_imports.sources.custom.source._is_host_safe",
+            return_value=(
+                False,
+                "Couldn't resolve the host 'api.example.com'. Check that it's spelled correctly and reachable from the public internet.",
+            ),
+        ):
+            ok, err = validate_manifest_urls(_minimal_manifest(), team_id=999)
+
+        assert not ok
+        assert err is not None
+        non_retryable = CustomSource().get_non_retryable_errors()
+        assert any(key in err for key in non_retryable)
 
     @parameterized.expand(["invalid_client", "invalid_grant"])
     def test_oauth2_permanent_errors_are_classified_non_retryable(self, error_code):
@@ -2957,3 +3053,16 @@ class TestCustomSourceOAuth2NonRetryableClassification(SimpleTestCase):
         assert not ctx.exception.is_permanent
         assert OAUTH2_PERMANENT_ERROR_MARKER not in str(ctx.exception)
         assert not _classify_non_retryable(ctx.exception), str(ctx.exception)
+
+
+class TestCustomSourceHttpNonRetryableClassification(SimpleTestCase):
+    def test_404_is_non_retryable_with_a_url_free_message(self):
+        # A 404 on a manifest-configured URL is deterministic, so it must be classified
+        # non-retryable to stop the loop, and its message must not echo the customer's hostname.
+        # Classification is a substring match on str(error), so the exception type doesn't matter;
+        # a plain Exception carries the realistic message without requests' typed constructor.
+        error = Exception("404 Client Error: Not Found for url: https://host.example.com/export")
+        non_retryable = CustomSource().get_non_retryable_errors()
+        assert _classify_non_retryable(error)
+        matched = [message for key, message in non_retryable.items() if key in str(error)]
+        assert matched and all(message is not None and "://" not in message for message in matched)

@@ -1,17 +1,13 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
+    SourceFieldSelectConfig,
+    SourceFieldSelectConfigOption,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.awin.awin import (
     AwinResumeConfig,
@@ -20,8 +16,10 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.awin.awin 
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.awin.settings import (
     AWIN_ENDPOINTS,
+    DEFAULT_REGION,
     ENDPOINTS,
     INCREMENTAL_FIELDS,
+    REGION_OPTIONS,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -30,6 +28,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.awin import AwinSourceConfig
 from products.warehouse_sources.backend.types import ExternalDataSourceType
 
@@ -47,7 +46,7 @@ class AwinSource(ResumableSource[AwinSourceConfig, AwinResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.AWIN,
+            name=ExternalDataSourceType.AWIN,
             category=DataWarehouseSourceCategory.ADVERTISING,
             label="Awin",
             releaseStatus=ReleaseStatus.ALPHA,
@@ -66,6 +65,16 @@ Create a personal OAuth2 token from the [Awin API settings](https://ui.awin.com/
                         required=True,
                         placeholder="",
                         secret=True,
+                    ),
+                    SourceFieldSelectConfig(
+                        name="region",
+                        label="Region",
+                        required=True,
+                        defaultValue=DEFAULT_REGION,
+                        caption="Your Awin account's primary region. Used to sync the advertiser performance report.",
+                        options=[
+                            SourceFieldSelectConfigOption(label=label, value=value) for value, label in REGION_OPTIONS
+                        ],
                     ),
                 ],
             ),
@@ -96,6 +105,12 @@ Create a personal OAuth2 token from the [Awin API settings](https://ui.awin.com/
         def _description(endpoint: str) -> str | None:
             if endpoint == "reports_advertiser":
                 return "Full refresh only. A rolling snapshot of the last 30 days of performance, aggregated per advertiser"
+            if endpoint == "reports_publisher":
+                return "Full refresh only. A rolling snapshot of the last 30 days of performance, aggregated per publisher. Needs an advertiser account"
+            if endpoint == "advertiser_publishers":
+                return "Full refresh only. Needs an advertiser account"
+            if endpoint in ("commission_groups", "programme_details"):
+                return "Full refresh only. Takes one request per joined programme, so it syncs slowly if your publisher accounts are in many programmes"
             if endpoint == "transactions":
                 return "Only syncs the last 365 days on initial sync"
             return None
@@ -139,6 +154,7 @@ Create a personal OAuth2 token from the [Awin API settings](https://ui.awin.com/
             endpoint=inputs.schema_name,
             logger=inputs.logger,
             resumable_source_manager=resumable_source_manager,
+            region=config.region,
             should_use_incremental_field=inputs.should_use_incremental_field,
             db_incremental_field_last_value=inputs.db_incremental_field_last_value
             if inputs.should_use_incremental_field

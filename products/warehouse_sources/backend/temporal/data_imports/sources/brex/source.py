@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.brex.brex import (
     BREX_API_VERSION_V1,
@@ -21,7 +15,11 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.brex.brex 
     validate_credentials as validate_brex_credentials,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.brex.settings import ENDPOINTS, INCREMENTAL_FIELDS
-from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import (
+    FieldType,
+    ResumableSource,
+    VersionDeprecation,
+)
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
     CanonicalDescriptions,
 )
@@ -31,6 +29,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.brex import BrexSourceConfig
 from products.warehouse_sources.backend.types import ExternalDataSourceType
 
@@ -42,6 +41,10 @@ class BrexSource(ResumableSource[BrexSourceConfig, BrexResumeConfig]):
 
     supported_versions = (BREX_API_VERSION_V1, BREX_API_VERSION_V2)
     default_version = BREX_API_VERSION_V2
+    # Brex deprecated its Spend Limits v1 endpoints in favor of the v2 Budgets API; the vendor
+    # announced no sunset date. v1 stays supported so existing pins keep working, but carries the
+    # deprecation flag so the generic in-product warning fires.
+    deprecated_versions = (VersionDeprecation(version=BREX_API_VERSION_V1, sunset_at=None),)
 
     @property
     def source_type(self) -> ExternalDataSourceType:
@@ -63,12 +66,12 @@ class BrexSource(ResumableSource[BrexSourceConfig, BrexResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.BREX,
+            name=ExternalDataSourceType.BREX,
             category=DataWarehouseSourceCategory.FINANCE___ACCOUNTING,
             label="Brex",
             caption="""Enter your Brex API user token to pull your Brex data into the PostHog Data warehouse.
 
-You can create a token in your [Brex dashboard](https://dashboard.brex.com/settings/developer) under Settings → Developer. Grant read access to the data you want to sync: Transactions and Accounts (card and cash transactions), Expenses, Team (users, departments, locations), Payments (vendors), and Budgets.
+You can create a token in your [Brex dashboard](https://dashboard.brex.com/settings/developer) under Settings → Developer. Grant read access to the data you want to sync: Transactions and Accounts (card and cash transactions, card and cash accounts), Expenses, Team (users, departments, locations, titles, cards), Payments (vendors, transfers), Budgets (budgets, budget programs, spend limits), and Fields (custom fields and their values).
 
 Note: Brex tokens expire after 90 days without API activity, so a token that hasn't been used recently may need to be regenerated.""",
             iconPath="/static/services/brex.png",

@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -20,7 +14,10 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.formbricks.formbricks import (
+    FORMBRICKS_DEFAULT_VERSION,
+    FORMBRICKS_SUPPORTED_VERSIONS,
     HOST_NOT_ALLOWED_ERROR,
     HTTP_NOT_ALLOWED_ERROR,
     RESPONSE_TOO_LARGE_ERROR,
@@ -42,6 +39,8 @@ from products.warehouse_sources.backend.types import ExternalDataSourceType
 
 @SourceRegistry.register
 class FormbricksSource(ResumableSource[FormbricksSourceConfig, FormbricksResumeConfig]):
+    supported_versions = FORMBRICKS_SUPPORTED_VERSIONS
+    default_version = FORMBRICKS_DEFAULT_VERSION
     api_docs_url = "https://formbricks.com/docs/api-reference/rest-api"
 
     lists_tables_without_credentials = True  # static endpoint catalog — safe for public docs
@@ -59,7 +58,7 @@ class FormbricksSource(ResumableSource[FormbricksSourceConfig, FormbricksResumeC
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.FORMBRICKS,
+            name=ExternalDataSourceType.FORMBRICKS,
             category=DataWarehouseSourceCategory.PRODUCTIVITY,
             label="Formbricks",
             releaseStatus=ReleaseStatus.ALPHA,

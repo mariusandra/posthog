@@ -11,7 +11,7 @@ import { getCurrentTeamId } from 'lib/utils/getAppContext'
 import { isDesktopApp } from 'lib/utils/isDesktopApp'
 import { addProjectIdIfMissing, removeProjectIdIfPresent } from 'lib/utils/kea-router'
 import { newInternalTab } from 'lib/utils/newInternalTab'
-import { isExternalLink } from 'lib/utils/url'
+import { isExternalLink, hasDangerousScheme } from 'lib/utils/url'
 import { urlToResource } from 'scenes/urls'
 
 import { Tooltip, TooltipProps } from '../Tooltip'
@@ -96,14 +96,6 @@ const isDirectLink = (url: string): boolean => {
     return /^(mailto:|https?:\/\/|:\/\/)/.test(url)
 }
 
-const hasDangerousScheme = (url: string): boolean => {
-    // Browsers ignore leading control chars/whitespace and any tabs/newlines embedded in the scheme,
-    // so strip them all before matching. javascript:/vbscript: targets must never become an href —
-    // not even when disableClientSideRouting would otherwise skip the routing rewrite.
-    const normalized = url.replace(/[\u0000-\u0020]/g, '').toLowerCase()
-    return /^(javascript|vbscript):/.test(normalized)
-}
-
 /** Resolve a `to` target into a concrete href string. */
 function resolveHref(to: LinkPrimitiveProps['to'], disableClientSideRouting?: boolean): string | undefined {
     if (!to) {
@@ -112,6 +104,8 @@ function resolveHref(to: LinkPrimitiveProps['to'], disableClientSideRouting?: bo
     if (typeof to !== 'string') {
         return '#'
     }
+    // Never let a javascript:/vbscript: target become an href, not even when
+    // disableClientSideRouting would otherwise skip the routing rewrite below.
     if (hasDangerousScheme(to)) {
         return '#'
     }

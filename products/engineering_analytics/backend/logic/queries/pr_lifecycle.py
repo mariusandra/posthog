@@ -23,6 +23,8 @@ from products.engineering_analytics.backend.facade.contracts import (
 )
 from products.engineering_analytics.backend.logic.queries._curated import CuratedGitHubSource
 from products.engineering_analytics.backend.logic.queries._pr_header import pr_header_placeholders, pr_header_query
+from products.engineering_analytics.backend.logic.queries._workflow_filters import UNPAGED_SCAN_LIMIT
+from products.engineering_analytics.backend.logic.views import issue_events
 
 # The curated subqueries and the repo filter are filled with str.replace (trusted
 # constants), leaving the HogQL {value} placeholders untouched for parse_select.
@@ -35,12 +37,29 @@ _HEADER = pr_header_query(
     """
 )
 
-_RUNS = """
+# Newest first, so a PR past the cap loses its oldest rows; the caller restores chronological order.
+_RUNS = f"""
     SELECT id, workflow_name, status, conclusion, run_started_at, updated_at
     FROM __RUNS_SOURCE__ AS r
-    WHERE head_sha = {head_sha}
-    ORDER BY run_started_at ASC
+    WHERE head_sha = {{head_sha}}
+    ORDER BY run_started_at DESC
+    LIMIT {UNPAGED_SCAN_LIMIT}
 """
+
+# pr_number alone is the key: a resolved table set is a single repo's, the same repo the
+# PR header was resolved from.
+_STATE_EVENTS = f"""
+    SELECT event, created_at, actor_login
+    FROM __STATE_EVENTS_SOURCE__ AS se
+    WHERE pr_number = {{pr_number}}
+    ORDER BY created_at DESC, id DESC
+    LIMIT {UNPAGED_SCAN_LIMIT}
+"""
+
+_STATE_EVENT_KINDS = {
+    issue_events.READY_FOR_REVIEW_EVENT: PRLifecycleEventKind.READY_FOR_REVIEW,
+    issue_events.CONVERT_TO_DRAFT_EVENT: PRLifecycleEventKind.CONVERTED_TO_DRAFT,
+}
 
 
 def query_pr_lifecycle(
@@ -109,6 +128,19 @@ def query_pr_lifecycle(
             events.append(PRLifecycleEvent(kind=kind, at=at, detail=detail, run_id=run_id))
 
     add(PRLifecycleEventKind.OPENED, created_at)
+
+    state_events_source = curated.issue_events_source()
+    if state_events_source is not None:
+        transitions = curated.run(
+            _STATE_EVENTS.replace("__STATE_EVENTS_SOURCE__", state_events_source),
+            query_type="engineering_analytics.pr_lifecycle.state_events",
+            placeholders={"pr_number": ast.Constant(value=pr_number)},
+        )
+        for event, at, actor_login in reversed(transitions.results):
+            kind = _STATE_EVENT_KINDS.get(event)
+            if kind is not None:
+                add(kind, at, detail=actor_login or None)
+
     runs = (
         curated.run(
             _RUNS.replace("__RUNS_SOURCE__", curated.run_source()),
@@ -119,7 +151,7 @@ def query_pr_lifecycle(
         else None
     )
     if runs is not None:
-        for run_id, workflow_name, status, conclusion, run_started_at, updated_at in runs.results:
+        for run_id, workflow_name, status, conclusion, run_started_at, updated_at in reversed(runs.results):
             run_id = int(run_id) if run_id is not None else None
             add(PRLifecycleEventKind.CI_STARTED, run_started_at, detail=workflow_name, run_id=run_id)
             if status == "completed":

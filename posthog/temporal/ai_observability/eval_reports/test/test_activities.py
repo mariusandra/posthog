@@ -7,25 +7,58 @@ from unittest.mock import MagicMock, Mock, patch
 
 from django.utils import timezone
 
+from asgiref.sync import sync_to_async
 from parameterized import parameterized
 
+from posthog.hogql import ast
+from posthog.hogql.query import execute_hogql_query
+from posthog.hogql.visitor import TraversingVisitor
+
+from posthog.exceptions import ClickHouseQueryTimeOut
 from posthog.models import Team
 from posthog.temporal.ai_observability.eval_reports.activities import (
     _check_count_triggered_eval_report_sync,
     _check_count_triggered_eval_reports_batch,
-    _count_eval_results_for_report,
+    _count_eval_results_for_reports_with_split_retry,
+    _CountEntry,
     _fetch_count_triggered_eval_report_candidate_groups,
-    _find_nth_eval_timestamp,
+    _load_detector_evaluation_ids,
     _load_evaluation_target,
     _period_for_scheduled_report,
+    prepare_report_context_activity,
     run_eval_report_agent_activity,
     store_report_run_activity,
 )
+from posthog.temporal.ai_observability.eval_reports.constants import (
+    COUNT_TRIGGER_QUERY_MAX_EXECUTION_TIME_SECONDS,
+    COUNT_TRIGGER_QUERY_MIN_EXECUTION_TIME_SECONDS,
+    COUNT_TRIGGER_QUERY_OVERSHOOT_FACTOR,
+    COUNT_TRIGGER_QUERY_RETRY_MAX_EXECUTION_TIME_SECONDS,
+    COUNT_TRIGGER_QUERY_TOTAL_BUDGET_SECONDS,
+)
 from posthog.temporal.ai_observability.eval_reports.report_agent.schema import EvalReportContent, EvalReportMetrics
-from posthog.temporal.ai_observability.eval_reports.types import RunEvalReportAgentInput, StoreReportRunInput
+from posthog.temporal.ai_observability.eval_reports.types import (
+    PrepareReportContextInput,
+    RunEvalReportAgentInput,
+    StoreReportRunInput,
+)
 
 from products.ai_observability.backend.models.evaluation_reports import EvaluationReport, EvaluationReportRun
 from products.ai_observability.backend.models.evaluations import Evaluation
+
+
+def _scanned_window(query: ast.SelectQuery) -> list[dt.datetime]:
+    class CollectTimestamps(TraversingVisitor):
+        def __init__(self) -> None:
+            self.timestamps: list[dt.datetime] = []
+
+        def visit_constant(self, node: ast.Constant) -> None:
+            if isinstance(node.value, dt.datetime):
+                self.timestamps.append(node.value)
+
+    visitor = CollectTimestamps()
+    visitor.visit(query.where)
+    return sorted(visitor.timestamps)
 
 
 class TestEvaluationTargetLoading(BaseTest):
@@ -46,6 +79,26 @@ class TestEvaluationTargetLoading(BaseTest):
         target = _load_evaluation_target(self.team.id, str(evaluation.id))
 
         self.assertEqual(target, "trace")
+
+    def test_loads_only_the_team_evaluations_that_declare_true_a_failure(self) -> None:
+        def _evaluation(name: str, output_config: dict) -> Evaluation:
+            return Evaluation.objects.create(
+                team=self.team,
+                name=name,
+                evaluation_type="llm_judge",
+                evaluation_config={"prompt": "test prompt"},
+                output_type="boolean",
+                output_config=output_config,
+                enabled=True,
+                created_by=self.user,
+                conditions=[{"id": "c1", "rollout_percentage": 100, "properties": []}],
+            )
+
+        detector = _evaluation("Detector", {"true_is_failure": True})
+        _evaluation("Quality check", {"true_is_failure": False})
+        _evaluation("Legacy config", {})
+
+        self.assertEqual(_load_detector_evaluation_ids(self.team.id), [str(detector.id)])
 
 
 @pytest.mark.parametrize(
@@ -73,6 +126,8 @@ async def test_run_agent_activity_loads_target_and_forwards_output_type(
         period_start="2026-07-01T00:00:00+00:00",
         period_end="2026-07-02T00:00:00+00:00",
         previous_period_start="2026-06-30T00:00:00+00:00",
+        trace_id="report-run-id",
+        session_id="report-session-id",
     )
 
     with (
@@ -88,14 +143,21 @@ async def test_run_agent_activity_loads_target_and_forwards_output_type(
             "posthog.temporal.ai_observability.eval_reports.activities._load_evaluation_target",
             return_value=evaluation_target,
         ) as load_target,
+        patch(
+            "posthog.temporal.ai_observability.eval_reports.activities._load_detector_evaluation_ids",
+            return_value=["detector-id"],
+        ) as load_detectors,
     ):
         result = await run_eval_report_agent_activity(inputs)
 
     assert result.content["metrics"]["output_type"] == output_type
     assert result.content["evaluation_target"] == evaluation_target
-    assert run_agent.call_args.kwargs["output_type"] == output_type
+    assert result.generation_status == "completed"
+    assert run_agent.call_args.args[0] is inputs
     assert run_agent.call_args.kwargs["evaluation_target"] == evaluation_target
+    assert run_agent.call_args.kwargs["detector_evaluation_ids"] == ["detector-id"]
     load_target.assert_called_once_with(inputs.team_id, inputs.evaluation_id)
+    load_detectors.assert_called_once_with(inputs.team_id)
 
 
 @pytest.mark.asyncio
@@ -194,36 +256,41 @@ async def test_store_legacy_boolean_report_emits_normalized_generic_metrics() ->
     assert properties["$ai_report_referenced_trace_ids"] == ["customer/trace:42"]
 
 
-def test_count_trigger_uses_current_output_type() -> None:
-    report = MagicMock(team_id=1, team=MagicMock(), evaluation_id="evaluation-id")
-    report.evaluation.output_type = "sentiment"
-    report.evaluation.target = "trace"
+@pytest.mark.asyncio
+async def test_store_metrics_unavailable_report_omits_placeholder_metrics() -> None:
+    report_run = MagicMock(id="run-id", report_id="report-id")
+    content: dict[str, object] = {
+        "title": "Metrics temporarily unavailable",
+        "sections": [],
+        "citations": [],
+        "generation_status": "metrics_unavailable",
+        "metrics": None,
+    }
+    inputs = StoreReportRunInput(
+        report_id="report-id",
+        team_id=1,
+        evaluation_id="evaluation-id",
+        content=content,
+        period_start="2026-07-01T00:00:00+00:00",
+        period_end="2026-07-02T00:00:00+00:00",
+    )
 
     with (
-        patch("posthog.hogql.parser.parse_select", return_value=MagicMock()) as parse_select,
-        patch("posthog.hogql.query.execute_hogql_query", return_value=Mock(results=[[4]])),
+        patch(
+            "products.ai_observability.backend.models.evaluation_reports.EvaluationReportRun.objects.create",
+            return_value=report_run,
+        ) as create_report_run,
+        patch("posthog.models.team.Team.objects.get", return_value=MagicMock()),
+        patch("posthog.models.event.util.create_event") as create_event,
     ):
-        result = _count_eval_results_for_report(report, dt.datetime(2026, 7, 1, tzinfo=dt.UTC))
+        await store_report_run_activity(inputs)
 
-    assert result == 4
-    assert "properties.$ai_evaluation_result_type = 'sentiment'" in parse_select.call_args.args[0]
-    assert "properties.$ai_target_type = 'trace_id'" in parse_select.call_args.args[0]
-
-
-def test_manual_count_window_uses_current_output_type() -> None:
-    before = dt.datetime(2026, 7, 2, tzinfo=dt.UTC)
-    expected = before - dt.timedelta(hours=2)
-
-    with (
-        patch("posthog.hogql.parser.parse_select", return_value=MagicMock()) as parse_select,
-        patch("posthog.hogql.query.execute_hogql_query", return_value=Mock(results=[[expected]])),
-        patch("posthog.models.Team.objects.get", return_value=MagicMock()),
-    ):
-        result = _find_nth_eval_timestamp(1, "evaluation-id", 100, before, output_type="sentiment")
-
-    assert result == expected
-    assert "properties.$ai_evaluation_result_type = 'sentiment'" in parse_select.call_args.args[0]
-    assert "isNull(properties.$ai_target_type)" in parse_select.call_args.args[0]
+    properties = create_event.call_args.kwargs["properties"]
+    assert create_report_run.call_args.kwargs["metadata"] == {}
+    assert properties["$ai_report_generation_status"] == "metrics_unavailable"
+    assert "$ai_report_total_runs" not in properties
+    assert "$ai_report_result_counts" not in properties
+    assert "$ai_report_pass_rate" not in properties
 
 
 def _prepare_sync(report_id: str, manual: bool = False):
@@ -359,6 +426,37 @@ class TestPrepareReportContext(BaseTest):
         self.assertEqual(result["team_id"], self.team.id)
 
 
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.asyncio
+async def test_prepare_activity_reads_detector_polarity_from_evaluation(team, user) -> None:
+    def _create_report() -> EvaluationReport:
+        evaluation = Evaluation.objects.create(
+            team=team,
+            name="Detector Eval",
+            evaluation_type="llm_judge",
+            evaluation_config={"prompt": "test prompt"},
+            output_type="boolean",
+            output_config={"true_is_failure": True},
+            enabled=True,
+            created_by=user,
+            conditions=[{"id": "c1", "rollout_percentage": 100, "properties": []}],
+        )
+        return EvaluationReport.objects.create(
+            team=team,
+            evaluation=evaluation,
+            frequency=EvaluationReport.Frequency.SCHEDULED,
+            rrule="FREQ=HOURLY",
+            starts_at=timezone.now() - dt.timedelta(hours=5),
+            delivery_targets=[{"type": "email", "value": "test@example.com"}],
+        )
+
+    report = await sync_to_async(_create_report)()
+
+    context = await prepare_report_context_activity(PrepareReportContextInput(report_id=str(report.id)))
+
+    assert context.true_is_failure is True
+
+
 class TestCountTriggeredReportChecks(BaseTest):
     def _create_report(self, team: Team | None = None, **kwargs) -> EvaluationReport:
         team = team or self.team
@@ -437,6 +535,21 @@ class TestCountTriggeredReportChecks(BaseTest):
         self.assertEqual(result.skipped_reason, "cooldown")
         execute_hogql_query.assert_not_called()
 
+    def test_check_report_uses_latest_attempt_for_cooldown_and_success_for_count_window(self):
+        now = timezone.now()
+        report = self._create_report(
+            last_delivered_at=now - dt.timedelta(hours=2),
+            last_attempted_at=now - dt.timedelta(minutes=5),
+            cooldown_minutes=60,
+        )
+
+        with patch("posthog.hogql.query.execute_hogql_query") as execute_hogql_query:
+            result = _check_count_triggered_eval_report_sync(str(report.id), now)
+
+        self.assertFalse(result.due)
+        self.assertEqual(result.skipped_reason, "cooldown")
+        execute_hogql_query.assert_not_called()
+
     def test_check_report_skips_daily_cap_without_clickhouse_query(self):
         now = timezone.now()
         report = self._create_report(daily_run_cap=1)
@@ -452,6 +565,24 @@ class TestCountTriggeredReportChecks(BaseTest):
         self.assertFalse(result.due)
         self.assertEqual(result.skipped_reason, "daily_cap")
         execute_hogql_query.assert_not_called()
+
+    def test_check_report_does_not_count_unavailable_run_toward_daily_cap(self):
+        now = timezone.now()
+        report = self._create_report(daily_run_cap=1)
+        EvaluationReportRun.objects.create(
+            report=report,
+            content={"generation_status": "metrics_unavailable"},
+            period_start=now - dt.timedelta(hours=1),
+            period_end=now,
+        )
+
+        with patch("posthog.hogql.query.execute_hogql_query") as execute_hogql_query:
+            execute_hogql_query.return_value = Mock(results=[[100]])
+            result = _check_count_triggered_eval_report_sync(str(report.id), now)
+
+        self.assertTrue(result.due)
+        self.assertIsNone(result.skipped_reason)
+        execute_hogql_query.assert_called_once()
 
     def test_batch_skips_gated_reports_without_clickhouse_and_preserves_order(self):
         # Every Postgres-gated report must be resolved without touching ClickHouse — that's
@@ -474,6 +605,136 @@ class TestCountTriggeredReportChecks(BaseTest):
         self.assertEqual([r.report_id for r in results], report_ids)
         self.assertEqual([r.skipped_reason for r in results], ["not_deliverable", "cooldown", "daily_cap"])
         self.assertTrue(all(r.due is False for r in results))
+
+    @parameterized.expand(
+        [
+            ("created_at",),
+            ("starts_at",),
+            ("last_delivered_at",),
+        ]
+    )
+    def test_count_window_preserves_older_report_anchor(self, anchor_field: str) -> None:
+        now = timezone.now()
+        since = now - dt.timedelta(days=10)
+        report = self._create_report()
+        EvaluationReport.objects.filter(id=report.id).update(**{anchor_field: since})
+
+        with patch("posthog.hogql.query.execute_hogql_query") as execute_hogql_query:
+            execute_hogql_query.return_value = Mock(results=[[1]])
+            _check_count_triggered_eval_report_sync(str(report.id), now)
+
+        self.assertEqual(_scanned_window(execute_hogql_query.call_args.kwargs["query"]), [since])
+
+
+class TestCountEvalResultsForReportsSplitRetry(BaseTest):
+    """Guards the retry behavior a `ClickHouseQueryTimeOut` needs: halve the time range and
+    retry over each half, rather than replaying a query over the same rows."""
+
+    def _entries(self, count: int, since: dt.datetime) -> list[_CountEntry]:
+        return [
+            _CountEntry(
+                key=f"r{i}",
+                evaluation_id=f"e{i}",
+                since=since,
+                event_predicate="1 = 1",
+                target_predicate="1 = 1",
+            )
+            for i in range(count)
+        ]
+
+    def test_splits_time_range_in_half_on_timeout_and_sums_the_halves(self):
+        # Catches a retry that reads the same range again, as the old column split did.
+        until = timezone.now()
+        since = until - dt.timedelta(days=8)
+        side_effects = [ClickHouseQueryTimeOut(), Mock(results=[[1, 2]]), Mock(results=[[30, 40]])]
+
+        with patch("posthog.hogql.query.execute_hogql_query", side_effect=side_effects) as execute_hogql_query:
+            counts = _count_eval_results_for_reports_with_split_retry(self.team, self._entries(2, since), until=until)
+
+        self.assertEqual(counts, {"r0": 31, "r1": 42})
+        self.assertEqual(
+            [call.kwargs["settings"].max_execution_time for call in execute_hogql_query.call_args_list], [30, 15, 15]
+        )
+        midpoint = since + (until - since) / 2
+        self.assertEqual(
+            [_scanned_window(call.kwargs["query"]) for call in execute_hogql_query.call_args_list],
+            [
+                [since, until],
+                [since, midpoint],
+                [midpoint + dt.timedelta(microseconds=1), until],
+            ],
+        )
+
+    def test_reraises_when_the_narrowest_range_still_times_out(self):
+        # A range too narrow to halve has nothing cheaper to retry, so the failure must surface.
+        until = timezone.now()
+        with patch("posthog.hogql.query.execute_hogql_query", side_effect=ClickHouseQueryTimeOut()):
+            with self.assertRaises(ClickHouseQueryTimeOut):
+                _count_eval_results_for_reports_with_split_retry(
+                    self.team, self._entries(1, until - dt.timedelta(seconds=30)), until=until
+                )
+
+    def test_stops_splitting_once_shared_budget_is_exhausted(self):
+        # A first attempt that burns nearly the whole wall-clock budget must not be followed
+        # by narrower retries: if each half drew a fresh budget instead of sharing the
+        # deadline, the split tree could outlive the activity timeout again.
+        clock = [0.0]
+        until = timezone.now()
+
+        def timeout_burning_budget(*args, **kwargs):
+            clock[0] += COUNT_TRIGGER_QUERY_TOTAL_BUDGET_SECONDS - COUNT_TRIGGER_QUERY_MIN_EXECUTION_TIME_SECONDS + 1
+            raise ClickHouseQueryTimeOut()
+
+        with (
+            patch("time.monotonic", side_effect=lambda: clock[0]),
+            patch("posthog.hogql.query.execute_hogql_query", side_effect=timeout_burning_budget) as execute_hogql_query,
+        ):
+            with self.assertRaises(ClickHouseQueryTimeOut):
+                _count_eval_results_for_reports_with_split_retry(
+                    self.team, self._entries(4, until - dt.timedelta(days=8)), until=until
+                )
+
+        self.assertEqual(execute_hogql_query.call_count, 1)
+
+    def test_execution_limit_leaves_room_for_clickhouse_to_overshoot_it(self):
+        # Catches a retry that claims the whole remaining budget as its limit. ClickHouse can
+        # run past that limit, so the attempt would overshoot the deadline and Temporal would
+        # kill the split midway.
+        clock = [0.0]
+        until = timezone.now()
+        remaining_after_first_attempt = COUNT_TRIGGER_QUERY_RETRY_MAX_EXECUTION_TIME_SECONDS * 1.5
+        execution_limits: list[int] = []
+
+        def record_limit_then_time_out_once(*args, **kwargs):
+            execution_limits.append(kwargs["settings"].max_execution_time)
+            if len(execution_limits) > 1:
+                return Mock(results=[[0]])
+            clock[0] = COUNT_TRIGGER_QUERY_TOTAL_BUDGET_SECONDS - remaining_after_first_attempt
+            raise ClickHouseQueryTimeOut()
+
+        with (
+            patch("time.monotonic", side_effect=lambda: clock[0]),
+            patch("posthog.hogql.query.execute_hogql_query", side_effect=record_limit_then_time_out_once),
+        ):
+            _count_eval_results_for_reports_with_split_retry(
+                self.team, self._entries(1, until - dt.timedelta(days=8)), until=until
+            )
+
+        self.assertEqual(execution_limits[0], COUNT_TRIGGER_QUERY_MAX_EXECUTION_TIME_SECONDS)
+        self.assertEqual(execution_limits[1], int(remaining_after_first_attempt / COUNT_TRIGGER_QUERY_OVERSHOOT_FACTOR))
+
+    def test_asks_clickhouse_to_raise_on_timeout_rather_than_return_a_partial_count(self):
+        # Catches a query that inherits the cluster's overflow mode. Under "break" the timeout
+        # never raises, so the split never runs and a partial count decides the threshold.
+        until = timezone.now()
+
+        with patch("posthog.hogql.query.execute_hogql_query") as execute_hogql_query:
+            execute_hogql_query.return_value = Mock(results=[[7]])
+            _count_eval_results_for_reports_with_split_retry(
+                self.team, self._entries(1, until - dt.timedelta(days=1)), until=until
+            )
+
+        self.assertEqual(execute_hogql_query.call_args.kwargs["settings"].timeout_overflow_mode, "throw")
 
 
 class TestPeriodForScheduledReport(BaseTest):
@@ -593,13 +854,16 @@ class TestBatchedCountTriggeredQuery(ClickhouseTestMixin, BaseTest):
                 properties={"$ai_evaluation_id": evaluation_id, **(extra_properties or {})},
             )
 
-    def test_counts_respect_since_evaluation_and_threshold(self):
+    @parameterized.expand([("same_day", dt.timedelta(hours=3)), ("over_seven_days", dt.timedelta(days=10))])
+    def test_counts_respect_since_evaluation_and_threshold(self, _name: str, window: dt.timedelta) -> None:
+        now = self.T0 + window
+        in_window = [self.T0 + dt.timedelta(hours=1), now - dt.timedelta(hours=1)]
         # A: 2 events in-window (threshold 2) -> due. One event before `since` must be excluded.
         report_a = self._create_report(self.team, threshold=2, since=self.T0, name="A")
         self._emit_eval_events(
             self.team,
             str(report_a.evaluation_id),
-            [self.T0 - dt.timedelta(hours=1), self.T0 + dt.timedelta(hours=1), self.T0 + dt.timedelta(hours=2)],
+            [self.T0 - dt.timedelta(hours=1), *in_window],
         )
         # B: same window as A but threshold 5 with only 2 events -> not due. Guards against
         # B's count picking up A's events (evaluation isolation).
@@ -607,7 +871,7 @@ class TestBatchedCountTriggeredQuery(ClickhouseTestMixin, BaseTest):
         self._emit_eval_events(
             self.team,
             str(report_b.evaluation_id),
-            [self.T0 + dt.timedelta(hours=1), self.T0 + dt.timedelta(hours=2)],
+            in_window,
         )
         # C: later `since` (11:00) than A/B — its only event (10:00) predates its window, so 0 -> not due.
         # This proves each report applies its OWN since, not a shared one.
@@ -615,13 +879,52 @@ class TestBatchedCountTriggeredQuery(ClickhouseTestMixin, BaseTest):
         self._emit_eval_events(self.team, str(report_c.evaluation_id), [self.T0 + dt.timedelta(hours=1)])
 
         report_ids = [str(report_a.id), str(report_b.id), str(report_c.id)]
-        results = _check_count_triggered_eval_reports_batch(report_ids, self.NOW)
+        results = _check_count_triggered_eval_reports_batch(report_ids, now)
 
         due_by_id = {r.report_id: r.due for r in results}
         self.assertEqual([r.report_id for r in results], report_ids)
         self.assertTrue(due_by_id[str(report_a.id)])
         self.assertFalse(due_by_id[str(report_b.id)])
         self.assertFalse(due_by_id[str(report_c.id)])
+
+    def test_split_after_a_timeout_counts_a_midpoint_event_exactly_once(self):
+        # An event on the split boundary must count once. Dropped, a report at its threshold
+        # stops firing; counted twice, a report below its threshold fires early.
+        midpoint = self.T0 + (self.NOW - self.T0) / 2
+        timestamps = [self.T0 + dt.timedelta(hours=1), midpoint, self.NOW - dt.timedelta(hours=1)]
+        at_threshold = self._create_report(self.team, threshold=3, since=self.T0, name="at threshold")
+        self._emit_eval_events(self.team, str(at_threshold.evaluation_id), timestamps)
+        above_threshold = self._create_report(self.team, threshold=4, since=self.T0, name="above threshold")
+        self._emit_eval_events(self.team, str(above_threshold.evaluation_id), timestamps)
+
+        attempts = 0
+
+        def time_out_the_first_attempt(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ClickHouseQueryTimeOut()
+            return execute_hogql_query(*args, **kwargs)
+
+        with patch("posthog.hogql.query.execute_hogql_query", side_effect=time_out_the_first_attempt):
+            results = _check_count_triggered_eval_reports_batch(
+                [str(at_threshold.id), str(above_threshold.id)], self.NOW
+            )
+
+        self.assertEqual(attempts, 3)
+        due_by_id = {r.report_id: r.due for r in results}
+        self.assertTrue(due_by_id[str(at_threshold.id)])
+        self.assertFalse(due_by_id[str(above_threshold.id)])
+
+    def test_events_after_check_time_are_excluded(self):
+        # An event timestamped after the check's `now` must not count — guards the explicit
+        # upper bound that keeps the scan from silently reading past the check time.
+        report = self._create_report(self.team, threshold=1, since=self.T0, name="future")
+        self._emit_eval_events(self.team, str(report.evaluation_id), [self.NOW + dt.timedelta(hours=1)])
+
+        results = _check_count_triggered_eval_reports_batch([str(report.id)], self.NOW)
+
+        self.assertFalse(results[0].due)
 
     def test_counts_are_scoped_per_team(self):
         # One report per team, each with a single in-window event and threshold 1. If the batch

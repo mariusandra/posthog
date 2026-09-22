@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.chameleon.chameleon import (
     ChameleonResumeConfig,
@@ -32,6 +26,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.chameleon import (
     ChameleonSourceConfig,
 )
@@ -53,7 +48,7 @@ class ChameleonSource(ResumableSource[ChameleonSourceConfig, ChameleonResumeConf
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.CHAMELEON,
+            name=ExternalDataSourceType.CHAMELEON,
             category=DataWarehouseSourceCategory.ANALYTICS,
             label="Chameleon",
             releaseStatus=ReleaseStatus.ALPHA,
@@ -109,7 +104,11 @@ You can generate an account-specific API secret in your [Chameleon account setti
             ENDPOINTS,
             {},
             names,
-            descriptions={"responses": "Microsurvey responses, fanned out across every Microsurvey. Full refresh only"},
+            descriptions={
+                "responses": "Microsurvey responses, fanned out across every Microsurvey. Full refresh only",
+                "interactions": "Per-user Tour state, fanned out across every Tour. Full refresh only",
+                "properties": "Custom data property definitions for both User Profiles and Companies. Full refresh only",
+            },
             should_sync_default={
                 endpoint: config.should_sync_default for endpoint, config in CHAMELEON_ENDPOINTS.items()
             },

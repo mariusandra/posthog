@@ -11,6 +11,7 @@ import {
     ExternalDataSchemaStatus,
     ExternalDataSourceSyncSchema,
     HogFunctionTemplateType,
+    IncrementalSyncBlockedReason,
 } from '~/types'
 
 export type SyncInterval = DataWarehouseSyncInterval | DataModelingSyncInterval
@@ -168,6 +169,13 @@ export const SyncTypeLabelMap: Record<NonNullable<ExternalDataSourceSyncSchema['
     xmin: 'xmin',
 }
 
+export const IncrementalSyncBlockedMessageMap: Record<IncrementalSyncBlockedReason, string> = {
+    missing_primary_key:
+        "This table has no primary key, so it can't sync incrementally. Pick primary key columns, or change the sync method. If you added a primary key in the source, enable syncing to try again.",
+    duplicate_primary_key:
+        "The primary key used for this table isn't unique, so it can't sync incrementally. Remove the duplicate rows in the source and enable syncing to try again, or change the sync method. The key itself can't be changed once data has synced, unless you delete the synced data first.",
+}
+
 export const SyncFrequencyLabelMap: Record<DataWarehouseSyncInterval, string> = {
     '1min': '1 min',
     '5min': '5 mins',
@@ -184,25 +192,19 @@ export const SyncFrequencyLabelMap: Record<DataWarehouseSyncInterval, string> = 
 // Sync frequencies ordered shortest→longest. Object key order above is the single source of truth.
 export const SYNC_FREQUENCY_ORDER = Object.keys(SyncFrequencyLabelMap) as DataWarehouseSyncInterval[]
 
-// Sub-5-minute cadence is CDC-only; every other sync type floors at 5 minutes. This is the one
-// place that rule lives — the schedule picker, bulk edits, and the clamp all derive from it.
-export const CDC_ONLY_SYNC_FREQUENCIES: DataWarehouseSyncInterval[] = ['1min']
+// Every sync type floors at 5 minutes. Rows written before the floor may still carry '1min'
+// (the label maps above keep rendering it), but it is never offered or accepted again. This is
+// the one place the floor lives — the schedule picker, bulk edits, and the clamp all derive
+// from it. (The backend enforces the same rule in ExternalDataSchemaSerializer.)
+const LEGACY_SUB_FLOOR_SYNC_FREQUENCIES: DataWarehouseSyncInterval[] = ['1min']
 
-// Frequencies a given sync type is allowed to use. (The backend enforces the same rule in
-// ExternalDataSchemaSerializer — keep them in sync if this changes.)
-export function allowedSyncFrequencies(syncType: string | null | undefined): DataWarehouseSyncInterval[] {
-    if (syncType === 'cdc') {
-        return SYNC_FREQUENCY_ORDER
-    }
-    return SYNC_FREQUENCY_ORDER.filter((frequency) => !CDC_ONLY_SYNC_FREQUENCIES.includes(frequency))
+export function allowedSyncFrequencies(): DataWarehouseSyncInterval[] {
+    return SYNC_FREQUENCY_ORDER.filter((frequency) => !LEGACY_SUB_FLOOR_SYNC_FREQUENCIES.includes(frequency))
 }
 
-// Raise a requested frequency to the fastest one the sync type permits (e.g. 1min → 5min for non-CDC).
-export function clampSyncFrequency(
-    requested: DataWarehouseSyncInterval,
-    syncType: string | null | undefined
-): DataWarehouseSyncInterval {
-    const allowed = allowedSyncFrequencies(syncType)
+// Raise a requested frequency to the fastest allowed one (e.g. a legacy 1min → 5min).
+export function clampSyncFrequency(requested: DataWarehouseSyncInterval): DataWarehouseSyncInterval {
+    const allowed = allowedSyncFrequencies()
     return allowed.includes(requested) ? requested : allowed[0]
 }
 

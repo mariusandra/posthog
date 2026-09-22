@@ -9,9 +9,10 @@ use personhog_proto::personhog::types::v1::{
     CountCohortMembersRequest, CreateGroupRequest, DeleteCohortMemberRequest,
     DeleteCohortMembersBulkRequest, DeleteGroupTypeMappingRequest,
     DeleteGroupTypeMappingsBatchForTeamRequest, DeleteGroupsBatchForTeamRequest,
-    DeletePersonsBatchForTeamRequest, DeletePersonsRequest, GetGroupRequest, GetPersonRequest,
-    GetPersonsByDistinctIdsInTeamRequest, InsertCohortMembersRequest, ListCohortMemberIdsRequest,
-    UpdateGroupRequest, UpdateGroupTypeMappingRequest,
+    DeletePersonsBatchForTeamRequest, DeletePersonsRequest, DeleteTombstonedPersonsRequest,
+    GetGroupRequest, GetPersonRequest, GetPersonsByDistinctIdsInTeamRequest,
+    InsertCohortMembersRequest, ListCohortMemberIdsRequest, UpdateGroupRequest,
+    UpdateGroupTypeMappingRequest,
 };
 use rstest::rstest;
 use tonic::Request;
@@ -189,6 +190,43 @@ async fn test_delete_persons_success(#[case] person_uuids: Vec<String>) {
         .await;
 
     assert!(result.is_ok());
+}
+
+// ============================================================
+// DeleteTombstonedPersons tests
+// ============================================================
+
+#[rstest]
+#[case::too_many_uuids(
+    (0..1001).map(|i| format!("00000000-0000-0000-0000-{i:012}")).collect(),
+    0,
+    "1000"
+)]
+#[case::invalid_uuid(vec!["not-a-valid-uuid".to_string()], 0, "Invalid UUID")]
+#[case::negative_max_rows(
+    vec!["00000000-0000-0000-0000-000000000001".to_string()],
+    -1,
+    "max_rows"
+)]
+#[tokio::test]
+async fn test_delete_tombstoned_persons_invalid_input(
+    #[case] person_uuids: Vec<String>,
+    #[case] max_rows: i64,
+    #[case] expected_message: &str,
+) {
+    let service = PersonHogReplicaService::new(Arc::new(mocks::SuccessStorage));
+
+    let status = service
+        .delete_tombstoned_persons(Request::new(DeleteTombstonedPersonsRequest {
+            team_id: 1,
+            person_uuids,
+            max_rows,
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(status.message().contains(expected_message));
 }
 
 // ============================================================
@@ -819,6 +857,7 @@ async fn test_update_group_type_mapping_storage_error(
             name_plural: None,
             detail_dashboard_id: None,
             default_columns: None,
+            created_at: None,
         }))
         .await;
 
@@ -838,12 +877,56 @@ async fn test_update_group_type_mapping_invalid_mask_field() {
             name_plural: None,
             detail_dashboard_id: None,
             default_columns: None,
+            created_at: None,
         }))
         .await
         .unwrap_err();
 
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(status.message().contains("invalid_field"));
+}
+
+#[tokio::test]
+async fn test_update_group_type_mapping_accepts_created_at_in_mask() {
+    let service = PersonHogReplicaService::new(Arc::new(mocks::SuccessStorage));
+
+    let result = service
+        .update_group_type_mapping(Request::new(UpdateGroupTypeMappingRequest {
+            project_id: 999,
+            group_type_index: 0,
+            update_mask: vec!["created_at".to_string()],
+            name_singular: None,
+            name_plural: None,
+            detail_dashboard_id: None,
+            default_columns: None,
+            created_at: Some(1_700_000_000_000),
+        }))
+        .await;
+
+    // NotFound (from the empty mock) proves the mask passed validation
+    assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn test_update_group_type_mapping_invalid_created_at_timestamp() {
+    let service = PersonHogReplicaService::new(Arc::new(mocks::SuccessStorage));
+
+    let status = service
+        .update_group_type_mapping(Request::new(UpdateGroupTypeMappingRequest {
+            project_id: 1,
+            group_type_index: 0,
+            update_mask: vec!["created_at".to_string()],
+            name_singular: None,
+            name_plural: None,
+            detail_dashboard_id: None,
+            default_columns: None,
+            created_at: Some(i64::MAX),
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(status.message().contains("Invalid created_at timestamp"));
 }
 
 #[tokio::test]
@@ -859,6 +942,7 @@ async fn test_update_group_type_mapping_not_found() {
             name_plural: None,
             detail_dashboard_id: None,
             default_columns: None,
+            created_at: None,
         }))
         .await;
 

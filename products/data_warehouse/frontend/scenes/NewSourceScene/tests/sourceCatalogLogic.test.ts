@@ -1,13 +1,15 @@
+import { FEATURE_FLAGS } from 'lib/constants'
 import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
 
 import { useMocks } from '~/mocks/jest'
-import type { SourceConfig } from '~/queries/schema/schema-general'
 import { initKeaTests } from '~/test/init'
+
+import type { SourceConfigResponseApi } from 'products/warehouse_sources/frontend/generated/api.schemas'
 
 import { availableSourcesLogic } from '../availableSourcesLogic'
 import { sourceCatalogLogic } from '../sourceCatalogLogic'
 
-const AVAILABLE_SOURCES: Record<string, SourceConfig> = {
+const AVAILABLE_SOURCES: Record<string, SourceConfigResponseApi> = {
     // Featured, so it must lead the browse list even though `Stripe` sorts after `Mango`.
     Stripe: {
         name: 'Stripe',
@@ -15,12 +17,29 @@ const AVAILABLE_SOURCES: Record<string, SourceConfig> = {
         caption: '',
         featured: true,
         fields: [],
-    } as unknown as SourceConfig,
+    } as unknown as SourceConfigResponseApi,
     // `Apple` sorts alphabetically first but is unreleased, so connectable-first ordering must
     // still push it below the two available sources.
-    Zebra: { name: 'Zebra', label: 'Zebra', fields: [] } as unknown as SourceConfig,
-    Mango: { name: 'Mango', label: 'Mango', fields: [] } as unknown as SourceConfig,
-    Apple: { name: 'Apple', label: 'Apple', unreleasedSource: true, fields: [] } as unknown as SourceConfig,
+    Zebra: { name: 'Zebra', label: 'Zebra', fields: [] } as unknown as SourceConfigResponseApi,
+    Mango: { name: 'Mango', label: 'Mango', fields: [] } as unknown as SourceConfigResponseApi,
+    Apple: { name: 'Apple', label: 'Apple', unreleasedSource: true, fields: [] } as unknown as SourceConfigResponseApi,
+    // Connectable, and shares the "apple" token with the unreleased `Apple` above so a search for
+    // "apple" fuzzy-matches both — used to assert connectable results outrank "Coming soon" ones.
+    ApplePay: { name: 'ApplePay', label: 'Apple Pay', fields: [] } as unknown as SourceConfigResponseApi,
+    // Two sources in distinct categories, used to assert that a category-filtered search which only
+    // matches a source in another category flags a cross-category hint instead of dead-ending.
+    Salesforce: {
+        name: 'Salesforce',
+        label: 'Salesforce',
+        category: 'Sales',
+        fields: [],
+    } as unknown as SourceConfigResponseApi,
+    Datadog: {
+        name: 'Datadog',
+        label: 'Datadog',
+        category: 'Engineering & monitoring',
+        fields: [],
+    } as unknown as SourceConfigResponseApi,
 }
 
 describe('sourceCatalogLogic', () => {
@@ -83,6 +102,18 @@ describe('sourceCatalogLogic', () => {
         expect(names.indexOf('Stripe')).toBeLessThan(names.indexOf('Zebra'))
     })
 
+    it('ranks connectable search matches above "Coming soon" ones', () => {
+        const logic = sourceCatalogLogic()
+        logic.actions.setSearch('apple')
+
+        // Both `Apple` (unreleased → "Coming soon") and `Apple Pay` (connectable) match, but a
+        // search must never lead with a tile the user can't act on.
+        const names = logic.values.filteredItems.map((item) => item.name)
+        expect(names).toContain('ApplePay')
+        expect(names).toContain('Apple')
+        expect(names.indexOf('ApplePay')).toBeLessThan(names.indexOf('Apple'))
+    })
+
     it('surfaces self-managed file-storage connectors when searching for a file format', () => {
         const logic = sourceCatalogLogic()
         logic.actions.setSearch('csv')
@@ -91,6 +122,46 @@ describe('sourceCatalogLogic', () => {
         // find them instead of dead-ending on "no sources match".
         const names = logic.values.filteredItems.map((item) => item.name)
         expect(names).toContain('aws')
+    })
+
+    // Fuse matches the whole search term as one pattern, so one extra word buries a term that
+    // matches on its own: each of these returned nothing at all, which sent the user to "request
+    // a source" for connectors we already have.
+    it.each(['source files', 'parquet file storage', 'amazon s3 bucket'])(
+        'retries a multi-word search word by word for "%s"',
+        (search) => {
+            const logic = sourceCatalogLogic()
+            logic.actions.setSearch(search)
+
+            expect(logic.values.filteredItems.some((item) => item.selfManaged)).toBe(true)
+        }
+    )
+
+    it('ranks a multi-word retry by how many words each source matches', () => {
+        const logic = sourceCatalogLogic()
+        logic.actions.setSearch('amazon gcs gcp')
+
+        // `google-cloud` matches "gcs" and "gcp"; `aws` only "amazon". The closer match must lead,
+        // even though the first word found `aws` and word order alone would keep it first.
+        const names = logic.values.filteredItems.map((item) => item.name)
+        expect(names).toContain('aws')
+        expect(names.indexOf('google-cloud')).toBeLessThan(names.indexOf('aws'))
+    })
+
+    it('flags a cross-category match when a filtered search only hits another category', () => {
+        const logic = sourceCatalogLogic()
+        logic.actions.setSelectedCategory('Sales')
+        logic.actions.setSearch('Datadog')
+
+        // The category filter hides the only match, so the list dead-ends...
+        expect(logic.values.filteredItems).toHaveLength(0)
+        // ...but the hint knows the source exists in another category and can point the user there.
+        expect(logic.values.hasCrossCategoryMatches).toBe(true)
+
+        // The same search across all categories finds it, so the hint is no longer needed.
+        logic.actions.setSelectedCategory('all')
+        expect(logic.values.filteredItems.map((item) => item.name)).toContain('Datadog')
+        expect(logic.values.hasCrossCategoryMatches).toBe(false)
     })
 
     it('clears the request text when the modal is closed', () => {
@@ -117,5 +188,38 @@ describe('sourceCatalogLogic', () => {
 
         expect(logic.values.catalogItems).toBe(initialItems)
         expect(logic.values.catalogFuse).toBe(initialFuse)
+    })
+
+    it.each([
+        { previewEnabled: true, expectedMatches: 1 },
+        { previewEnabled: false, expectedMatches: 0 },
+    ])(
+        'shows the incoming webhook source in a "webhook" search when the preview is $previewEnabled',
+        ({ previewEnabled, expectedMatches }) => {
+            const logic = sourceCatalogLogic()
+            featureFlagLogic.mount()
+            featureFlagLogic.actions.setFeatureFlags(previewEnabled ? [FEATURE_FLAGS.CDP_HOG_SOURCES] : [], {
+                [FEATURE_FLAGS.CDP_HOG_SOURCES]: previewEnabled,
+            })
+
+            logic.actions.setSearch('webhook')
+
+            expect(logic.values.filteredItems.filter((item) => item.name === 'event-webhook')).toHaveLength(
+                expectedMatches
+            )
+        }
+    )
+
+    it('leaves the incoming webhook source out of a catalog restricted to warehouse sources', () => {
+        const logic = sourceCatalogLogic({ allowedSources: ['Stripe'] })
+        const unmountRestricted = logic.mount()
+        featureFlagLogic.mount()
+        featureFlagLogic.actions.setFeatureFlags([FEATURE_FLAGS.CDP_HOG_SOURCES], {
+            [FEATURE_FLAGS.CDP_HOG_SOURCES]: true,
+        })
+
+        expect(logic.values.catalogItems.some((item) => item.name === 'event-webhook')).toBe(false)
+
+        unmountRestricted()
     })
 })

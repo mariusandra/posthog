@@ -8,16 +8,23 @@ from unittest import mock
 from requests import Response
 from requests.adapters import HTTPAdapter
 
+from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.paddle import PaddleSourceConfig
 from products.warehouse_sources.backend.temporal.data_imports.sources.paddle.paddle import (
     PADDLE_BASE_URL,
     PaddlePermissionError,
     PaddleResumeConfig,
+    PaddleUnreachableError,
     _format_paddle_datetime_query_value,
     _get_paddle_session,
     paddle_source,
     validate_credentials,
 )
-from products.warehouse_sources.backend.temporal.data_imports.sources.paddle.source import PaddleSource
+from products.warehouse_sources.backend.temporal.data_imports.sources.paddle.source import (
+    INVALID_API_KEY_ERROR,
+    KEY_CHECK_FAILED_ERROR,
+    MISSING_PERMISSIONS_ERROR,
+    PaddleSource,
+)
 
 # RESTClient builds its session via make_tracked_session in the rest_client module.
 CLIENT_SESSION_PATCH = "products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.rest_client.make_tracked_session"
@@ -25,10 +32,21 @@ CLIENT_SESSION_PATCH = "products.warehouse_sources.backend.temporal.data_imports
 PADDLE_SESSION_PATCH = (
     "products.warehouse_sources.backend.temporal.data_imports.sources.paddle.paddle.make_tracked_session"
 )
+SOURCE_MODULE = "products.warehouse_sources.backend.temporal.data_imports.sources.paddle.source"
 
 
-def _response(items: list[dict[str, Any]] | None, *, next_url: str | None = None, drop_data: bool = False) -> Response:
-    body: dict[str, Any] = {"meta": {"pagination": {"per_page": 200, "next": next_url}}}
+def _response(
+    items: list[dict[str, Any]] | None,
+    *,
+    next_url: str | None = None,
+    has_more: bool | None = None,
+    drop_data: bool = False,
+) -> Response:
+    # Real Paddle bodies always carry has_more; default it from next_url so fixture
+    # pages terminate the way real responses do (via has_more, not a null next).
+    if has_more is None:
+        has_more = next_url is not None
+    body: dict[str, Any] = {"meta": {"pagination": {"per_page": 200, "next": next_url, "has_more": has_more}}}
     if not drop_data:
         body["data"] = items or []
     resp = Response()
@@ -107,6 +125,27 @@ class TestPagination:
 
         assert [r["id"] for r in rows] == ["a", "b"]
         assert session.send.call_count == 1
+
+    @mock.patch(CLIENT_SESSION_PATCH)
+    def test_terminates_when_last_page_repeats_next_url(self, MockSession) -> None:
+        # Real Paddle populates `next` on every page, including the last, where it
+        # points back at the page just fetched; has_more is the only stop signal.
+        # Following `next` alone refetches the final page forever.
+        session = MockSession.return_value
+        last_url = f"{PADDLE_BASE_URL}/customers?after=c_1"
+        _wire(
+            session,
+            [
+                _response([{"id": "c_1"}], next_url=last_url, has_more=True),
+                _response([{"id": "c_2"}], next_url=last_url, has_more=False),
+            ],
+        )
+
+        manager = _make_manager()
+        rows = _rows(_source("customers", manager))
+
+        assert [r["id"] for r in rows] == ["c_1", "c_2"]
+        assert session.send.call_count == 2
 
     @mock.patch(CLIENT_SESSION_PATCH)
     def test_missing_data_key_yields_no_rows(self, MockSession) -> None:
@@ -192,6 +231,23 @@ class TestResume:
         assert params[0] == {}
 
     @mock.patch(CLIENT_SESSION_PATCH)
+    def test_checkpoint_saved_on_last_page_terminates_on_resume(self, MockSession) -> None:
+        # A checkpoint saved while looping on the final page points at that page.
+        # The resumed fetch sees has_more=false, completes, and writes the empty
+        # terminal marker instead of re-saving the same URL.
+        session = MockSession.return_value
+        saved_url = f"{PADDLE_BASE_URL}/customers?after=c_9"
+        _wire(session, [_response([], next_url=saved_url, has_more=False)])
+
+        manager = _make_manager(PaddleResumeConfig(next_url=saved_url))
+        rows = _rows(_source("customers", manager))
+
+        assert rows == []
+        assert session.send.call_count == 1
+        saved = [call.args[0] for call in manager.save_state.call_args_list]
+        assert saved == [PaddleResumeConfig(next_url="")]
+
+    @mock.patch(CLIENT_SESSION_PATCH)
     def test_empty_saved_url_starts_fresh(self, MockSession) -> None:
         session = MockSession.return_value
         params, urls = _wire(session, [_response([{"id": "c_1"}], next_url=None)])
@@ -228,9 +284,56 @@ class TestValidateCredentials:
         assert validate_credentials("key") is False
 
     @mock.patch(PADDLE_SESSION_PATCH)
-    def test_swallows_exceptions(self, mock_session) -> None:
+    def test_transport_failure_is_not_a_rejected_key(self, mock_session) -> None:
         mock_session.return_value.get.side_effect = Exception("boom")
-        assert validate_credentials("key") is False
+        with pytest.raises(PaddleUnreachableError):
+            validate_credentials("key")
+
+
+class TestSourceValidateCredentials:
+    def _validate(self) -> tuple[bool, str | None]:
+        return PaddleSource().validate_credentials(PaddleSourceConfig(paddle_api_key="key"), team_id=1)
+
+    @mock.patch(PADDLE_SESSION_PATCH)
+    def test_ok(self, mock_session) -> None:
+        mock_session.return_value.get.return_value = mock.MagicMock(status_code=200)
+        assert self._validate() == (True, None)
+
+    @pytest.mark.parametrize(
+        "status_code,expected",
+        [(401, INVALID_API_KEY_ERROR), (403, MISSING_PERMISSIONS_ERROR)],
+    )
+    @mock.patch(PADDLE_SESSION_PATCH)
+    def test_refusal_message(self, mock_session, status_code: int, expected: str) -> None:
+        mock_session.return_value.get.return_value = mock.MagicMock(status_code=status_code)
+        valid, message = self._validate()
+
+        assert valid is False
+        assert message == expected
+        # The wizard shows this string and nothing else, so it has to name a next step and must
+        # not carry the probed endpoint name the permission error reports.
+        assert "reconnect" in message
+        assert "Missing permissions" not in message
+
+    @mock.patch(PADDLE_SESSION_PATCH)
+    def test_unreachable_paddle_does_not_blame_the_key(self, mock_session) -> None:
+        mock_session.return_value.get.side_effect = Exception("boom")
+        valid, message = self._validate()
+
+        # Paddle never judged the key, so telling the customer to replace it would send them
+        # rotating a key that works.
+        assert valid is False
+        assert message == KEY_CHECK_FAILED_ERROR
+
+    @mock.patch(f"{SOURCE_MODULE}.validate_paddle_credentials", side_effect=RuntimeError("probe blew up"))
+    @mock.patch(f"{SOURCE_MODULE}.capture_exception")
+    def test_unexpected_failure_is_captured_not_shown(self, mock_capture, _mock_validate) -> None:
+        valid, message = self._validate()
+
+        assert valid is False
+        assert message == KEY_CHECK_FAILED_ERROR
+        assert "probe blew up" not in message
+        assert mock_capture.call_count == 1
 
 
 class TestPaddleSession:
@@ -268,22 +371,3 @@ class TestFormatDatetimeQueryValue:
     )
     def test_normalizes_to_utc_z(self, value: Any, expected: str) -> None:
         assert _format_paddle_datetime_query_value(value) == expected
-
-
-class TestGetSchemas:
-    @pytest.mark.parametrize(
-        "endpoint, expected_incremental",
-        [
-            ("transactions", True),
-            ("customers", False),
-            ("discounts", False),
-            ("prices", False),
-            ("products", False),
-            ("subscriptions", False),
-            ("adjustments", False),
-        ],
-    )
-    def test_incremental_flag_per_endpoint(self, endpoint: str, expected_incremental: bool) -> None:
-        schemas = {schema.name: schema for schema in PaddleSource().get_schemas(config=mock.MagicMock(), team_id=1)}
-        assert schemas[endpoint].supports_incremental is expected_incremental
-        assert schemas[endpoint].supports_append is expected_incremental

@@ -68,7 +68,7 @@ export interface eventsSceneLogicMeta {
 export type eventsSceneLogicType = MakeLogicType<
     eventsSceneLogicValues,
     eventsSceneLogicActions,
-    Record<string, any>,
+    EventsSceneLogicProps,
     eventsSceneLogicMeta
 >
 

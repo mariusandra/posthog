@@ -8,9 +8,6 @@ import {
     getDisplayNameFromEntityNode,
     humanizePathsEventTypes,
 } from 'scenes/insights/utils'
-import { retentionOptions } from 'scenes/retention/constants'
-import { MathCategory, apiValueToMathType, mathsLogic } from 'scenes/trends/mathsLogic'
-import type { mathsLogicType } from 'scenes/trends/mathsLogic'
 
 import { cohortsModel } from '~/models/cohortsModel'
 import type { cohortsModelType } from '~/models/cohortsModel'
@@ -32,6 +29,7 @@ import {
     isInsightVizNode,
     isLifecycleQuery,
     isPathsQuery,
+    isPathsV2Query,
     isPersonsNode,
     isRetentionQuery,
     isStickinessQuery,
@@ -42,6 +40,15 @@ import {
 import { getCoreFilterDefinition } from '~/taxonomy/helpers'
 import { CORE_FILTER_DEFINITIONS_BY_GROUP } from '~/taxonomy/taxonomy'
 import { BreakdownKeyType, BreakdownType, EntityFilter, FilterType, FunnelVizType, StepOrderValue } from '~/types'
+
+import { summarizeJourneys } from 'products/product_analytics/frontend/insights/journeys/journeysSummary'
+import { retentionOptions } from 'products/product_analytics/frontend/insights/retention/constants'
+import {
+    MathCategory,
+    apiValueToMathType,
+    mathsLogic,
+} from 'products/product_analytics/frontend/insights/trends/mathsLogic'
+import type { mathsLogicType } from 'products/product_analytics/frontend/insights/trends/mathsLogic'
 
 function summarizeSingularBreakdown(
     breakdown: BreakdownKeyType | undefined,
@@ -220,6 +227,8 @@ export function summarizeInsightQuery(query: InsightQueryNode, context: SummaryC
             summary += `${query.pathsFilter?.startPoint ? ' and' : ''} ending at ${query.pathsFilter?.endPoint}`
         }
         return summary
+    } else if (isPathsV2Query(query)) {
+        return summarizeJourneys(query.pathsV2Filter)
     } else if (isStickinessQuery(query)) {
         return capitalizeFirstLetter(
             query.series

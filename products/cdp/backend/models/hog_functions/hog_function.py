@@ -1,4 +1,5 @@
 import enum
+from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
@@ -60,17 +61,24 @@ class HogFunctionType(models.TextChoices):
     WAREHOUSE_SOURCE_WEBHOOK = "warehouse_source_webhook"
     SITE_APP = "site_app"
     TRANSFORMATION = "transformation"
+    TRANSFORMATION_LOG = "transformation_log"
+    # Run inline by CdpLegacyEventsConsumer, never by a cyclotron worker
+    LEGACY_DESTINATION = "legacy_destination"
 
 
 TYPES_THAT_RELOAD_PLUGIN_SERVER = (
     HogFunctionType.DESTINATION,
     HogFunctionType.TRANSFORMATION,
+    HogFunctionType.TRANSFORMATION_LOG,
     HogFunctionType.INTERNAL_DESTINATION,
     HogFunctionType.SOURCE_WEBHOOK,
     HogFunctionType.WAREHOUSE_SOURCE_WEBHOOK,
+    HogFunctionType.LEGACY_DESTINATION,
 )
 TYPES_WITH_TRANSPILED_FILTERS = (HogFunctionType.SITE_DESTINATION, HogFunctionType.SITE_APP)
 TYPES_WITH_JAVASCRIPT_SOURCE = (HogFunctionType.SITE_DESTINATION, HogFunctionType.SITE_APP)
+# Types that run sequentially during ingestion and are ordered by execution_order
+TYPES_WITH_EXECUTION_ORDER = (HogFunctionType.TRANSFORMATION, HogFunctionType.TRANSFORMATION_LOG)
 
 # Function types a cyclotron worker actually executes, so a "rerun" — which re-enqueues
 # the stored invocation onto the cyclotron hog queue — can run to completion. Every other
@@ -82,6 +90,21 @@ TYPES_THAT_CAN_RERUN = (
     HogFunctionType.DESTINATION,
     HogFunctionType.INTERNAL_DESTINATION,
 )
+
+# A save touching only these columns stages config for review — it never changes what workers
+# execute, so it must skip both the worker reload and the live-column normalization in save().
+DRAFT_ONLY_UPDATE_FIELDS = frozenset({"draft", "draft_updated_at", "draft_encrypted_inputs"})
+
+
+DERIVED_FILTER_KEYS = {"bytecode", "bytecode_error"}
+
+
+def _is_draft_only_save(update_fields: Optional[Iterable[str]]) -> bool:
+    return update_fields is not None and set(update_fields) <= DRAFT_ONLY_UPDATE_FIELDS
+
+
+def _raw_filters(filters: dict | None) -> dict:
+    return {key: value for key, value in (filters or {}).items() if key not in DERIVED_FILTER_KEYS}
 
 
 class HogFunction(FileSystemSyncMixin, UUIDTModel):
@@ -137,6 +160,18 @@ class HogFunction(FileSystemSyncMixin, UUIDTModel):
         blank=True,
     )
 
+    # db_default alongside default: the plugin-server test fixtures INSERT into this table with raw
+    # SQL that doesn't list this column, and the test-schema builder skips migrations entirely.
+    version = models.IntegerField(default=1, db_default=1)
+
+    # Draft storage for enabled functions: stores pending edits separately from the live config.
+    draft = models.JSONField(null=True, blank=True)
+    draft_updated_at = models.DateTimeField(null=True, blank=True)
+    # Pending secret inputs for the draft, same shape as `encrypted_inputs`. Kept separate so a
+    # draft's secrets are promoted to `encrypted_inputs` on publish and dropped on discard, without
+    # ever touching the live values.
+    draft_encrypted_inputs: EncryptedJSONStringField = EncryptedJSONStringField(null=True, blank=True)
+
     @classmethod
     def get_file_system_unfiled(cls, team: "Team", surface: str = DEFAULT_SURFACE) -> QuerySet["HogFunction"]:
         base_qs = HogFunction.objects.filter(team=team, deleted=False)
@@ -155,6 +190,9 @@ class HogFunction(FileSystemSyncMixin, UUIDTModel):
         elif self.type == HogFunctionType.TRANSFORMATION:
             folder = "Unfiled/Transformations"
             href = f"/pipeline/transformations/hog-{self.pk}/configuration"
+        elif self.type == HogFunctionType.TRANSFORMATION_LOG:
+            folder = "Unfiled/Transformations"
+            href = f"/functions/{self.pk}/configuration"
         elif self.type == HogFunctionType.SOURCE_WEBHOOK:
             folder = "Unfiled/Sources"
             href = f"/functions/{self.pk}/configuration"
@@ -250,12 +288,63 @@ class HogFunction(FileSystemSyncMixin, UUIDTModel):
     def url(self):
         return absolute_uri(f"/project/{self.team_id}/pipeline/destinations/hog-{str(self.id)}")
 
-    def save(self, *args, **kwargs):
+    def _compile_filters(self) -> dict:
         from posthog.cdp.filters import compile_filters_bytecode
+
+        compiled = compile_filters_bytecode(self.filters, self.team)
+        if not compiled.get("bytecode_error"):
+            return compiled
+
+        # compile_filters_bytecode nulls the bytecode next to the error, so a save that is not about
+        # these filters, such as one after a cohort stops being inlinable, would otherwise leave an
+        # enabled function that matches nothing. The error stays on the filters for the UI.
+        previous = (
+            {}
+            if self._state.adding
+            else (
+                HogFunction.objects.filter(pk=self.pk, team_id=self.team_id).values_list("filters", flat=True).first()
+                or {}
+            )
+        )
+        previous_bytecode = previous.get("bytecode")
+
+        # The runtime reads raw fields beside the bytecode - `source` picks the consumer, `events`
+        # drives the pre-filter - so new raw fields on an old program would apply rules the stored
+        # filters no longer describe.
+        if previous_bytecode is not None and _raw_filters(compiled) == _raw_filters(previous):
+            compiled["bytecode"] = previous_bytecode
+            logger.warning(
+                "hog_function_filters_kept_previous_bytecode",
+                hog_function_id=str(self.pk),
+                team_id=self.team_id,
+                bytecode_error=compiled["bytecode_error"],
+            )
+        elif self._state.adding and self.enabled:
+            # A new function has no working bytecode to fall back on, so saving it enabled would
+            # create a function that is on and matches nothing. An existing function already in
+            # that state stays enabled: notify_uncompilable_hog_function_filters is what tells its
+            # owner, and refresh_affected_hog_functions starts it delivering again once the cause
+            # is fixed. Both need the function to still be on, and a bulk re-save must not take
+            # that away silently.
+            self.enabled = False
+            logger.warning(
+                "hog_function_created_disabled_uncompilable_filters",
+                hog_function_id=str(self.pk),
+                team_id=self.team_id,
+                bytecode_error=compiled["bytecode_error"],
+            )
+
+        return compiled
+
+    def save(self, *args, **kwargs):
+        if _is_draft_only_save(kwargs.get("update_fields")):
+            # Nothing here writes a live column, so re-splitting live secrets and recompiling filter
+            # bytecode (a DB-hitting compile) would be pure waste.
+            return super().save(*args, **kwargs)
 
         self.move_secret_inputs()
         if self.type not in TYPES_WITH_TRANSPILED_FILTERS:
-            self.filters = compile_filters_bytecode(self.filters, self.team)
+            self.filters = self._compile_filters()
 
         return super().save(*args, **kwargs)
 
@@ -265,6 +354,11 @@ class HogFunction(FileSystemSyncMixin, UUIDTModel):
 
 @receiver(post_save, sender=HogFunction)
 def hog_function_saved(sender, instance: HogFunction, created, **kwargs):
+    # A draft-only write stages config for a human to review; pushing it to workers would defeat
+    # the point of staging it.
+    if _is_draft_only_save(kwargs.get("update_fields")):
+        return
+
     if instance.type is None or instance.type in TYPES_THAT_RELOAD_PLUGIN_SERVER:
         reload_hog_functions_on_workers(team_id=instance.team_id, hog_function_ids=[str(instance.id)])
 
@@ -308,6 +402,9 @@ def cohort_saved(sender, instance, **kwargs):
 
 @mutable_receiver([post_save, post_delete], sender=HogFunction)
 def team_inject_web_apps_changd(sender, instance, created=None, **kwargs):
+    # A draft-only write can't change which site apps /decide serves.
+    if _is_draft_only_save(kwargs.get("update_fields")):
+        return
     try:
         team = instance.team
     except Team.DoesNotExist:

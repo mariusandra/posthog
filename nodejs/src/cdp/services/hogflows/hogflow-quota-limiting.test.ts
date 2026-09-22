@@ -43,9 +43,8 @@ describe('HogFlow Quota Limiting', () => {
             const result = await checkHogFlowQuotaLimits(hogFlow, teamId, mockQuotaLimiting)
 
             expect(result.isLimited).toBe(false)
-            expect(mockQuotaLimiting.isTeamQuotaLimited).toHaveBeenCalledTimes(3)
+            expect(mockQuotaLimiting.isTeamQuotaLimited).toHaveBeenCalledTimes(2)
             expect(mockQuotaLimiting.isTeamQuotaLimited).toHaveBeenCalledWith(teamId, 'workflow_emails')
-            expect(mockQuotaLimiting.isTeamQuotaLimited).toHaveBeenCalledWith(teamId, 'workflow_push')
             expect(mockQuotaLimiting.isTeamQuotaLimited).toHaveBeenCalledWith(
                 teamId,
                 'workflow_destinations_dispatched'
@@ -68,9 +67,9 @@ describe('HogFlow Quota Limiting', () => {
             expect(result.isLimited).toBe(true)
         })
 
-        it('should limit workflow with push action when team has push quota limit', async () => {
+        it('should limit workflow with push action when team has destination quota limit', async () => {
             mockQuotaLimiting.isTeamQuotaLimited.mockImplementation((_teamId, resource) => {
-                return Promise.resolve(resource === 'workflow_push')
+                return Promise.resolve(resource === 'workflow_destinations_dispatched')
             })
 
             const hogFlow: HogFlow = {
@@ -157,9 +156,8 @@ describe('HogFlow Quota Limiting', () => {
             const result = await checkHogFlowQuotaLimits(hogFlow, teamId, mockQuotaLimiting)
 
             expect(result.isLimited).toBe(false)
-            expect(mockQuotaLimiting.isTeamQuotaLimited).toHaveBeenCalledTimes(3)
+            expect(mockQuotaLimiting.isTeamQuotaLimited).toHaveBeenCalledTimes(2)
             expect(mockQuotaLimiting.isTeamQuotaLimited).toHaveBeenCalledWith(teamId, 'workflow_emails')
-            expect(mockQuotaLimiting.isTeamQuotaLimited).toHaveBeenCalledWith(teamId, 'workflow_push')
             expect(mockQuotaLimiting.isTeamQuotaLimited).toHaveBeenCalledWith(
                 teamId,
                 'workflow_destinations_dispatched'
@@ -182,6 +180,7 @@ describe('HogFlow Quota Limiting', () => {
                 actions: [],
                 trigger: { type: 'event' },
                 billable_action_types: [],
+                version: 4,
             } as unknown as HogFlow,
         } as CyclotronJobInvocationHogFlow
 
@@ -244,6 +243,7 @@ describe('HogFlow Quota Limiting', () => {
                     metric_kind: 'failure',
                     metric_name: 'quota_limited',
                     count: 1,
+                    app_source_version: { id: expect.any(String), version: 4 },
                 },
                 'hog_flow'
             )

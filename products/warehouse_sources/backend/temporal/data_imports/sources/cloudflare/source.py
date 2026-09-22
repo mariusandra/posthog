@@ -1,29 +1,27 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
 )
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
-)
 from products.warehouse_sources.backend.temporal.data_imports.sources.cloudflare.cloudflare import (
     cloudflare_source,
     validate_credentials as validate_cloudflare_credentials,
 )
-from products.warehouse_sources.backend.temporal.data_imports.sources.cloudflare.settings import ENDPOINTS
+from products.warehouse_sources.backend.temporal.data_imports.sources.cloudflare.settings import (
+    ENDPOINTS,
+    INCREMENTAL_FIELDS,
+)
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, SimpleSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
     CanonicalDescriptions,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.cloudflare import (
     CloudflareSourceConfig,
 )
@@ -51,15 +49,15 @@ class CloudflareSource(SimpleSource[CloudflareSourceConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.CLOUDFLARE,
+            name=ExternalDataSourceType.CLOUDFLARE,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="Cloudflare",
-            caption="""Enter your Cloudflare API token to pull your Cloudflare configuration data into the PostHog Data warehouse.
+            caption="""Enter your Cloudflare API token to pull your Cloudflare configuration, security, and usage data into the PostHog Data warehouse.
 
-Create an API token in the [Cloudflare dashboard](https://dash.cloudflare.com/profile/api-tokens) with read permissions for Account Settings, Zone, and DNS. DNS records are synced from every zone the token can access.""",
+Create an API token in the [Cloudflare dashboard](https://dash.cloudflare.com/profile/api-tokens) with read permissions for the areas you want to sync, such as Account Settings, Zone, DNS, Firewall Services, Logs, Workers, and Access. Zone tables are synced from every zone the token can read, and account tables from every account. Zones and accounts the token can't read are skipped.""",
             iconPath="/static/services/cloudflare.svg",
             docsUrl="https://posthog.com/docs/cdp/sources/cloudflare",
-            releaseStatus=ReleaseStatus.BETA,
+            releaseStatus=ReleaseStatus.GA,
             fields=cast(
                 list[FieldType],
                 [
@@ -91,14 +89,15 @@ Create an API token in the [Cloudflare dashboard](https://dash.cloudflare.com/pr
         force_refresh: bool = False,
         api_version: str | None = None,
     ) -> list[SourceSchema]:
-        # v4 REST lists are small configuration tables with no updated-since
-        # filters; the analytics datasets live in the GraphQL API (follow-up).
+        # Most v4 REST lists are small configuration tables with no updated-since
+        # filter, so they full refresh. Only endpoints in INCREMENTAL_FIELDS take a
+        # server-side timestamp filter.
         schemas = [
             SourceSchema(
                 name=endpoint,
-                supports_incremental=False,
-                supports_append=False,
-                incremental_fields=[],
+                supports_incremental=endpoint in INCREMENTAL_FIELDS,
+                supports_append=endpoint in INCREMENTAL_FIELDS,
+                incremental_fields=INCREMENTAL_FIELDS.get(endpoint, []),
             )
             for endpoint in ENDPOINTS
         ]
@@ -116,10 +115,19 @@ Create an API token in the [Cloudflare dashboard](https://dash.cloudflare.com/pr
         schema_name: Optional[str] = None,
         api_version: str | None = None,
     ) -> tuple[bool, str | None]:
-        if validate_cloudflare_credentials(config.api_token):
+        is_valid, status = validate_cloudflare_credentials(config.api_token)
+        if is_valid:
             return True, None
 
-        return False, "Invalid Cloudflare API token"
+        if status is None or status == 429 or status >= 500:
+            return (
+                False,
+                "Couldn't reach Cloudflare to verify your API token. Try again in a moment.",
+            )
+        return (
+            False,
+            "Your Cloudflare API token was rejected. Create a new token with read permissions in your Cloudflare dashboard, then reconnect.",
+        )
 
     def source_for_pipeline(self, config: CloudflareSourceConfig, inputs: SourceInputs) -> SourceResponse:
         return cloudflare_source(
@@ -127,4 +135,8 @@ Create an API token in the [Cloudflare dashboard](https://dash.cloudflare.com/pr
             endpoint=inputs.schema_name,
             team_id=inputs.team_id,
             job_id=inputs.job_id,
+            should_use_incremental_field=inputs.should_use_incremental_field,
+            db_incremental_field_last_value=inputs.db_incremental_field_last_value
+            if inputs.should_use_incremental_field
+            else None,
         )

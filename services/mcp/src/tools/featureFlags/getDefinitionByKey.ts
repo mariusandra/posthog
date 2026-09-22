@@ -2,6 +2,8 @@ import { z } from 'zod'
 
 import type { Schemas } from '@/api/generated'
 import { ToolInputValidationError } from '@/lib/errors'
+import { normalizeParamAliases } from '@/tools/cast-helpers'
+import { resolveFlagsByKey } from '@/tools/featureFlags/resolveFlagsByKey'
 import { withPostHogUrl, type WithPostHogUrl } from '@/tools/tool-utils'
 import type { Context, ToolBase } from '@/tools/types'
 
@@ -22,9 +24,20 @@ import type { Context, ToolBase } from '@/tools/types'
  * keep throwing where the caller expects the target to already exist, so a miss signals a
  * genuine problem rather than an expected outcome.
  */
-const schema = z.object({
-    key: z.string().describe('The feature flag key: the string identifier used in code (e.g. "new-checkout").'),
-})
+// Agents composing this call in exec mode reconstruct the param name from the tool
+// name rather than reading the advertised schema, and reach for `flagKey` /
+// `flag_key` / `feature_flag_key` where the schema requires `key` — production
+// traces show that mismatch, not a genuinely absent key, as the dominant
+// validation failure. Normalize the aliases onto `key` before validation (same
+// pattern as the insight-id aliases; see normalizeParamAliases). The canonical
+// `key` still wins on conflict, and the advertised JSON schema is unchanged —
+// preprocess renders as the wrapped object, so it still shows only `key`.
+const schema = z.preprocess(
+    normalizeParamAliases({ key: ['flagKey', 'flag_key', 'feature_flag_key', 'featureFlagKey'] }),
+    z.object({
+        key: z.string().describe('The feature flag key: the string identifier used in code (e.g. "new-checkout").'),
+    })
+)
 
 type Params = z.infer<typeof schema>
 
@@ -49,19 +62,7 @@ const featureFlagGetDefinitionByKey = (): ToolBase<typeof schema, Result> => ({
 
         const projectId = await context.stateManager.getProjectId()
 
-        // The list endpoint's `key` filter is a case-insensitive exact match, so it can return
-        // more than one flag only when two keys differ solely by case — prefer an exact-case
-        // match among the results before falling back to whatever case-insensitive match came
-        // back. The search result already has the full flag, so it's wrapped directly instead of
-        // triggering a redundant fetch-by-id round trip.
-        const list = await context.api.request<Schemas.PaginatedFeatureFlagList>({
-            method: 'GET',
-            path: `/api/projects/${encodeURIComponent(projectId)}/feature_flags/`,
-            query: { key, limit: 5 },
-        })
-        const results = list.results ?? []
-        const exact = results.filter((flag) => flag.key === key)
-        const matches = exact.length > 0 ? exact : results
+        const matches = await resolveFlagsByKey(context, projectId, key)
 
         if (matches.length === 0) {
             return {
@@ -82,6 +83,8 @@ const featureFlagGetDefinitionByKey = (): ToolBase<typeof schema, Result> => ({
             )
         }
         const flag = matches[0]!
+        // The list row is already the full flag, so it's wrapped directly instead of
+        // triggering a redundant fetch-by-id round trip.
         const flagWithUrl = await withPostHogUrl(context, flag, `/feature_flags/${flag.id}`)
         return { ...flagWithUrl, found: true }
     },

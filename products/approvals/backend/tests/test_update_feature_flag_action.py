@@ -1,17 +1,25 @@
+from datetime import timedelta
 from typing import Any
 
 from posthog.test.base import APIBaseTest
 from unittest.mock import MagicMock, patch
 
+from django.utils import timezone
+
 from parameterized import parameterized
+
+from posthog.models import Team
 
 from products.approvals.backend.actions.feature_flags import (
     DisableFeatureFlagAction,
     EnableFeatureFlagAction,
     UpdateFeatureFlagAction,
+    _resolve_existing_flag,
 )
 from products.approvals.backend.models import ApprovalPolicy, ChangeRequest
 from products.approvals.backend.policies import PolicyEngine
+from products.approvals.backend.services import ChangeRequestService
+from products.dashboards.backend.models.dashboard import Dashboard
 from products.feature_flags.backend.models.feature_flag import FeatureFlag
 
 SINGLE_DICT_PATHS = {"holdout"}
@@ -253,6 +261,49 @@ class TestUpdateFeatureFlagActionExtractIntent(APIBaseTest):
         assert any("groups" in path for path in intent["triggered_paths"])
 
 
+@patch("products.approvals.backend.decorators._is_approvals_enabled", return_value=True)
+class TestRelatedFieldsInIntent(APIBaseTest):
+    def test_gated_update_stores_related_field_as_primary_keys_then_applies(self, _mock_enabled):
+        ApprovalPolicy.objects.create(
+            organization=self.organization,
+            team=self.team,
+            action_key="feature_flag.enable",
+            conditions={},
+            approver_config={"quorum": 1, "users": [self.user.id]},
+            created_by=self.user,
+        )
+        dashboard = Dashboard.objects.create(team=self.team, name="Flag analytics", created_by=self.user)
+        flag = FeatureFlag.objects.create(
+            team=self.team,
+            key="test-flag",
+            filters={"groups": [{"properties": [], "rollout_percentage": 50}]},
+            active=False,
+            created_by=self.user,
+        )
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/feature_flags/{flag.id}/",
+            {"active": True, "analytics_dashboards": [dashboard.id]},
+            format="json",
+        )
+
+        assert response.status_code == 409, response.content
+        assert response.json().get("code") == "approval_required"
+
+        change_request = ChangeRequest.objects.get(action_key="feature_flag.enable")
+        assert change_request.intent["full_request_data"]["analytics_dashboards"] == [dashboard.id]
+
+        assert FeatureFlag.objects.get(team=self.team, key="test-flag").active is False
+
+        # Apply replays the stored intent through the serializer, so the related field has to survive the round trip.
+        result = ChangeRequestService(change_request, self.user).approve()
+        assert result.status == "applied"
+
+        applied_flag = FeatureFlag.objects.get(team=self.team, key="test-flag")
+        assert applied_flag.active is True
+        assert list(applied_flag.analytics_dashboards.all()) == [dashboard]
+
+
 class TestUpdateFeatureFlagActionDisplayData(APIBaseTest):
     def test_get_display_data_generates_human_readable_diff(self):
         intent_data = {
@@ -346,6 +397,63 @@ class TestCheckStaleness(APIBaseTest):
         result = BaseAction.check_staleness({"preconditions": {"version": 1}}, {})
 
         assert result is False
+
+    def test_not_stale_for_create_type_request_with_no_instance(self):
+        # A create-type request has no flag row yet, so preconditions.version is None and
+        # context has no instance. That must not be treated as staleness, or every
+        # create-type change request would be marked stale before it's ever approved.
+        intent = {"preconditions": {"version": None}}
+
+        result = EnableFeatureFlagAction.check_staleness(intent, {})
+
+        assert result is False
+
+    def test_stale_when_instance_missing_but_version_was_stored(self):
+        # An update/enable/disable request whose flag can no longer be resolved
+        # (e.g. deleted) genuinely is stale, unlike the create-type case above.
+        intent = {"preconditions": {"version": 1}}
+
+        result = EnableFeatureFlagAction.check_staleness(intent, {})
+
+        assert result is True
+
+
+class TestResolveExistingFlag(APIBaseTest):
+    def _make_change_request(self, team: Team, flag_id: int | str | None) -> ChangeRequest:
+        return ChangeRequest.objects.create(
+            team=team,
+            organization=self.organization,
+            created_by=self.user,
+            action_key="feature_flag.enable",
+            resource_type="feature_flag",
+            resource_id=None,
+            state="pending",
+            intent={"flag_id": flag_id, "full_request_data": {}},
+            intent_display={"description": "Enable feature flag"},
+            policy_snapshot={"quorum": 1, "users": [self.user.id]},
+            expires_at=timezone.now() + timedelta(hours=24),
+        )
+
+    def test_resolves_flag_owned_by_a_sibling_team_in_the_same_project(self):
+        # Multi-environment projects have one FeatureFlag row per team, but the change
+        # request can be created against a sibling environment of the same project.
+        # A team_id-scoped lookup misses the flag entirely and looks like a deleted
+        # resource — resolution must be project-scoped instead.
+        sibling_team = Team.objects.create(organization=self.organization, project=self.team.project)
+        flag = FeatureFlag.objects.create(team=sibling_team, key="cross-env-flag", created_by=self.user)
+        change_request = self._make_change_request(self.team, flag.id)
+
+        resolved = _resolve_existing_flag(change_request)
+
+        assert resolved is not None
+        assert resolved.id == flag.id
+
+    def test_returns_none_when_flag_does_not_exist_in_the_project(self):
+        change_request = self._make_change_request(self.team, 999999999)
+
+        resolved = _resolve_existing_flag(change_request)
+
+        assert resolved is None
 
 
 class TestPolicyConditionEvaluation(APIBaseTest):

@@ -34,7 +34,18 @@ class EmbeddingResponse:
     did_truncate: bool
 
 
+@dataclass(frozen=True)
+class DocumentKey:
+    """The full embedding identity; document_id alone is not unique."""
+
+    product: str
+    document_type: str
+    rendering: str
+    document_id: str
+
+
 _EMBEDDING_URL = EMBEDDING_API_URL + "/generate/ad_hoc"
+_RECENTLY_SEEN_URL = EMBEDDING_API_URL + "/recently_seen"
 
 
 def _build_embedding_payload(team: Team, content: str, model: str | None, no_truncate: bool) -> dict:
@@ -53,12 +64,15 @@ def _build_embedding_payload(team: Team, content: str, model: str | None, no_tru
 def _raise_for_embedding_response(response) -> None:
     """raise_for_status() with a clearer hint when the worker rejects ad-hoc requests
     because the organization has not opted into AI data processing — a common dev
-    foot-gun where the underlying 403 body is hidden behind a generic HTTPStatusError.
+    foot-gun otherwise hidden behind a generic HTTPStatusError.
+
+    The worker returns 403 for the opt-in gate and nothing else, and sends no body
+    with it, so the status alone identifies the case.
     """
-    if response.status_code == 403 and "ai" in response.text.lower():
+    if response.status_code == 403:
         raise httpx.HTTPStatusError(
-            f"Embedding worker returned 403: {response.text}. "
-            "Likely the organization has not opted into AI data processing — "
+            "Embedding worker returned 403. "
+            "The organization has not opted into AI data processing — "
             "set Organization.is_ai_data_processing_approved=True (Settings > AI, "
             "or via SQL in local dev) and retry.",
             request=response.request,
@@ -161,3 +175,61 @@ def emit_embedding_request(
 
     producer = get_producer(topic=KAFKA_DOCUMENT_EMBEDDINGS_INPUT_TOPIC)
     return producer.produce(topic=KAFKA_DOCUMENT_EMBEDDINGS_INPUT_TOPIC, data=payload)
+
+
+def _build_recently_seen_payload(documents: list[DocumentKey], team_id: int) -> dict:
+    return {
+        "team_id": team_id,
+        "documents": [
+            {
+                "product": d.product,
+                "document_type": d.document_type,
+                "rendering": d.rendering,
+                "document_id": d.document_id,
+            }
+            for d in documents
+        ],
+    }
+
+
+def _parse_recently_seen_response(data: list[dict]) -> dict[DocumentKey, Optional[datetime]]:
+    results: dict[DocumentKey, Optional[datetime]] = {}
+    for item in data:
+        key = DocumentKey(
+            product=item["product"],
+            document_type=item["document_type"],
+            rendering=item["rendering"],
+            document_id=item["document_id"],
+        )
+        emitted_at = item.get("emitted_at")
+        results[key] = datetime.fromisoformat(emitted_at) if emitted_at else None
+    return results
+
+
+def get_recently_seen_documents(
+    documents: list[DocumentKey],
+    *,
+    team_id: int,
+    timeout: float | None = 30.0,
+) -> dict[DocumentKey, Optional[datetime]]:
+    """Return each document's worker emission time, or None when it is not cached."""
+    if not documents:
+        return {}
+    payload = _build_recently_seen_payload(documents, team_id)
+    response = internal_requests.post(_RECENTLY_SEEN_URL, json=payload, timeout=timeout)
+    response.raise_for_status()
+    return _parse_recently_seen_response(response.json())
+
+
+async def async_get_recently_seen_documents(
+    documents: list[DocumentKey],
+    *,
+    team_id: int,
+) -> dict[DocumentKey, Optional[datetime]]:
+    if not documents:
+        return {}
+    payload = _build_recently_seen_payload(documents, team_id)
+    async with internal_httpx_async_client(timeout=30.0) as client:
+        response = await client.post(_RECENTLY_SEEN_URL, json=payload)
+        response.raise_for_status()
+        return _parse_recently_seen_response(response.json())

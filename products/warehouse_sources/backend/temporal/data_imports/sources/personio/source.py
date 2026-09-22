@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -26,6 +20,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.personio import (
     PersonioSourceConfig,
 )
@@ -64,12 +59,12 @@ class PersonioSource(ResumableSource[PersonioSourceConfig, PersonioResumeConfig]
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.PERSONIO,
+            name=ExternalDataSourceType.PERSONIO,
             category=DataWarehouseSourceCategory.HR___RECRUITING,
             label="Personio",
             caption="""Enter your Personio API credentials to pull your Personio HR data into the PostHog Data warehouse.
 
-An admin can create API credentials in Personio under Settings > Integrations > API credentials. Grant the read scopes for the datasets you want to sync (`personio:persons:read`, `personio:absences:read`, `personio:attendances:read`) and whitelist the employee attributes you need — attributes that aren't whitelisted are silently omitted from responses.""",
+An admin can create API credentials in Personio under Settings > Integrations > API credentials. Grant the read scopes for the datasets you want to sync (`personio:persons:read`, `personio:absences:read`, `personio:attendances:read`, `personio:salary-bands:read`, `personio:cost-centers:read`) and whitelist the employee attributes you need — attributes that aren't whitelisted are silently omitted from responses.""",
             iconPath="/static/services/personio.png",
             docsUrl="https://posthog.com/docs/cdp/sources/personio",
             releaseStatus=ReleaseStatus.ALPHA,

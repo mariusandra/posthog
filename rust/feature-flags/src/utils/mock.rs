@@ -324,6 +324,7 @@ mod tests {
             deleted: false,
             team_id: 99,
             filters: FlagFilters {
+                non_v1: None,
                 groups: vec![FlagPropertyGroup {
                     properties: Some(vec![crate::properties::property_models::PropertyFilter {
                         key: "country".to_string(),
@@ -418,6 +419,7 @@ mod tests {
             last_backfill_person_properties_at: None,
             last_backfill_events_at: None,
             condition_type: None,
+            last_realtime_cohort_calculation_at: None,
         };
 
         let mock_cohort = mock!(Cohort,

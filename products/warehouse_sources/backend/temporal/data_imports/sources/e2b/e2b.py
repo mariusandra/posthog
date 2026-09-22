@@ -3,7 +3,6 @@ from typing import Any, Optional
 
 from requests import Request, Response
 
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.http import make_tracked_session
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source import (
     RESTAPIConfig,
@@ -12,6 +11,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.res
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source.paginators import BasePaginator
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.source_helpers import validate_via_probe
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.e2b.settings import E2B_ENDPOINTS
 
 # E2B exposes a single global base URL; there are no regional hosts.
@@ -26,6 +26,17 @@ NEXT_TOKEN_PARAM = "nextToken"
 # (API keys, tokens) there. Writing it to the warehouse table would let anyone with table read access
 # read credentials they can't see in the protected source config, so we drop it before ingesting.
 SENSITIVE_FIELDS = ("metadata",)
+
+# Shared with the source's 401 and 403 entries in `get_non_retryable_errors` so a rejected key reads
+# the same whether it surfaces while the source is being set up or during a later sync.
+INVALID_CREDENTIALS_ERROR = (
+    "Your E2B API key is invalid or has been revoked. Create a new team-scoped API key in your E2B "
+    "dashboard, then reconnect."
+)
+NO_ACCESS_ERROR = (
+    "Your E2B API key does not have access to this data. Check the key's team scope in your E2B "
+    "dashboard, then reconnect."
+)
 
 
 def _scrub(item: dict[str, Any]) -> dict[str, Any]:
@@ -168,11 +179,13 @@ def e2b_source(
     )
 
 
-def validate_credentials(api_key: str) -> bool:
-    # Cheapest authenticated probe: list a single sandbox. 200 means the team-scoped key is genuine,
-    # 401/403 means it isn't. Anything else — a timeout, connection error, rate limit, or 5xx — is a
-    # transient upstream problem that says nothing about the key, so raise rather than mislabel a valid
-    # key "invalid" and send the user down the wrong recovery path.
+def validate_credentials(api_key: str) -> tuple[bool, str | None]:
+    # Cheapest authenticated probe: list a single sandbox. 200 means the team-scoped key is genuine.
+    # A 401 and a 403 need different next steps — a revoked key has to be replaced, a key scoped to
+    # the wrong team does not — so they map to their own messages. Anything else — a timeout,
+    # connection error, rate limit, or 5xx — is a transient upstream problem that says nothing about
+    # the key, so raise rather than mislabel a valid key "invalid" and send the user down the wrong
+    # recovery path.
     # `redact_values` masks the key from tracked HTTP samples (the `X-API-Key` header isn't on the
     # generic scrubber's denylist); `allow_redirects=False` keeps the key from replaying to another host;
     # `capture=False` keeps the raw response body out of sample storage, since a sandbox's user-set
@@ -183,7 +196,9 @@ def validate_credentials(api_key: str) -> bool:
         headers={"X-API-Key": api_key, "Accept": "application/json"},
     )
     if ok:
-        return True
-    if status in (401, 403):
-        return False
+        return True, None
+    if status == 401:
+        return False, INVALID_CREDENTIALS_ERROR
+    if status == 403:
+        return False, NO_ACCESS_ERROR
     raise E2BRetryableError(f"E2B credential probe failed (retryable): status={status}")

@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -20,6 +14,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.railway import (
     RailwaySourceConfig,
 )
@@ -46,10 +41,10 @@ class RailwaySource(ResumableSource[RailwaySourceConfig, RailwayResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.RAILWAY,
+            name=ExternalDataSourceType.RAILWAY,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="Railway",
-            releaseStatus=ReleaseStatus.ALPHA,
+            releaseStatus=ReleaseStatus.BETA,
             caption="""Enter your Railway API token to pull your Railway projects, services, environments, deployments, members, and volumes into the PostHog Data warehouse.
 
 Create an account or workspace token in your [Railway account settings](https://railway.com/account/tokens). Project tokens are not supported — they are scoped to a single environment and cannot list your projects.
@@ -84,6 +79,17 @@ Note that Railway rate limits API requests per plan (as low as 100 requests/hour
             # Railway returns auth failures as HTTP 200 + a GraphQL "Not Authorized" error; the
             # transport re-raises them with this stable prefix. Retrying can never fix a bad token.
             "Railway API error: Not Authorized": "Your Railway API token is invalid, revoked, or lacks access to this resource. Create a new account or workspace token in your Railway account settings, then reconnect.",
+        }
+
+    def get_retryable_errors(self) -> set[str]:
+        # `_execute` already retries 429/5xx (as the "Railway API error (retryable)" sentinel),
+        # connection failures, and read timeouts in-process. Once that budget exhausts, Temporal
+        # retries the whole activity and the failure is transient and self-recovering, so don't
+        # surface it as tracked exception noise. The host is a constant, not user input, so
+        # matching on it doesn't risk swallowing an unrelated failure.
+        return {
+            "Railway API error (retryable)",
+            "HTTPSConnectionPool(host='backboard.railway.com', port=443)",
         }
 
     def get_schemas(

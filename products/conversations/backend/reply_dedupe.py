@@ -1,0 +1,539 @@
+"""Idempotency guard for team-authored support messages.
+
+Two POST paths create them, and both get retried in the wild: gateways and API clients replay
+the request within a second, and an operator whose send looks like it failed sends the same text
+again. Dedupe on the validated request the server already has, so neither caller needs to supply
+an idempotency key.
+
+The same reservation protocol also guards outbound ``compose``. A caller that retries a slow
+compose — a workflow webhook whose fetch times out just as the server finishes — would otherwise
+open the same ticket, and email the customer, once per retry.
+
+Redis access goes through ``posthog.redis.get_client()`` rather than the Django cache. The default
+cache alias is replica-aware, so the ``GET`` that follows a lost ``SET NX`` could read a lagging
+replica and report a conflict for a reservation that already resolved. This client is bound to
+``REDIS_URL`` alone, and it exposes the Lua needed for the owner-token compares below, which
+``cache.add``/``get``/``set`` cannot do atomically.
+"""
+
+import json
+import uuid
+import hashlib
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Any, Protocol
+
+from django.db.models import Q
+from django.utils import timezone
+
+import structlog
+
+from posthog.api.tagged_item import current_tag_names
+from posthog.models.comment import Comment
+from posthog.redis import get_client
+
+from products.conversations.backend.models import Channel, Ticket
+
+logger = structlog.get_logger(__name__)
+
+
+class _DedupeFingerprint(Protocol):
+    """What the reservation protocol needs from any fingerprint: a key, and a way to find or
+    re-verify the object an earlier attempt created. ``ReplyFingerprint`` and ``ComposeFingerprint``
+    both satisfy it, over comments and tickets respectively."""
+
+    @property
+    def key(self) -> str: ...
+
+    def find_persisted_match(self, *, created_after: datetime) -> Any: ...
+
+    def load_replay_target(self, object_id: str | None) -> Any: ...
+
+
+# A reservation only has to outlive one request, and a worker killed mid-create self-heals this
+# many seconds later instead of blocking that exact message for the full replay window.
+IN_FLIGHT_TTL_SECONDS = 30
+# How long a created message stays replayable. Covers the automated retries (0-1s apart) and the
+# operator who resends after an unconfirmed send (tens of seconds).
+REPLAY_WINDOW_SECONDS = 120
+
+SUPPORT_TICKET_SCOPE = "conversations_ticket"
+SUPPORT_AUTHOR_TYPE = "support"
+
+REPLY_IN_PROGRESS_ERROR_TYPE = "reply_in_progress"
+REPLY_IN_PROGRESS_DETAIL = "This message is already being sent. Check the thread before sending it again."
+
+COMPOSE_IN_PROGRESS_ERROR_TYPE = "compose_in_progress"
+COMPOSE_IN_PROGRESS_DETAIL = "This ticket is already being created. Check the inbox before composing it again."
+
+# Both endpoints hash into one keyspace, so a retry that switches paths still replays. Bump the
+# version when the fingerprint's contents change, so old entries can't be read under new rules.
+_KEY_PREFIX = "conversations:reply_dedupe:v1:"
+_IN_FLIGHT_VALUE_PREFIX = "inflight:"
+# Marks a reservation value that holds the id of the created object — a comment for reply, a
+# ticket for compose. The key prefix keeps the two keyspaces apart, so the value prefix is shared.
+_STORED_VALUE_PREFIX = "comment:"
+
+# Compare the owner token before writing, so a creator that stalled past its own TTL cannot
+# overwrite or delete the reservation a later attempt has since taken.
+_PUBLISH_SCRIPT = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return 1
+"""
+
+_RELEASE_SCRIPT = """
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+return redis.call('DEL', KEYS[1])
+"""
+
+
+class ReservationState(Enum):
+    # Free to create, either because we took the reservation or because Redis couldn't answer.
+    ACQUIRED = "acquired"
+    # Another attempt holds the reservation and hasn't finished creating yet.
+    IN_FLIGHT = "in_flight"
+    # An earlier attempt already created this message.
+    REPLAY = "replay"
+
+
+@dataclass(frozen=True, kw_only=True)
+class Reservation:
+    state: ReservationState
+    key: str
+    # Absent when we failed open, which makes publish and release no-ops.
+    owner_token: str | None = None
+    # Id of the created object (a comment for reply, a ticket for compose).
+    object_id: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReplyFingerprint:
+    """The immutable identity of a support-message create request.
+
+    Two requests with the same fingerprint are the same message: same team, ticket, author,
+    thread position, body, and privacy. ``build`` returns None for anything this guard must not
+    collapse.
+    """
+
+    team_id: int
+    scope: str
+    item_id: str
+    created_by_id: int
+    source_comment_id: str | None
+    content: str
+    rich_content: Any
+    item_context: dict[str, Any]
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        team_id: int,
+        created_by_id: int | None,
+        scope: Any,
+        item_id: Any,
+        content: Any,
+        rich_content: Any,
+        item_context: Any,
+        source_comment_id: Any = None,
+        is_task: Any = False,
+        has_unverifiable_metadata: bool = False,
+    ) -> "ReplyFingerprint | None":
+        if scope != SUPPORT_TICKET_SCOPE or not item_id or created_by_id is None:
+            return None
+        if not isinstance(item_context, dict) or item_context.get("author_type") != SUPPORT_AUTHOR_TYPE:
+            return None
+        # A task carries state (completion) that a replayed response would misreport, and an emoji
+        # reaction is a toggle rather than a message.
+        if is_task or item_context.get("is_emoji"):
+            return None
+        # Explicit mentions and the notification slug are consumed by the serializer and never
+        # persisted, so a replay can't confirm the stored row came from the same request.
+        if has_unverifiable_metadata:
+            return None
+        if not isinstance(content, str):
+            return None
+
+        return cls(
+            team_id=team_id,
+            scope=scope,
+            item_id=str(item_id),
+            created_by_id=created_by_id,
+            source_comment_id=str(source_comment_id) if source_comment_id else None,
+            content=content,
+            rich_content=rich_content,
+            item_context=item_context,
+        )
+
+    @property
+    def key(self) -> str:
+        canonical = json.dumps(
+            {
+                "team_id": self.team_id,
+                "scope": self.scope,
+                "item_id": self.item_id,
+                "created_by_id": self.created_by_id,
+                "source_comment_id": self.source_comment_id,
+                "content": self.content,
+                "rich_content": self.rich_content,
+                "item_context": self.item_context,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        # Only the digest reaches Redis, so no message content lands in a key.
+        return f"{_KEY_PREFIX}{hashlib.sha256(canonical.encode()).hexdigest()}"
+
+    def matches(self, comment: Comment) -> bool:
+        """Whether this persisted comment is the message this request asked for."""
+        if comment.deleted or comment.version != 0:
+            return False
+        if (
+            comment.team_id != self.team_id
+            or comment.scope != self.scope
+            or comment.item_id != self.item_id
+            or comment.created_by_id != self.created_by_id
+            or comment.content != self.content
+            or comment.rich_content != self.rich_content
+        ):
+            return False
+        if str(comment.source_comment_id or "") != (self.source_comment_id or ""):
+            return False
+        # Delivery bookkeeping is merged into item_context after creation, so require the
+        # request's own fields rather than equality.
+        persisted_context = comment.item_context or {}
+        return all(persisted_context.get(field) == value for field, value in self.item_context.items())
+
+    def find_persisted_match(self, *, created_after: datetime) -> Comment | None:
+        """The most recent row this request would have created, if some earlier attempt already did.
+
+        This is what closes the window where a create commits but its publication never lands: the
+        reservation is gone, so only the database can tell the retry that its message exists.
+        """
+        candidates = Comment.objects.filter(
+            team_id=self.team_id,
+            scope=self.scope,
+            item_id=self.item_id,
+            created_by_id=self.created_by_id,
+            content=self.content,
+            deleted=False,
+            version=0,
+            created_at__gte=created_after,
+        ).order_by("-created_at")[:20]
+        return next((comment for comment in candidates if self.matches(comment)), None)
+
+    def load_replay_target(self, comment_id: str | None) -> Comment | None:
+        """Re-verify a published mapping before serving it as a replay."""
+        if not comment_id:
+            return None
+        comment = Comment.objects.filter(team_id=self.team_id, pk=comment_id).first()
+        if comment is None or not self.matches(comment):
+            logger.warning("conversations_reply_dedupe_stale_mapping", comment_id=comment_id)
+            return None
+        return comment
+
+
+class CreateOutcome(Enum):
+    CREATED = "created"
+    # An identical message already exists; return it without writing anything.
+    REPLAYED = "replayed"
+    # A concurrent request is still creating this message, and we can't yet say which row it is.
+    CONFLICT = "conflict"
+
+
+@dataclass(frozen=True, kw_only=True)
+class GuardedCreate:
+    outcome: CreateOutcome
+    comment: Comment | None = None
+
+
+def _run_deduplicated(fingerprint: _DedupeFingerprint, create: Callable[[], Any]) -> tuple[CreateOutcome, Any]:
+    """Run ``create`` at most once per fingerprint, and report the outcome plus the object.
+
+    The shared core for both create endpoints, so the reservation protocol can't drift between
+    them. The caller owns the response shape: a REPLAYED outcome is theirs to render as a 200 and a
+    CONFLICT as a 409. Exceptions from ``create`` propagate unchanged after the reservation is
+    settled. On CONFLICT the object is None.
+    """
+    reservation = reserve(fingerprint)
+    if reservation.state is ReservationState.REPLAY:
+        replayed = fingerprint.load_replay_target(reservation.object_id)
+        if replayed is not None:
+            return CreateOutcome.REPLAYED, replayed
+        # A mapping we can't verify is treated as no mapping, rather than serving an unrelated row.
+    elif reservation.state is ReservationState.IN_FLIGHT:
+        return CreateOutcome.CONFLICT, None
+
+    attempted_at = timezone.now()
+    already_created = fingerprint.find_persisted_match(created_after=_replay_window_start(attempted_at))
+    if already_created is not None:
+        publish(reservation, already_created.id)
+        return CreateOutcome.REPLAYED, already_created
+
+    try:
+        created_object = create()
+    except Exception:
+        # Receivers and mention fan-out run after the INSERT, so an exception does not mean the row
+        # is absent. Releasing blindly would make an already-delivered object immediately repeatable.
+        recovered = fingerprint.find_persisted_match(created_after=attempted_at)
+        if recovered is not None:
+            publish(reservation, recovered.id)
+        else:
+            release(reservation)
+        raise
+
+    publish(reservation, created_object.id)
+    return CreateOutcome.CREATED, created_object
+
+
+def create_deduplicated(fingerprint: ReplyFingerprint, create: Callable[[], Comment]) -> GuardedCreate:
+    """Deduplicate a support-message create. See ``_run_deduplicated`` for the outcome contract."""
+    outcome, comment = _run_deduplicated(fingerprint, create)
+    return GuardedCreate(outcome=outcome, comment=comment)
+
+
+def _replay_window_start(attempted_at: datetime) -> datetime:
+    return attempted_at - timedelta(seconds=REPLAY_WINDOW_SECONDS)
+
+
+def reserve(fingerprint: _DedupeFingerprint) -> Reservation:
+    """Claim the right to create this message, or report who got there first.
+
+    Fails open (ACQUIRED without a token) once Redis has failed twice. That degrades to the caller's
+    recent-row lookup, which catches a retry of a message that already committed. It does not
+    serialize two concurrent first attempts: while Redis is unreachable, both can pass that lookup
+    before either inserts, and the customer receives the message twice. Closing that last race needs
+    a durable idempotency key or a uniqueness constraint, which this design deliberately avoids, so
+    the retry here is what keeps a single dropped connection from widening the window.
+    """
+    key = fingerprint.key
+    token = f"{_IN_FLIGHT_VALUE_PREFIX}{uuid.uuid4()}"
+    for attempt in range(2):
+        try:
+            client = get_client()
+            if client.set(key, token, nx=True, ex=IN_FLIGHT_TTL_SECONDS):
+                return Reservation(state=ReservationState.ACQUIRED, key=key, owner_token=token)
+            held = client.get(key)
+            if held is not None:
+                return _classify_held_value(key, held, token)
+            # The holder's entry expired or was evicted between the SET and the GET, so try again
+            # instead of reporting a conflict that no longer exists.
+        except Exception:
+            if attempt == 0:
+                continue
+            logger.warning("conversations_reply_dedupe_reserve_error", key=key, exc_info=True)
+    return Reservation(state=ReservationState.ACQUIRED, key=key)
+
+
+def publish(reservation: Reservation, object_id: Any) -> None:
+    """Point the reservation at the created object so later retries replay it."""
+    if reservation.owner_token is None:
+        return
+    value = f"{_STORED_VALUE_PREFIX}{object_id}"
+    for attempt in range(2):
+        try:
+            get_client().eval(
+                _PUBLISH_SCRIPT, 1, reservation.key, reservation.owner_token, value, REPLAY_WINDOW_SECONDS
+            )
+            return
+        except Exception:
+            if attempt == 0:
+                continue
+            # The message is already committed. Raising here would turn a confirmed send into an
+            # error the client is likely to retry, and the recent-row lookup covers that retry.
+            logger.exception("conversations_reply_dedupe_publish_failed", key=reservation.key)
+
+
+def release(reservation: Reservation) -> None:
+    """Give up the reservation so an immediate retry isn't blocked for the full in-flight TTL."""
+    if reservation.owner_token is None:
+        return
+    try:
+        get_client().eval(_RELEASE_SCRIPT, 1, reservation.key, reservation.owner_token)
+    except Exception:
+        logger.warning("conversations_reply_dedupe_release_error", key=reservation.key, exc_info=True)
+
+
+def _classify_held_value(key: str, held: Any, token: str) -> Reservation:
+    value = held.decode() if isinstance(held, bytes) else str(held)
+    if value == token:
+        # Our own SET landed even though its reply never reached us, so we still own the reservation.
+        return Reservation(state=ReservationState.ACQUIRED, key=key, owner_token=token)
+    if value.startswith(_STORED_VALUE_PREFIX):
+        return Reservation(
+            state=ReservationState.REPLAY,
+            key=key,
+            object_id=value.removeprefix(_STORED_VALUE_PREFIX),
+        )
+    if value.startswith(_IN_FLIGHT_VALUE_PREFIX):
+        return Reservation(state=ReservationState.IN_FLIGHT, key=key)
+    logger.warning("conversations_reply_dedupe_malformed_value", key=key)
+    return Reservation(state=ReservationState.ACQUIRED, key=key)
+
+
+# Compose opens a brand-new outbound ticket, so it hashes into its own keyspace — a compose retry
+# must never collapse onto a reply, or vice versa. Bump the version when the contents below change.
+_COMPOSE_KEY_PREFIX = "conversations:compose_dedupe:v4:"
+
+
+@dataclass(frozen=True, kw_only=True)
+class ComposeFingerprint:
+    """The immutable identity of an outbound compose request.
+
+    Two requests with the same fingerprint open the same outbound ticket: same team, sending
+    channel, recipient, subject, first message, and resolved person link. ``build`` returns None
+    for anything this guard must not collapse.
+    """
+
+    team_id: int
+    email_config_id: str
+    recipient_email: str
+    email_subject: str
+    message: str
+    rich_content: Any
+    # The resolved recipient person link the create writes onto the ticket. Two composes with the
+    # same body but a different recipient point at different people, so they must not collapse.
+    distinct_id: str
+    # The user that authored the compose, stored as the opening comment's creator. Two agents that
+    # send identical content to the same recipient are two distinct tickets, so they must not
+    # collapse — only a genuine retry from the same author does.
+    creator_id: int | None
+    # Two composes that differ only by tags are distinct requests, not a replay of one another.
+    tags: frozenset[str]
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        team_id: int,
+        email_config_id: Any,
+        recipient_email: Any,
+        email_subject: Any,
+        message: Any,
+        rich_content: Any,
+        distinct_id: Any,
+        creator_id: int | None,
+        tags: Iterable[str] = (),
+    ) -> "ComposeFingerprint | None":
+        if not email_config_id or not recipient_email or not isinstance(message, str) or not message:
+            return None
+        return cls(
+            team_id=team_id,
+            email_config_id=str(email_config_id),
+            recipient_email=str(recipient_email),
+            email_subject=str(email_subject or ""),
+            message=message,
+            rich_content=rich_content,
+            distinct_id=str(distinct_id or ""),
+            creator_id=creator_id,
+            tags=frozenset(tags),
+        )
+
+    @property
+    def key(self) -> str:
+        canonical = json.dumps(
+            {
+                "team_id": self.team_id,
+                "email_config_id": self.email_config_id,
+                "recipient_email": self.recipient_email,
+                "email_subject": self.email_subject,
+                "message": self.message,
+                "rich_content": self.rich_content,
+                "distinct_id": self.distinct_id,
+                "creator_id": self.creator_id,
+                "tags": sorted(self.tags),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        # Only the digest reaches Redis, so no message content lands in a key.
+        return f"{_COMPOSE_KEY_PREFIX}{hashlib.sha256(canonical.encode()).hexdigest()}"
+
+    def matches(self, ticket: Ticket) -> bool:
+        """Whether this persisted outbound ticket is the one this request asked for."""
+        if (
+            ticket.team_id != self.team_id
+            or ticket.channel_source != Channel.EMAIL
+            or str(ticket.email_config_id or "") != self.email_config_id
+            or (ticket.email_from or "") != self.recipient_email
+            or (ticket.email_subject or "") != self.email_subject
+            or (ticket.distinct_id or "") != self.distinct_id
+        ):
+            return False
+        # The first message lives on the ticket's opening comment, so confirm the body too: a
+        # second, different pitch to the same recipient in the window is a distinct ticket.
+        first = (
+            Comment.objects.filter(team_id=self.team_id, scope=SUPPORT_TICKET_SCOPE, item_id=str(ticket.id))
+            .order_by("created_at")
+            .first()
+        )
+        if first is None or first.deleted or first.content != self.message or first.rich_content != self.rich_content:
+            return False
+        # The author is the opening comment's creator, so a different agent's identical compose is
+        # a distinct ticket even when everything else matches.
+        if first.created_by_id != self.creator_id:
+            return False
+        # A retry that adds or drops a tag must not replay a differently-tagged ticket.
+        if current_tag_names(ticket) != self.tags:
+            return False
+        return True
+
+    def find_persisted_match(self, *, created_after: datetime) -> Ticket | None:
+        """The outbound ticket this request would have opened, if an earlier attempt already did.
+
+        This closes the window where a create commits but its publication never lands: the
+        reservation is gone, so only the database can tell the retry that its ticket exists.
+        """
+        # Filter on every matches() column the DB can express directly, so the unbounded query
+        # below can't miss the real match under a burst of newer, non-matching tickets. subject
+        # is nullable and matches() treats NULL as "", so a blank subject must accept NULL too.
+        subject_filter = (
+            Q(email_subject__isnull=True) | Q(email_subject="")
+            if not self.email_subject
+            else Q(email_subject=self.email_subject)
+        )
+        candidates = Ticket.objects.filter(
+            subject_filter,
+            team_id=self.team_id,
+            channel_source=Channel.EMAIL,
+            email_config_id=self.email_config_id,
+            email_from=self.recipient_email,
+            distinct_id=self.distinct_id,
+            created_at__gte=created_after,
+        ).order_by("-created_at")
+        return next((ticket for ticket in candidates if self.matches(ticket)), None)
+
+    def load_replay_target(self, ticket_id: str | None) -> Ticket | None:
+        """Re-verify a published mapping before serving it as a replay."""
+        if not ticket_id:
+            return None
+        ticket = Ticket.objects.filter(team_id=self.team_id, pk=ticket_id).first()
+        if ticket is None or not self.matches(ticket):
+            logger.warning("conversations_compose_dedupe_stale_mapping", ticket_id=ticket_id)
+            return None
+        return ticket
+
+
+@dataclass(frozen=True, kw_only=True)
+class GuardedTicketCreate:
+    outcome: CreateOutcome
+    ticket: Ticket | None = None
+
+
+def create_ticket_deduplicated(fingerprint: ComposeFingerprint, create: Callable[[], Ticket]) -> GuardedTicketCreate:
+    """Deduplicate an outbound compose. See ``_run_deduplicated`` for the outcome contract.
+
+    This is what stops a caller that retries a slow compose from opening the same ticket — and
+    emailing the customer — more than once.
+    """
+    outcome, ticket = _run_deduplicated(fingerprint, create)
+    return GuardedTicketCreate(outcome=outcome, ticket=ticket)

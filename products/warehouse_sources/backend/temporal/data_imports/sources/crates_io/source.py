@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, SimpleSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -19,6 +13,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.crates_io.crates_io import (
     crates_io_source,
     validate_credentials as validate_crates_io_credentials,
@@ -48,12 +43,12 @@ class CratesIOSource(SimpleSource[CratesIOSourceConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.CRATES_IO,
+            name=ExternalDataSourceType.CRATESIO,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="crates.io",
             releaseStatus=ReleaseStatus.ALPHA,
             keywords=["rust", "cargo", "crates"],
-            caption="""Pull metadata, versions, owners, and daily download counts for Rust crates from the [crates.io](https://crates.io) API into the PostHog Data warehouse.
+            caption="""Pull metadata, versions, owners, dependencies, and daily download counts for Rust crates from the [crates.io](https://crates.io) API into the PostHog Data warehouse.
 
 crates.io's read APIs are public, so no credentials are required. There is no practical way to sync the whole registry, so enter the crate names you want to track, one per line (or comma-separated). For example:
 
@@ -63,7 +58,7 @@ tokio
 posthog-rs
 ```
 
-Each sync fetches the current data for every configured crate. crates.io has no server-side "changed since" filter, and daily download counts only cover the trailing ~90 days, so all tables sync as a full refresh.""",
+Each sync fetches the current data for every configured crate. The dependency table covers the 25 most recent versions of each crate. The category and keyword tables cover the whole registry, so they do not depend on the crates you list. crates.io has no server-side "changed since" filter, and daily download counts only cover the trailing ~90 days, so all tables sync as a full refresh.""",
             iconPath="/static/services/crates_io.png",
             docsUrl="https://posthog.com/docs/cdp/sources/crates-io",
             fields=cast(

@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -20,6 +14,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.can
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.persona import (
     PersonaSourceConfig,
 )
@@ -48,13 +43,13 @@ class PersonaSource(ResumableSource[PersonaSourceConfig, PersonaResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.PERSONA,
+            name=ExternalDataSourceType.PERSONA,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="Persona",
             releaseStatus=ReleaseStatus.ALPHA,
             caption="""Enter your Persona API key to automatically pull your Persona data into the PostHog Data warehouse.
 
-Create an API key in your Persona dashboard under **Settings → API Keys**. The key needs read access to the resources you want to sync (inquiries, accounts, cases, transactions, events).
+Create an API key in your Persona dashboard under **Settings → API Keys**. The key needs read access to the resources you want to sync (inquiries, verifications, accounts, cases, transactions, events).
 
 Sandbox and production environments use separate API keys — use the one for the environment whose data you want to import.
 """,

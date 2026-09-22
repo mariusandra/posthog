@@ -2,7 +2,7 @@ import json
 from typing import Any
 
 import pytest
-from freezegun import freeze_time
+import time_machine
 from unittest.mock import MagicMock, patch
 
 from parameterized import parameterized
@@ -42,6 +42,7 @@ def _run_rows(
     endpoint: str,
     fake_fetch: Any,
     manager: _FakeResumableManager | None = None,
+    api_version: str = "v1",
     **incremental: Any,
 ) -> tuple[list[dict], _FakeResumableManager]:
     manager = manager or _FakeResumableManager()
@@ -53,6 +54,7 @@ def _run_rows(
             endpoint=endpoint,
             logger=MagicMock(),
             resumable_source_manager=manager,  # type: ignore[arg-type]
+            api_version=api_version,
             **incremental,
         ):
             rows.extend(batch)
@@ -60,13 +62,13 @@ def _run_rows(
 
 
 class TestEventWindow:
-    @freeze_time("2026-07-14T12:00:00Z")
+    @time_machine.travel("2026-07-14T12:00:00Z", tick=False)
     def test_first_sync_backfills_the_max_retention_window(self) -> None:
         # received_after defaults to only 1 hour ago server-side, so leaving it off a first sync
         # would silently drop everything older than an hour.
-        after, before = _event_window(should_use_incremental_field=False, db_incremental_field_last_value=None)
-        assert after == "2026-04-15T12:00:00.000Z"
-        assert before == "2026-07-14T12:00:00.000Z"
+        window = _event_window(should_use_incremental_field=False, db_incremental_field_last_value=None)
+        assert window.start == "2026-04-15T12:00:00.000Z"
+        assert window.end == "2026-07-14T12:00:00.000Z"
 
     @parameterized.expand(
         [
@@ -74,18 +76,18 @@ class TestEventWindow:
             ("iso_string_z", "2026-07-10T08:30:00.500Z", "2026-07-10T08:30:00.500Z"),
         ]
     )
-    @freeze_time("2026-07-14T12:00:00Z")
+    @time_machine.travel("2026-07-14T12:00:00Z", tick=False)
     def test_incremental_run_advances_from_the_watermark(self, _name: str, value: Any, expected_after: str) -> None:
-        after, _ = _event_window(should_use_incremental_field=True, db_incremental_field_last_value=value)
-        assert after == expected_after
+        window = _event_window(should_use_incremental_field=True, db_incremental_field_last_value=value)
+        assert window.start == expected_after
 
-    @freeze_time("2026-07-14T12:00:00Z")
+    @time_machine.travel("2026-07-14T12:00:00Z", tick=False)
     def test_future_watermark_is_clamped_to_now(self) -> None:
         # A future-dated watermark would produce an inverted window that returns nothing forever.
-        after, before = _event_window(
+        window = _event_window(
             should_use_incremental_field=True, db_incremental_field_last_value="2027-01-01T00:00:00Z"
         )
-        assert after == before == "2026-07-14T12:00:00.000Z"
+        assert window.start == window.end == "2026-07-14T12:00:00.000Z"
 
 
 class TestEventsPagination:
@@ -297,6 +299,29 @@ class TestV1Lists:
 
         rows, _ = _run_rows("webhooks", fake_fetch)
         assert rows == [{"id": "wh1", "name": "github intake"}]
+
+
+class TestVersionDispatch:
+    @parameterized.expand(
+        [
+            # Cancellations and the webhooks inventory only exist in v1 and the envs inventory only
+            # in v2, so a pin on the other version must not relocate them off their only compatible
+            # home (a 404 otherwise).
+            ("cancellations", "v2", "/v1/cancellations"),
+            ("environments", "v1", "/v2/envs"),
+            ("webhooks", "v2", "/v1/webhooks"),
+            ("webhooks", "v1", "/v1/webhooks"),
+        ]
+    )
+    def test_version_locked_endpoint_ignores_the_pin(self, endpoint: str, api_version: str, expected_path: str) -> None:
+        seen_urls: list[str] = []
+
+        def fake_fetch(session: Any, url: str, headers: dict, logger: Any, params: dict | None = None) -> Any:
+            seen_urls.append(url)
+            return {"data": [{"id": "x1"}], "page": {"hasMore": False}}
+
+        _run_rows(endpoint, fake_fetch, api_version=api_version)
+        assert seen_urls[0] == f"https://api.inngest.com{expected_path}"
 
 
 class TestValidateCredentials:

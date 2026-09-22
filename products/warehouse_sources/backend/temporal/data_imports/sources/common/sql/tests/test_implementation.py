@@ -9,16 +9,13 @@ each implementation (e.g. `mysql/tests/test_mysql.py`).
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
 import pytest
 from unittest.mock import MagicMock, patch
 
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
-)
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.config import Config
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.implementation import (
     SQLSourceImplementation,
@@ -27,6 +24,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.incremental import (
     IncrementalFieldFilter,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 
 
 @dataclasses.dataclass
@@ -53,7 +51,9 @@ class _FakeImplementation(SQLSourceImplementation[_FakeConfig, Any, Any]):
         self.fetch_average_row_size_calls: list[tuple[Any, ...]] = []
 
     @contextmanager
-    def connect(self, config):  # pragma: no cover — not exercised by these tests
+    def connect(
+        self, config: Any, *, team_id: int | None = None
+    ) -> Iterator[object]:  # pragma: no cover — not exercised by these tests
         yield object()
 
     def get_columns(self, conn, config, names):  # pragma: no cover

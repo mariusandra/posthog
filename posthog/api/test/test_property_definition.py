@@ -10,7 +10,11 @@ from parameterized import parameterized
 from rest_framework import status
 
 from posthog.models import ActivityLog, EventDefinition, EventProperty, Organization, PropertyDefinition, Team
-from posthog.taxonomy.property_definition_api import PropertyDefinitionQuerySerializer, PropertyDefinitionViewSet
+from posthog.taxonomy.property_definition_api import (
+    PropertyDefinitionQuerySerializer,
+    PropertyDefinitionViewSet,
+    QueryContext,
+)
 
 
 def exclude_virtual_properties(results: list) -> list:
@@ -195,6 +199,17 @@ class TestPropertyDefinitionAPI(APIBaseTest):
         assert response.status_code == status.HTTP_200_OK
         db_results = self._exclude_virtual(response.json()["results"])
         assert len(db_results) == 6
+
+    def test_list_property_definitions_omits_person_property_setters(self):
+        for name in ("$set", "$set_once"):
+            PropertyDefinition.objects.get_or_create(team=self.team, name=name, property_type="String")
+
+        response = self.client.get(f"/api/projects/{self.team.pk}/property_definitions/?search=set")
+
+        assert response.status_code == status.HTTP_200_OK
+        names = [r["name"] for r in response.json()["results"]]
+        assert "$set" not in names
+        assert "$set_once" not in names
 
     def test_list_numerical_property_definitions(self):
         response = self.client.get(f"/api/projects/{self.team.pk}/property_definitions/?is_numerical=true")
@@ -1035,6 +1050,23 @@ class TestPropertyDefinitionAPI(APIBaseTest):
         assert "$virt_traffic_type" in virtual_names
         assert "$virt_traffic_category" in virtual_names
         assert "$virt_bot_name" in virtual_names
+
+
+class TestPropertyDefinitionListStatementTimeout(APIBaseTest):
+    def test_cancelled_list_query_returns_a_retryable_503(self) -> None:
+        # Postgres cancels the statement, psycopg raises, and Django re-raises it as a bare
+        # OperationalError. Without the handler that renders as a 500, which the taxonomic filter
+        # shows as "no properties" rather than as a failure the user can retry.
+        slow_count_sql = "SELECT count(*) AS full_count FROM (SELECT pg_sleep(3)) s WHERE %(project_id)s IS NOT NULL"
+
+        with (
+            patch.object(QueryContext, "as_count_sql", return_value=slow_count_sql),
+            patch("posthog.taxonomy.property_definition_api.DEFINITION_LIST_STATEMENT_TIMEOUT_MS", 250),
+        ):
+            response = self.client.get(f"/api/projects/{self.team.pk}/property_definitions/")
+
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        assert response.json()["code"] == "property_definitions_timeout"
 
 
 class TestPropertyDefinitionQuerySerializer(SimpleTestCase):

@@ -2,8 +2,10 @@ import { MOCK_DEFAULT_TEAM, MOCK_TEAM_ID } from 'lib/api.mock'
 
 import { router } from 'kea-router'
 import { expectLogic, partial, truth } from 'kea-test-utils'
+import posthog from 'posthog-js'
 
 import api from 'lib/api'
+import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
 import { objectsEqual } from 'lib/utils/objects'
 import 'lib/constants'
 import { dashboardLogic } from 'scenes/dashboard/dashboardLogic'
@@ -15,6 +17,7 @@ import { urls } from 'scenes/urls'
 import { useMocks } from '~/mocks/jest'
 import { dashboardsModel } from '~/models/dashboardsModel'
 import { insightsModel } from '~/models/insightsModel'
+import { tagsModel } from '~/models/tagsModel'
 import { examples } from '~/queries/examples'
 import { DataTableNode, type InsightVizNode, NodeKind } from '~/queries/schema/schema-general'
 import { initKeaTests } from '~/test/init'
@@ -36,6 +39,7 @@ import {
 
 import { insightDataLogic } from './insightDataLogic'
 import { createEmptyInsight, insightLogic } from './insightLogic'
+import { insightVizDataLogic } from './insightVizDataLogic'
 
 const API_FILTERS: Partial<FilterType> = {
     insight: InsightType.TRENDS as InsightType,
@@ -265,10 +269,6 @@ describe('insightLogic', () => {
                         JSON.parse(new URL(request.url).searchParams.get('filters') || 'false')
                     )
                     return [200, response]
-                },
-                '/api/projects/:team/insights/:id': async ({ request, params }) => {
-                    const payload = (await request.json()) as Record<string, any>
-                    return [200, { ...payload, id: params.id }]
                 },
             },
         })
@@ -915,7 +915,7 @@ describe('insightLogic', () => {
             const mockCreateCalls = (api.create as jest.Mock).mock.calls
             expect(mockCreateCalls).toEqual([
                 [
-                    `api/environments/${MOCK_TEAM_ID}/insights`,
+                    `api/projects/${MOCK_TEAM_ID}/insights`,
                     expect.objectContaining({
                         derived_name: '* from events',
                         query: {
@@ -936,6 +936,76 @@ describe('insightLogic', () => {
                     }),
                 ],
             ])
+        })
+    })
+
+    describe('PostHog AI suggestions', () => {
+        const suggestedQuery: InsightVizNode = {
+            kind: NodeKind.InsightVizNode,
+            source: {
+                kind: NodeKind.TrendsQuery,
+                series: [{ kind: NodeKind.EventsNode, event: '$pageview', math: BaseMathType.TotalCount }],
+            },
+        }
+        let vizLogic: ReturnType<typeof insightVizDataLogic.build>
+
+        const mountInsight = async (dashboardItemId: InsightShortId | 'new'): Promise<void> => {
+            const insightProps: InsightLogicProps = { dashboardItemId }
+            logic = insightLogic(insightProps)
+            logic.mount()
+            insightDataLogic(insightProps).mount()
+            vizLogic = insightVizDataLogic(insightProps)
+            vizLogic.mount()
+            // A saved insight loads asynchronously and re-syncs the query when it arrives, which
+            // would land on top of a suggestion applied before then.
+            await expectLogic(logic).toFinishAllListeners()
+        }
+
+        const suggest = (): void => {
+            logic.actions.handleInsightSuggested(suggestedQuery)
+            vizLogic.actions.setQuery(suggestedQuery)
+        }
+
+        it.each([
+            ['an unsaved', 'new' as const],
+            ['a saved', Insight42],
+        ])('keeping the changes on %s insight ends the review and holds on to the query', async (_, insightId) => {
+            await mountInsight(insightId)
+            suggest()
+
+            await expectLogic(logic, () => {
+                logic.actions.onKeepSuggestedInsight()
+            }).toMatchValues({
+                previousQuery: null,
+                suggestedQuery: null,
+                query: suggestedQuery,
+            })
+        })
+
+        it('an edit made after the suggestion keeps it, so a reject cannot revert the edit', async () => {
+            await mountInsight('new')
+            suggest()
+
+            await expectLogic(logic, () => {
+                vizLogic.actions.updateQuerySource({ filterTestAccounts: true })
+            }).toMatchValues({
+                previousQuery: null,
+                suggestedQuery: null,
+            })
+        })
+
+        it('rejecting the suggestion restores the previous query and leaves it available to reapply', async () => {
+            await mountInsight('new')
+            const queryBeforeSuggestion = logic.values.query
+            suggest()
+
+            await expectLogic(logic, () => {
+                logic.actions.onRejectSuggestedInsight()
+            }).toMatchValues({
+                previousQuery: null,
+                suggestedQuery,
+                query: queryBeforeSuggestion,
+            })
         })
     })
 
@@ -1050,6 +1120,50 @@ describe('insightLogic', () => {
 
             await expectLogic(router).toNotHaveDispatchedActions(['push'])
         })
+
+        it('marks the insight as duplicating until the request settles', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.duplicateInsight(logic.values.insight as QueryBasedInsightModel, true)
+            })
+                .toMatchValues({ insightDuplicating: true })
+                .toFinishAllListeners()
+                .toMatchValues({ insightDuplicating: false })
+        })
+
+        // Catching the rejection skips the gate `initKea` applies to loader failures, so the
+        // listener has to reapply it: a validation error is the app's own bug and stays
+        // reportable, while an access-denied 403 the AccessDenied scene already handles would
+        // file an issue sharing its stack with every other ApiError, burying real crashes.
+        it.each([
+            ['a validation error', 400, { detail: 'Insight limit reached' }, 1],
+            [
+                'a failure the app recovers from',
+                403,
+                { detail: 'You do not have permission', code: 'permission_denied' },
+                0,
+            ],
+        ])(
+            'toasts %s rather than doing nothing, and reports it only if it is worth filing',
+            async (_, status, body, timesReported) => {
+                useMocks({
+                    post: {
+                        '/api/environments/:team_id/insights/': () => [status, body],
+                    },
+                })
+                jest.spyOn(lemonToast, 'error')
+                jest.spyOn(posthog, 'captureException')
+
+                await expectLogic(logic, () => {
+                    logic.actions.duplicateInsight(logic.values.insight as QueryBasedInsightModel, true)
+                })
+                    .toFinishAllListeners()
+                    .toMatchValues({ insightDuplicating: false })
+
+                expect(lemonToast.error).toHaveBeenCalledWith(body.detail)
+                expect(posthog.captureException).toHaveBeenCalledTimes(timesReported)
+                await expectLogic(router).toNotHaveDispatchedActions(['push'])
+            }
+        )
     })
 
     describe('hasOverrides', () => {
@@ -1072,6 +1186,88 @@ describe('insightLogic', () => {
             logic.mount()
 
             expect(logic.values.hasOverrides).toBe(expected)
+        })
+    })
+
+    describe('loadInsight refresh mode', () => {
+        // Overridden queries get their own cache key, which nothing warms — a cache-only-ish
+        // `async` read yields `result: null` and the scene shows "Chart data didn't load".
+        const seenRefreshParams: (string | null)[] = []
+
+        beforeEach(() => {
+            seenRefreshParams.length = 0
+            useMocks({
+                get: {
+                    '/api/environments/:team_id/insights/': ({ request }) => {
+                        const url = new URL(request.url)
+                        seenRefreshParams.push(url.searchParams.get('refresh'))
+                        return [
+                            200,
+                            {
+                                results: [
+                                    {
+                                        id: 42,
+                                        short_id: Insight42,
+                                        result: ['result from api'],
+                                        filters: API_FILTERS,
+                                        name: 'original name',
+                                    },
+                                ],
+                            },
+                        ]
+                    },
+                },
+            })
+        })
+
+        it('uses async without overrides', async () => {
+            logic = insightLogic({ dashboardItemId: Insight42 })
+            logic.mount()
+            await expectLogic(logic).toDispatchActions(['loadInsightSuccess'])
+
+            expect(seenRefreshParams).toEqual(['async'])
+        })
+
+        it('blocks on a cache miss when overrides are present', async () => {
+            logic = insightLogic({
+                dashboardItemId: Insight42,
+                dashboardId: 33,
+                filtersOverride: { date_from: '-14d' },
+            })
+            logic.mount()
+            await expectLogic(logic).toDispatchActions(['loadInsightSuccess'])
+
+            expect(seenRefreshParams).toEqual(['async_except_on_cache_miss'])
+        })
+
+        it('treats empty overrides as no overrides', async () => {
+            logic = insightLogic({
+                dashboardItemId: Insight42,
+                dashboardId: 33,
+                filtersOverride: {},
+            })
+            logic.mount()
+            await expectLogic(logic).toDispatchActions(['loadInsightSuccess'])
+
+            expect(seenRefreshParams).toEqual(['async'])
+        })
+    })
+
+    describe('insightMissing', () => {
+        // A notebook cell binds a saved insight by short id. When that insight is gone, the API
+        // returns no results and the loader throws — the cell needs a flag it can turn into a
+        // "not found" screen instead of silently rendering a blank default query.
+        it('is set when the insight cannot be found', async () => {
+            useMocks({
+                get: {
+                    '/api/environments/:team_id/insights/': () => [200, { results: [] }],
+                },
+            })
+            logic = insightLogic({ dashboardItemId: Insight42 })
+            logic.mount()
+            await expectLogic(logic).toDispatchActions(['loadInsightFailure'])
+
+            expect(logic.values.insightMissing).toBe(true)
         })
     })
 
@@ -1147,7 +1343,7 @@ describe('insightLogic', () => {
             await expectLogic(logic, () => {
                 logic.actions.setInsightMetadata({ name: 'Foobar 43', description: 'Lorem ipsum.', tags: ['good'] })
             })
-                .toDispatchActions(['setInsightMetadataSuccess'])
+                .toDispatchActions([tagsModel.actionTypes.loadTags, 'setInsightMetadataSuccess'])
                 .toMatchValues({
                     savedInsight: partial({ name: 'Foobar 43', description: 'Lorem ipsum.', tags: ['good'] }),
                     insightChanged: false,
@@ -1196,6 +1392,7 @@ describe('insightLogic', () => {
                 logic.actions.setInsightMetadata({ favorited: true })
             })
                 .toDispatchActions(['setInsightMetadataSuccess'])
+                .toNotHaveDispatchedActions([tagsModel.actionTypes.loadTags])
                 .toMatchValues({
                     savedInsight: partial({ favorited: true }),
                 })

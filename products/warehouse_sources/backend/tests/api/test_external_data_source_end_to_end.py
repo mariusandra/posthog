@@ -25,9 +25,7 @@ from products.warehouse_sources.backend.facade.models import (
 )
 from products.warehouse_sources.backend.facade.types import DataWarehouseManagedViewSetKind
 from products.warehouse_sources.backend.temporal.data_imports.external_data_job import ExternalDataJobWorkflow
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.delta_table_helper import (
-    DeltaTableHelper,
-)
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.delta.maintenance import DeltaMaintenance
 from products.warehouse_sources.backend.temporal.data_imports.settings import ACTIVITIES
 from products.warehouse_sources.backend.temporal.data_imports.sources.stripe.constants import (
     SUBSCRIPTION_RESOURCE_NAME as STRIPE_SUBSCRIPTION_RESOURCE_NAME,
@@ -47,7 +45,7 @@ def api_client(user):
             return_value=(True, None),
         ),
         mock.patch(
-            "products.warehouse_sources.backend.presentation.views.external_data_source.bulk_create_external_data_job_schedules",
+            "products.warehouse_sources.backend.presentation.views.external_data_source.base.bulk_create_external_data_job_schedules",
             return_value=[],
         ) as mock_sync_workflow,
         mock.patch.object(DataWarehouseSavedQuery, "schedule_materialization"),
@@ -94,7 +92,7 @@ def run_data_import_workflow(mock_stripe_client):
         )
 
         with (
-            mock.patch.object(DeltaTableHelper, "compact_table"),
+            mock.patch.object(DeltaMaintenance, "compact_table"),
             mock.patch(
                 "products.warehouse_sources.backend.temporal.data_imports.external_data_job.get_data_import_finished_metric"
             ),

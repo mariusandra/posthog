@@ -6,7 +6,6 @@ from urllib.parse import urlsplit
 from requests import Response
 from urllib3.util.retry import Retry
 
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.capsule_crm.settings import CAPSULE_CRM_ENDPOINTS
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.http import make_tracked_session
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.rest_source import (
@@ -18,6 +17,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.res
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.source_helpers import validate_via_probe
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceResponse
 
 CAPSULE_CRM_BASE_URL = "https://api.capsulecrm.com/api/v2"
 CAPSULE_CRM_HOST = "api.capsulecrm.com"
@@ -113,7 +113,7 @@ def capsule_crm_source(
 ) -> SourceResponse:
     config = CAPSULE_CRM_ENDPOINTS[endpoint]
 
-    params: dict[str, Any] = {"perPage": PAGE_SIZE}
+    params: dict[str, Any] = {"perPage": PAGE_SIZE, **config.extra_params}
     if config.embed:
         params["embed"] = config.embed
     if config.supports_since and should_use_incremental_field and db_incremental_field_last_value is not None:
@@ -181,7 +181,7 @@ def capsule_crm_source(
         # Capsule does not document an ordering guarantee for `since`, but the ResumableSource
         # next-URL state (not the watermark) drives mid-sync resume, so the dominant interruption
         # path is order-independent. `asc` matches the framework's default incremental checkpointing.
-        sort_mode="asc",
+        sort_mode=config.sort_mode,
     )
 
 

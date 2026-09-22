@@ -1,17 +1,20 @@
 import io
 import uuid
+import base64
 import zipfile
 from typing import Any
 
 from posthog.test.base import APIBaseTest
 from unittest.mock import MagicMock, patch
 
+from django.test import SimpleTestCase
 from django.utils import timezone
 
 from parameterized import parameterized
 from rest_framework import status
 
 from products.streamlit_apps.backend.models import StreamlitApp, StreamlitAppSandbox, StreamlitAppVersion
+from products.streamlit_apps.backend.presentation.serializers import CreateVersionFromSourceInputSerializer
 
 
 def _make_zip(files: dict[str, str]) -> bytes:
@@ -680,3 +683,192 @@ class TestStreamlitAppSandboxControlAPI(_StreamlitAppsFlagMixin, APIBaseTest):
         second_count = OAuthAccessToken.objects.filter(user=self.user).count()
 
         assert first_count == second_count, "expected token reuse, but a new token was minted"
+
+
+class TestCreateVersionFromSource(_StreamlitAppsFlagMixin, APIBaseTest):
+    def _url(self, short_id: str, suffix: str = "") -> str:
+        base = f"/api/projects/{self.team.id}/streamlit_apps/{short_id}"
+        return f"{base}/{suffix}" if suffix else f"{base}/"
+
+    def _create_app(self, **kwargs) -> StreamlitApp:
+        defaults = {"team": self.team, "name": "Source App", "created_by": self.user}
+        defaults.update(kwargs)
+        return StreamlitApp.objects.create(**defaults)
+
+    @patch("posthog.storage.object_storage.write")
+    def test_create_version_from_source(self, mock_storage_write):
+        app = self._create_app()
+        source = "import streamlit as st\nst.title('Hi')"
+        response = self.client.post(
+            self._url(app.short_id, "create_version_from_source/"),
+            data={"source": source},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED
+        assert response.json()["version_number"] == 1
+        mock_storage_write.assert_called_once()
+
+        # The stored object must be a valid zip with the source at app.py in the root.
+        stored_bytes = mock_storage_write.call_args[0][1]
+        with zipfile.ZipFile(io.BytesIO(stored_bytes)) as zf:
+            assert zf.read("app.py").decode() == source
+
+        app.refresh_from_db()
+        assert app.active_version_id == uuid.UUID(response.json()["id"])
+
+    @parameterized.expand([("missing", {}), ("blank", {"source": ""}), ("whitespace_only", {"source": "  \n  "})])
+    def test_create_version_from_source_rejects_empty_source(self, _name, payload):
+        app = self._create_app()
+        response = self.client.post(self._url(app.short_id, "create_version_from_source/"), data=payload, format="json")
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    @patch("posthog.storage.object_storage.write")
+    def test_create_version_from_source_packs_files_and_assets(self, mock_storage_write):
+        app = self._create_app()
+        parquet_bytes = b"PAR1\x00\x01\x02\xff"
+        response = self.client.post(
+            self._url(app.short_id, "create_version_from_source/"),
+            data={
+                "source": "import streamlit as st",
+                "files": {"utils.py": "def helper():\n    return 1\n", "data/empty.txt": ""},
+                "assets": {"data/events.parquet": base64.b64encode(parquet_bytes).decode()},
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED, response.json()
+
+        stored_bytes = mock_storage_write.call_args[0][1]
+        with zipfile.ZipFile(io.BytesIO(stored_bytes)) as zf:
+            assert sorted(zf.namelist()) == ["app.py", "data/empty.txt", "data/events.parquet", "utils.py"]
+            assert zf.read("utils.py").decode() == "def helper():\n    return 1\n"
+            assert zf.read("data/events.parquet") == parquet_bytes
+
+    @patch("posthog.storage.object_storage.write")
+    @patch("products.streamlit_apps.backend.facade.api.MAX_ZIP_SIZE", 64)
+    def test_create_version_from_source_oversized_archive_413(self, mock_storage_write):
+        # The serializer's budget counts raw bytes, so an archive that only goes over once
+        # zip overhead is added reaches the facade and must not surface as a 500.
+        app = self._create_app()
+        response = self.client.post(
+            self._url(app.short_id, "create_version_from_source/"),
+            data={"source": "import streamlit as st\n" * 20},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+        mock_storage_write.assert_not_called()
+
+
+class TestCreateVersionFromSourceInputSerializer(SimpleTestCase):
+    @parameterized.expand(
+        [
+            ("traversal", {"files": {"../x.py": ""}}, "files"),
+            ("absolute", {"files": {"/etc/x": ""}}, "files"),
+            ("dot_segment", {"files": {"./x.py": ""}}, "files"),
+            ("trailing_slash", {"files": {"data/": ""}}, "files"),
+            ("backslash", {"files": {"data\\x.csv": ""}}, "files"),
+            ("root_app_file", {"files": {"app.py": "print(1)"}}, "files"),
+            ("asset_traversal", {"assets": {"../x.bin": "AAAA"}}, "assets"),
+            ("asset_not_base64", {"assets": {"x.bin": "not base64!"}}, "assets"),
+            ("same_path_in_both", {"files": {"x.txt": "a"}, "assets": {"x.txt": "AAAA"}}, "assets"),
+            ("nul_in_path", {"files": {"bad\x00.txt": "a"}}, "files"),
+            ("file_and_directory", {"files": {"data": "a"}, "assets": {"data/events.csv": "AAAA"}}, "non_field_errors"),
+            ("under_app_py", {"files": {"app.py/helper.py": "a"}}, "non_field_errors"),
+            ("too_many_entries", {"files": {f"f{i}.txt": "a" for i in range(500)}}, "non_field_errors"),
+            ("overlong_segment", {"files": {"data/" + "a" * 256: "a"}}, "files"),
+            ("overlong_path", {"files": {"/".join(["d"] * 600) + "/x.txt": "a"}}, "files"),
+        ]
+    )
+    def test_rejects_bad_attachments(self, _name, extra, error_field):
+        serializer = CreateVersionFromSourceInputSerializer(data={"source": "import streamlit as st", **extra})
+        assert not serializer.is_valid()
+        assert error_field in serializer.errors
+
+    @parameterized.expand([("fits", 40, True), ("over_budget", 48, False)])
+    def test_raw_size_budget_counts_decoded_assets(self, _name, asset_bytes, expected_valid):
+        asset = base64.b64encode(b"x" * asset_bytes).decode()
+        with patch("products.streamlit_apps.backend.presentation.serializers.MAX_ZIP_SIZE", 64):
+            serializer = CreateVersionFromSourceInputSerializer(
+                data={"source": "import streamlit as st", "assets": {"d.bin": asset}}
+            )
+            assert serializer.is_valid() is expected_valid, serializer.errors
+
+
+class TestStreamlitAppPersonalAPIKeyAccess(_StreamlitAppsFlagMixin, APIBaseTest):
+    """Custom actions are invisible to the default CRUD scope derivation; these
+    guard the explicit scope_object_*_actions lists that make PAK/MCP calls work,
+    and the query:read requirement on code-shipping/executing actions (the sandbox
+    bridge runs HogQL, so a streamlit_app-only key must not reach it)."""
+
+    def _make_key(self, label: str, scopes: list[str]) -> str:
+        from posthog.models.personal_api_key import PersonalAPIKey
+        from posthog.models.utils import generate_random_token_personal, hash_key_value
+
+        raw = generate_random_token_personal()
+        PersonalAPIKey.objects.create(label=label, user=self.user, secure_value=hash_key_value(raw), scopes=scopes)
+        return raw
+
+    def setUp(self):
+        super().setUp()
+        self._write_query_key = self._make_key("streamlit-write-query", ["streamlit_app:write", "query:read"])
+        self._write_only_key = self._make_key("streamlit-write-only", ["streamlit_app:write"])
+        self._read_key = self._make_key("streamlit-read", ["streamlit_app:read"])
+        self.client.logout()
+
+    def _url(self, short_id: str = "", suffix: str = "") -> str:
+        base = f"/api/projects/{self.team.id}/streamlit_apps"
+        if short_id:
+            base = f"{base}/{short_id}"
+        return f"{base}/{suffix}" if suffix else f"{base}/"
+
+    def _auth(self, key: str) -> dict:
+        return {"HTTP_AUTHORIZATION": f"Bearer {key}"}
+
+    @patch("posthog.storage.object_storage.write")
+    def test_set_source_allowed_with_write_and_query_scopes(self, _mock_storage_write):
+        app = StreamlitApp.objects.create(team=self.team, name="PAK App", created_by=self.user)
+        response = self.client.post(
+            self._url(app.short_id, "create_version_from_source/"),
+            data={"source": "import streamlit as st"},
+            format="json",
+            **self._auth(self._write_query_key),
+        )
+        assert response.status_code == status.HTTP_201_CREATED
+
+    @parameterized.expand(["create_version_from_source", "activate_version", "start", "restart"])
+    def test_code_executing_actions_refused_without_query_read(self, action: str):
+        app = StreamlitApp.objects.create(team=self.team, name="PAK App", created_by=self.user)
+        response = self.client.post(
+            self._url(app.short_id, f"{action}/"),
+            data={"source": "import streamlit as st"},
+            format="json",
+            **self._auth(self._write_only_key),
+        )
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        assert "query:read" in response.json()["detail"]
+
+    def test_set_source_refused_with_read_scope(self):
+        app = StreamlitApp.objects.create(team=self.team, name="PAK App", created_by=self.user)
+        response = self.client.post(
+            self._url(app.short_id, "create_version_from_source/"),
+            data={"source": "import streamlit as st"},
+            format="json",
+            **self._auth(self._read_key),
+        )
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_non_query_custom_action_allowed_with_write_only_scope(self):
+        """`stop` ships no code and runs none, so it stays streamlit-scoped only —
+        and unlike partial_update it is a custom action, so dropping it from
+        scope_object_write_actions would refuse every key with no other test noticing."""
+        app = StreamlitApp.objects.create(team=self.team, name="PAK App", created_by=self.user)
+        response = self.client.post(
+            self._url(app.short_id, "stop/"),
+            format="json",
+            **self._auth(self._write_only_key),
+        )
+        assert response.status_code == status.HTTP_200_OK
+
+    def test_custom_read_action_allowed_with_read_scope(self):
+        app = StreamlitApp.objects.create(team=self.team, name="PAK App", created_by=self.user)
+        response = self.client.get(self._url(app.short_id, "versions/"), **self._auth(self._read_key))
+        assert response.status_code == status.HTTP_200_OK

@@ -1,6 +1,5 @@
 import { FunnelLayout } from 'lib/constants'
 
-import { filtersToQueryNode } from '~/queries/nodes/InsightQuery/utils/filtersToQueryNode'
 import { hiddenLegendItemsToKeys, queryNodeToFilter } from '~/queries/nodes/InsightQuery/utils/queryNodeToFilter'
 import {
     FunnelsQuery,
@@ -28,6 +27,16 @@ import {
 } from '~/types'
 
 describe('queryNodeToFilter', () => {
+    test('maps a paths v2 query to its insight type only, as it has no legacy filter format', () => {
+        const result = queryNodeToFilter({
+            kind: NodeKind.PathsV2Query,
+            dateRange: { date_from: '-7d' },
+            pathsV2Filter: { maxSteps: 4 },
+        })
+
+        expect(result).toEqual({ insight: InsightType.JOURNEYS })
+    })
+
     test('converts a query node to a filter', () => {
         const query: LifecycleQuery = {
             kind: NodeKind.LifecycleQuery,
@@ -136,20 +145,6 @@ describe('queryNodeToFilter', () => {
             show_multiple_y_axes: false,
         }
         expect(result).toEqual(filters)
-    })
-
-    test('round-trips axis labels through legacy trends filters', () => {
-        const query: TrendsQuery = {
-            kind: NodeKind.TrendsQuery,
-            series: [],
-            trendsFilter: {
-                display: ChartDisplayType.ActionsLineGraph,
-                xAxisLabel: 'Signup date',
-                yAxisLabel: 'Unique users',
-            },
-        }
-
-        expect(filtersToQueryNode(queryNodeToFilter(query))).toEqual(query)
     })
 
     test('converts a funnelsFilter into filter properties', () => {

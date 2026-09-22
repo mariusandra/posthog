@@ -1,19 +1,13 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from posthog.cloud_utils import is_cloud
+
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from posthog.cloud_utils import is_cloud
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -23,6 +17,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.mix
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.registry import SourceRegistry
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.flagsmith.flagsmith import (
     FlagsmithResumeConfig,
     flagsmith_source,
@@ -65,7 +60,7 @@ class FlagsmithSource(ResumableSource[FlagsmithSourceConfig, FlagsmithResumeConf
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.FLAGSMITH,
+            name=ExternalDataSourceType.FLAGSMITH,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             keywords=["feature flags", "remote config"],
             label="Flagsmith",

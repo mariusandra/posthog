@@ -67,20 +67,29 @@ class SignalSourceConfigs(_Section):
 
 
 class EmitEligibility(_Section):
-    """Whether a scout's findings can actually reach the inbox for this team.
+    """Whether a scout's findings and reports can actually reach the inbox.
 
-    Both the signal channel (`emit_signal`) and the report channel (`emit_report`) pass the
-    same team/org-level preflight gates: the organization must have approved AI data processing
-    and the `signals_scout` signal source must be enabled. When either is off, every emit is
-    silently dropped — so a scout can read this at cold start and quick-close instead of doing
-    throwaway investigation whose output never surfaces. `remediation` is the one-line next step
-    when `can_emit` is False. Per-scout state (the config's dry-run `emit` toggle) is not covered
-    here — this is the team-wide floor, not a single scout's config.
+    `can_emit` is the one value to read, and `blocking_reason` names the gate behind a False: the
+    same reason code `emit_report` returns as `skipped_reason` and `edit_report` refuses with, with
+    `remediation` as the one-line next step. Three gates sit behind it: the organization must have
+    approved AI data processing, the `signals_scout` signal source must be enabled, and the calling
+    scout's own config must not be in dry-run (`emit=False`). When any is off every write is
+    dropped. A dry-run scout continues its investigation without emitting findings or reports.
+    For other blocks, a scout can stop after it checks the reason and remediation.
+
+    As stored on a profile row these are the two team-wide gates only, because the row is shared by
+    every scout on the team: `scout_emit_enabled` is null and `can_emit` is the team-wide floor. The
+    profile endpoint re-derives both for the scout that is reading, which is what makes the value it
+    returns the effective one.
     """
 
     ai_processing_approved: bool
     source_enabled: bool
+    # The calling scout's own dry-run toggle. Null on a stored row (no scout in hand) and whenever
+    # the run's dispatch-time config is gone, which fails closed as `scout_config_missing`.
+    scout_emit_enabled: bool | None
     can_emit: bool
+    blocking_reason: str | None
     remediation: str | None
 
 
@@ -96,14 +105,18 @@ class ScoutFleetEntry(_Section):
     # authored/edited report), within the run-history window `_scout_fleet` scans. Null means
     # the scout has been quiet for at least that window, not that it has never emitted.
     last_emitted_at: str | None
-    # Why this scout is in the `disabled` bucket: `turned_off` (an operator set `enabled=False`)
-    # or `skill_unavailable` (left on, but its skill was deleted, superseded, or withheld, so the
+    # Why this scout is in the `disabled` bucket: `turned_off` (a human or seed posture set
+    # `enabled=False`), `auto_paused` (the system paused it — no operator chose this), or
+    # `skill_unavailable` (left on, but its skill was deleted, superseded, or withheld, so the
     # coordinator never dispatches it). Null for scouts that actually run.
     not_running_reason: str | None
+    # The cause behind an `auto_paused` entry (`no_output` / `ignored` / `repeated_failures`);
+    # null for every other entry.
+    pause_reason: str | None
 
 
 class ScoutFleet(_Section):
-    """The other `signals-scout-*` scouts configured on this team.
+    """The other scouts configured on this team.
 
     Split on whether the scout actually runs, for the same reason `SignalSourceConfigs` splits
     on `enabled`: a scout deliberately turned off is different from a surface nobody ever

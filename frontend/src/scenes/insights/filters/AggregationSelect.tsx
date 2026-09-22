@@ -3,22 +3,21 @@ import { useActions, useValues } from 'kea'
 import { LemonSelect, LemonSelectSection } from '@posthog/lemon-ui'
 
 import { HogQLEditor } from 'lib/components/HogQLEditor/HogQLEditor'
-import { FEATURE_FLAGS } from 'lib/constants'
 import { groupsAccessLogic } from 'lib/introductions/groupsAccessLogic'
-import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
-import { GroupIntroductionFooter } from 'scenes/groups/GroupsIntroduction'
 import { insightVizDataLogic } from 'scenes/insights/insightVizDataLogic'
 
 import { groupsModel } from '~/models/groupsModel'
 import { FunnelsQuery, LifecycleQuery, RetentionQuery } from '~/queries/schema/schema-general'
 import {
+    getAggregationGroupTypeIndex,
     isFunnelsQuery,
     isInsightQueryNode,
     isLifecycleQuery,
     isRetentionQuery,
-    isStickinessQuery,
 } from '~/queries/utils'
 import { InsightLogicProps } from '~/types'
+
+import { GroupIntroductionFooter } from 'products/groups/frontend/components/GroupsIntroduction'
 
 export function getHogQLValue(groupIndex?: number | null, aggregationQuery?: string | null): string {
     if (groupIndex != undefined) {
@@ -64,13 +63,10 @@ export function AggregationSelect({
 
     const { groupTypes, aggregationLabel } = useValues(groupsModel)
     const { needsUpgradeForGroups, canStartUsingGroups } = useValues(groupsAccessLogic)
-    const { featureFlags } = useValues(featureFlagLogic)
 
     if (!isInsightQueryNode(querySource)) {
         return null
     }
-
-    const isRetentionDWHEnabled = !!featureFlags[FEATURE_FLAGS.PRODUCT_ANALYTICS_RETENTION_DWH]
 
     const value =
         (isLifecycleQuery(querySource) && querySource.customAggregationTarget) ||
@@ -78,7 +74,7 @@ export function AggregationSelect({
         (isRetentionQuery(querySource) && querySource.retentionFilter?.customAggregationTarget)
             ? CUSTOM_DATA_WAREHOUSE_ITEMS
             : getHogQLValue(
-                  isStickinessQuery(querySource) ? undefined : querySource.aggregation_group_type_index,
+                  getAggregationGroupTypeIndex(querySource),
                   isFunnelsQuery(querySource) ? querySource.funnelsFilter?.funnelAggregateByHogQL : undefined
               )
 
@@ -172,7 +168,7 @@ export function AggregationSelect({
         })
     }
 
-    if (isFunnels || isLifecycle || (isRetention && isRetentionDWHEnabled)) {
+    if (isFunnels || isLifecycle || isRetention) {
         const hasOnlyDataWarehouseRetentionEntities =
             isRetentionQuery(querySource) &&
             querySource.retentionFilter &&

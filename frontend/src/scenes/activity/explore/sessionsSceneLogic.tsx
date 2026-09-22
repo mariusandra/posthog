@@ -61,7 +61,7 @@ export interface sessionsSceneLogicMeta {
 export type sessionsSceneLogicType = MakeLogicType<
     sessionsSceneLogicValues,
     sessionsSceneLogicActions,
-    Record<string, any>,
+    SessionsSceneLogicProps,
     sessionsSceneLogicMeta
 >
 

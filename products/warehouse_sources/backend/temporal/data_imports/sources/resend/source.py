@@ -1,8 +1,7 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
@@ -10,11 +9,6 @@ from posthog.schema import (
     SourceFieldOauthConfig,
     SourceFieldSelectConfig,
     SourceFieldSelectConfigOption,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -28,6 +22,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.res
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.resumable import ResumableSourceManager
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.schema import SourceSchema
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.resend import ResendSourceConfig
 from products.warehouse_sources.backend.temporal.data_imports.sources.resend.oauth import (
     ResendIntegrationAuth,
@@ -54,7 +49,7 @@ class ResendSource(ResumableSource[ResendSourceConfig, ResendResumeConfig], OAut
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.RESEND,
+            name=ExternalDataSourceType.RESEND,
             category=DataWarehouseSourceCategory.MARKETING___EMAIL,
             label="Resend",
             releaseStatus=ReleaseStatus.GA,
@@ -199,7 +194,10 @@ Either way, the connection needs **full access** so the following resources can 
 
         if config.auth_method.selection == "oauth":
             return False, "Your Resend connection is invalid or expired. Please reconnect it."
-        return False, "Invalid Resend API key"
+        return (
+            False,
+            "Resend rejected the API key. Generate a new API key in your Resend dashboard, then enter it here.",
+        )
 
     def get_non_retryable_errors(self) -> dict[str, str | None]:
         return {
@@ -234,6 +232,26 @@ Either way, the connection needs **full access** so the following resources can 
                 "Resend rejected the request to sync your Broadcasts. This usually means the connected Resend "
                 "account can't access the Broadcasts API — enable Broadcasts in Resend and grant the API key full "
                 "access, or unselect the Broadcasts table to keep syncing your other Resend data."
+            ),
+            # Resend rejects the well-formed list request with a 400 when the connected account can't
+            # access the Domains API (seen in production for accounts without domain management
+            # enabled). Retrying the identical request can't fix an account-level restriction. Scope
+            # the match to the domains path so a 400 from another endpoint (which could be our bug)
+            # stays retryable and visible.
+            "400 Client Error: Bad Request for url: https://api.resend.com/domains": (
+                "Resend rejected the request to sync your Domains. This usually means the connected Resend "
+                "account can't access the Domains API — grant the API key full access, or unselect the Domains "
+                "table to keep syncing your other Resend data."
+            ),
+            # Resend rejects the well-formed List Emails request with a 400 when the connected key can't
+            # list sent emails (a sending-only key rather than full access). limit=100 is Resend's
+            # documented maximum, so the request itself is valid and retrying the identical request can't
+            # fix a key-permission restriction. Scope the match to the emails path so a 400 from another
+            # endpoint (which could be our bug) stays retryable and visible.
+            "400 Client Error: Bad Request for url: https://api.resend.com/emails": (
+                "Resend rejected the request to sync your sent emails, which usually means the connected "
+                "API key can't list sent emails. Grant the API key full access in Resend, or unselect the "
+                "Emails table to keep syncing your other Resend data."
             ),
         }
 

@@ -5,6 +5,7 @@ upgrade-canonical definition (so schema migrations never read as drift later) pl
 directly references (cached on the row for the catalog's denied-table filter).
 """
 
+from collections.abc import Iterator
 from typing import NoReturn, Optional
 
 from pydantic import BaseModel
@@ -39,20 +40,57 @@ _SUPPORTED_KINDS = {HOGQL_DEFINITION_KIND, *_NODE_MODELS, *_INSIGHT_MODELS}
 # A markdown definition is a bounded blob; keep it small so it stays a definition, not a document.
 MAX_MARKDOWN_DEFINITION_LENGTH = 20_000
 
+# A description is a few sentences of business meaning; a narrated query walkthrough blows past this.
+MAX_DESCRIPTION_LENGTH = 1_000
+
 # HogQLQuery carries fields that would let a caller bypass team query controls (a raw ClickHouse
 # passthrough, an arbitrary DB connection). A metric definition may only set these.
 _HOGQL_ALLOWED_KEYS = {"kind", "query", "values"}
 
 
 class _TableReferenceCollector(TraversingVisitor):
-    """Collects the identifiers used directly as FROM/JOIN targets in a parsed HogQL query."""
+    """Collects the real tables a query reads, excluding CTE aliases.
 
-    def __init__(self) -> None:
+    Global CTE-name subtraction (``get_table_names``) is not enough here: a CTE named after a
+    real table would erase that table even when the CTE body reads it (a non-recursive CTE body
+    does not see its own name), silently defeating the catalog's denied-table filter. So CTE
+    names are tracked per scope: each CTE body is visited under the scope of the CTEs defined
+    before it, and only single-part FROM/JOIN targets naming an in-scope CTE are skipped.
+
+    ``skip_table_functions`` drops a table-function call such as ``numbers(10)``. Lineage wants the
+    data assets a metric reads, and a generator is not one; the denied-table filter keeps them,
+    because it must see every name the query reads.
+    """
+
+    def __init__(self, *, skip_table_functions: bool = False) -> None:
         self.tables: set[str] = set()
+        self._skip_table_functions = skip_table_functions
+        self._cte_scopes: list[set[str]] = [set()]
+
+    def visit_select_query(self, node: ast.SelectQuery) -> None:
+        scope = set(self._cte_scopes[-1])
+        for cte_name, cte in (node.ctes or {}).items():
+            self._cte_scopes.append(set(scope))
+            self.visit(cte.expr)
+            self._cte_scopes.pop()
+            scope.add(cte_name)
+        self._cte_scopes.append(scope)
+        # CTEs were just visited with the right scopes; blank them out so the generic traversal
+        # of the remaining children doesn't re-visit them under this (wider) scope.
+        ctes, node.ctes = node.ctes, None
+        try:
+            super().visit_select_query(node)
+        finally:
+            node.ctes = ctes
+            self._cte_scopes.pop()
 
     def visit_join_expr(self, node: ast.JoinExpr) -> None:
-        if isinstance(node.table, ast.Field):
-            self.tables.add(".".join(str(part) for part in node.table.chain))
+        is_table_function = node.table_args is not None
+        if isinstance(node.table, ast.Field) and not (is_table_function and self._skip_table_functions):
+            chain = [str(part) for part in node.table.chain]
+            if len(chain) != 1 or chain[0] not in self._cte_scopes[-1]:
+                self.tables.add(".".join(chain))
+        # The generic traversal also covers subqueries in the join target and in ON constraints.
         super().visit_join_expr(node)
 
 
@@ -61,6 +99,17 @@ def _fail(error: str, hint: str) -> NoReturn:
     # renders that as attr="definition" + the full text; any richer dict shape strips the
     # message (or 500s) on its way through the HTTP envelope.
     raise ValidationError({"definition": f"{error} {hint}"})
+
+
+def validate_description(description: str) -> None:
+    """Reject a description too long to be a summary. Raises keyed by the ``description`` field."""
+    if len(description) > MAX_DESCRIPTION_LENGTH:
+        raise ValidationError(
+            {
+                "description": f"Description is too long. State what the metric means and what it serves in 1-3 "
+                f"sentences (under {MAX_DESCRIPTION_LENGTH} characters), and put query rationale in 'reasoning'."
+            }
+        )
 
 
 def validate_metric_definition(definition: dict, team: Team, user: Optional[User] = None) -> tuple[dict, list[str]]:
@@ -122,6 +171,44 @@ def _validate_markdown(definition: dict) -> tuple[dict, list[str]]:
     return definition, []
 
 
+def _parse_hogql_definition(definition: dict) -> ast.SelectQuery | ast.SelectSetQuery:
+    """Parse a HogQL definition's query text. Raises :class:`ValidationError` on unparseable SQL."""
+    # Both run paths substitute `values` as parse-time placeholders and set no globals, so this
+    # parses the same way: `HogQLQueryRunner._parse_query` for a metric run, and `bind_metric_query`
+    # for a data quality check on a metric. Resolving them as globals instead would accept a bare
+    # field that carries a value's name, which neither run path can resolve.
+    values = definition.get("values")
+    placeholders: dict[str, ast.Expr] | None = (
+        {name: ast.Constant(value=value) for name, value in values.items()}
+        if isinstance(values, dict) and values
+        else None
+    )
+    try:
+        return parse_select(definition["query"], placeholders=placeholders)
+    except ExposedHogQLError as e:
+        _fail(f"Invalid HogQL query: {e}", "Fix the SQL syntax.")
+    except ResolutionError as e:
+        capture_exception(e)
+        _fail("Could not resolve a table or field in the query.", "Check table and column names.")
+    except Exception as e:
+        capture_exception(e)
+        _fail("Could not parse the query.", "Check the SQL syntax.")
+
+
+def table_names_as_written(definition: dict) -> list[str]:
+    """The tables and views a HogQL definition names in its own query text.
+
+    Collected before resolution, which replaces a non-materialized view with its body: a metric that
+    reads a view depends on the view, not on the view's own sources. Table functions are dropped:
+    they generate rows rather than read them, so they are not upstream of the metric. Not a
+    substitute for ``referenced_table_names``, which the catalog's denied-table filter needs
+    resolved.
+    """
+    collector = _TableReferenceCollector(skip_table_functions=True)
+    collector.visit(_parse_hogql_definition(definition))
+    return sorted(collector.tables)
+
+
 def _validate_hogql(definition: dict, team: Team, user: Optional[User]) -> tuple[dict, list[str]]:
     extra_keys = set(definition.keys()) - _HOGQL_ALLOWED_KEYS
     if extra_keys:
@@ -133,16 +220,7 @@ def _validate_hogql(definition: dict, team: Team, user: Optional[User]) -> tuple
 
     _ensure_valid_schema(definition, HogQLQuery)
 
-    try:
-        ast_node = parse_select(definition["query"])
-    except ExposedHogQLError as e:
-        _fail(f"Invalid HogQL query: {e}", "Fix the SQL syntax.")
-    except ResolutionError as e:
-        capture_exception(e)
-        _fail("Could not resolve a table or field in the query.", "Check table and column names.")
-    except Exception as e:
-        capture_exception(e)
-        _fail("Could not parse the query.", "Check the SQL syntax.")
+    ast_node = _parse_hogql_definition(definition)
 
     context = HogQLContext(team_id=team.pk, user=user, enable_select_queries=True)
     try:
@@ -170,19 +248,24 @@ def _ensure_valid_schema(definition: dict, model_class: type[BaseModel]) -> None
         _fail(f"Definition does not match {model_class.__name__}: {e}", "Fix the query shape.")
 
 
+def definition_nodes(definition: object, kinds: frozenset[str]) -> Iterator[dict]:
+    """Every nested query node of one of `kinds`, anywhere in a definition."""
+    if isinstance(definition, dict):
+        if definition.get("kind") in kinds:
+            yield definition
+        for child in definition.values():
+            yield from definition_nodes(child, kinds)
+    elif isinstance(definition, list):
+        for child in definition:
+            yield from definition_nodes(child, kinds)
+
+
 def _extract_warehouse_tables(definition: dict) -> list[str]:
     """Walk a node/insight query dict for DataWarehouseNode table references (direct references only)."""
-    tables: set[str] = set()
-
-    def walk(value: object) -> None:
-        if isinstance(value, dict):
-            if value.get("kind") == "DataWarehouseNode" and value.get("table_name"):
-                tables.add(str(value["table_name"]))
-            for child in value.values():
-                walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-
-    walk(definition)
-    return sorted(tables)
+    return sorted(
+        {
+            str(node["table_name"])
+            for node in definition_nodes(definition, frozenset({"DataWarehouseNode"}))
+            if node.get("table_name")
+        }
+    )

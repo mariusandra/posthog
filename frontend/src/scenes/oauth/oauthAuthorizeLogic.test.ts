@@ -1,11 +1,15 @@
 import { MOCK_DEFAULT_USER } from 'lib/api.mock'
 
+import { decodeParams, router } from 'kea-router'
+
+import { DEFAULT_OAUTH_SCOPES } from 'lib/scopes'
 import { userLogic } from 'scenes/userLogic'
 
 import { useMocks } from '~/mocks/jest'
 import { initKeaTests } from '~/test/init'
+import { AppContext } from '~/types'
 
-import { oauthAuthorizeLogic } from './oauthAuthorizeLogic'
+import { describeOAuthError, oauthAuthorizeLogic } from './oauthAuthorizeLogic'
 
 describe('oauthAuthorizeLogic', () => {
     let logic: ReturnType<typeof oauthAuthorizeLogic.build>
@@ -24,12 +28,18 @@ describe('oauthAuthorizeLogic', () => {
 
     afterEach(() => {
         logic.unmount()
+        delete (window as any).POSTHOG_APP_CONTEXT
     })
 
     const effectiveScopesCases: { name: string; scopes: string[]; apply?: () => void; expected: string[] }[] = [
         {
-            name: 'grants the full requested set, collapsed to the highest action',
+            name: 'grants both halves of the pair for an object at write level',
             scopes: ['openid', 'feature_flag:read', 'feature_flag:write', 'insight:read'],
+            expected: ['openid', 'feature_flag:read', 'feature_flag:write', 'insight:read'],
+        },
+        {
+            name: 'keeps the write half alone when the read half was never requested',
+            scopes: ['openid', 'feature_flag:write', 'insight:read'],
             expected: ['openid', 'feature_flag:write', 'insight:read'],
         },
         {
@@ -127,6 +137,59 @@ describe('oauthAuthorizeLogic', () => {
         expect(logic.values.effectiveScopes).toEqual(['openid', 'feature_flag:write', 'insight:read'])
     })
 
+    const scopeSourceCases: {
+        name: string
+        urlScope?: string
+        resolution?: { scopes: string[]; was_defaulted: boolean }
+        mcpConsent?: { is_mcp_resource: boolean; scopes: string[] }
+        expected: string[]
+    }[] = [
+        {
+            name: 'prefers the resolved set over the URL',
+            urlScope: 'insight:read',
+            resolution: { scopes: ['openid', 'insight:read', 'dashboard:write'], was_defaulted: false },
+            expected: ['openid', 'insight:read', 'dashboard:write'],
+        },
+        {
+            name: 'uses the resolved set when the client sent no scope',
+            resolution: { scopes: ['openid', 'insight:write', 'query:read'], was_defaulted: true },
+            expected: ['openid', 'insight:write', 'query:read'],
+        },
+        {
+            name: 'narrows a defaulted request to the MCP set on an MCP resource',
+            resolution: { scopes: ['openid', 'insight:write', 'query:read'], was_defaulted: true },
+            mcpConsent: { is_mcp_resource: true, scopes: ['openid', 'query:read'] },
+            expected: ['openid', 'query:read'],
+        },
+        {
+            name: 'falls back to the URL when the server sent no resolution',
+            urlScope: 'insight:read',
+            expected: ['insight:read'],
+        },
+        {
+            name: 'falls back to the identity scopes when neither the server nor the URL names one',
+            expected: DEFAULT_OAUTH_SCOPES,
+        },
+    ]
+
+    it.each(scopeSourceCases)('scope source $name', ({ urlScope, resolution, mcpConsent, expected }) => {
+        window.POSTHOG_APP_CONTEXT = {
+            ...window.POSTHOG_APP_CONTEXT,
+            oauth_scope_resolution: resolution,
+            oauth_mcp_consent: mcpConsent,
+        } as AppContext
+        const params = new URLSearchParams({
+            client_id: 'test-client',
+            redirect_uri: 'https://example.com/callback',
+            response_type: 'code',
+            ...(urlScope ? { scope: urlScope } : {}),
+        })
+
+        router.actions.push(`/oauth/authorize?${params.toString()}`)
+
+        expect(logic.values.scopes).toEqual(expected)
+    })
+
     const withRequiredScopes = (required_scopes: string[]): void => {
         logic.actions.loadOAuthApplicationSuccess({
             name: 'Test App',
@@ -206,7 +269,7 @@ describe('oauthAuthorizeLogic', () => {
         expect(row).toMatchObject({ locked: true, value: 'write' })
         expect(row?.description).toContain('Write')
         expect(logic.values.effectiveScopes).toContain('feature_flag:write')
-        expect(logic.values.effectiveScopes).not.toContain('feature_flag:read')
+        expect(logic.values.effectiveScopes).toContain('feature_flag:read')
     })
 
     it('resets access selections when scopes are reloaded', () => {
@@ -291,5 +354,126 @@ describe('oauthAuthorizeLogic', () => {
         logic.actions.setRequiredAccessLevel('team')
         expect(logic.values.selectedOrganization).toBe(expectedOrg)
         expect(logic.values.oauthAuthorization.scoped_teams).toEqual(expectedTeams)
+    })
+
+    // Opaque client-owned params must reach the API byte-for-byte, whatever they look like.
+    it.each([
+        { name: 'the server sets no flag', flag: undefined, expected: false },
+        { name: 'the server sets the flag to false', flag: false, expected: false },
+        { name: 'the server sets the flag to true', flag: true, expected: true },
+    ])('reports access controls as $expected when $name', ({ flag, expected }) => {
+        const original = window.POSTHOG_APP_CONTEXT
+        window.POSTHOG_APP_CONTEXT = { ...original, oauth_consent_access_controls_apply: flag } as AppContext
+        try {
+            logic.unmount()
+            logic = oauthAuthorizeLogic()
+            logic.mount()
+            expect(logic.values.accessControlsApply).toBe(expected)
+        } finally {
+            window.POSTHOG_APP_CONTEXT = original
+        }
+    })
+
+    describe('OAuth parameter passthrough', () => {
+        const JSON_STATE = '{"flow_id":"5a8f3d48-c841-4375-b06d-5c828c86282d","provider":"posthog"}'
+
+        let sentBody: Record<string, any>
+
+        beforeEach(() => {
+            sentBody = {}
+            useMocks({
+                post: {
+                    '/oauth/authorize/': async ({ request }) => {
+                        sentBody = (await request.json()) as Record<string, any>
+                        // No `redirect_to`, so the logic does not navigate the test page away.
+                        return {}
+                    },
+                },
+            })
+        })
+
+        const authorizeWithSearch = async (search: string): Promise<Record<string, any>> => {
+            // `replaceState` rather than `router.actions.push`: push rebuilds the search string
+            // from kea-router's decoded values, so it cannot reproduce a raw inbound URL.
+            window.history.replaceState({}, '', `/oauth/authorize${search}`)
+            await logic.asyncActions.cancel().catch(() => undefined)
+            return sentBody
+        }
+
+        it('sends a JSON state as the verbatim string the client provided', async () => {
+            const search = `?client_id=abc&state=${encodeURIComponent(JSON_STATE)}`
+            // This is what kea-router hands to `searchParams` — the value we must not send.
+            expect(decodeParams(search, '?').state).toEqual({
+                flow_id: '5a8f3d48-c841-4375-b06d-5c828c86282d',
+                provider: 'posthog',
+            })
+
+            const body = await authorizeWithSearch(search)
+            expect(body.state).toBe(JSON_STATE)
+            expect(body.client_id).toBe('abc')
+        })
+
+        it.each([
+            ['a boolean-like state', 'true'],
+            ['a numeric state with a leading zero', '0123'],
+            ['an array-like state', '[1,2]'],
+        ])('sends %s unchanged', async (_name, state) => {
+            const body = await authorizeWithSearch(`?state=${encodeURIComponent(state)}`)
+            expect(body.state).toBe(state)
+        })
+
+        it('sends null for a parameter the client omitted', async () => {
+            const body = await authorizeWithSearch('?client_id=abc')
+            expect(body.state).toBeNull()
+            expect(body.nonce).toBeNull()
+        })
+    })
+
+    describe('describeOAuthError', () => {
+        it('names the parameter that the serializer rejected', () => {
+            expect(describeOAuthError({ state: ['Not a valid string.'] })).toBe(
+                'The application sent an incorrect authorization request. ' +
+                    'The parameter "state" is not correct: Not a valid string.'
+            )
+        })
+
+        it('describes every rejected parameter', () => {
+            expect(describeOAuthError({ state: ['Not a valid string.'], scope: ['Unknown scope.'] })).toBe(
+                'The application sent an incorrect authorization request. ' +
+                    'The parameter "state" is not correct: Not a valid string. ' +
+                    'The parameter "scope" is not correct: Unknown scope.'
+            )
+        })
+
+        it('uses a non-field error as its own sentence', () => {
+            expect(describeOAuthError({ non_field_errors: ['The request expired.'] })).toBe(
+                'The application sent an incorrect authorization request. The request expired.'
+            )
+        })
+
+        // `/oauth/authorize/` also fails with the RFC 6749 envelope (views.py:1274). Its keys
+        // are not parameter names, and `ApiError.message` would show the code, not the prose.
+        it('prefers the description over the code in an OAuth error envelope', () => {
+            expect(
+                describeOAuthError({
+                    error: 'access_denied',
+                    error_description: 'This organization has disabled AI data processing.',
+                })
+            ).toBe('This organization has disabled AI data processing.')
+        })
+
+        it.each([
+            ['no body', undefined],
+            ['a null body', null],
+            ['a plain string body', 'Bad Request'],
+            ['an array body', ['Bad Request']],
+            ['a body without messages', { state: [] }],
+            // Would otherwise read as a parameter named "error".
+            ['an envelope with no description', { error: 'invalid_client' }],
+            // DRF always sends a list, so a bare string is not a field error.
+            ['a non-list field value', { state: 'Not a valid string.' }],
+        ])('returns null for %s, so the caller falls back', (_name, data) => {
+            expect(describeOAuthError(data)).toBeNull()
+        })
     })
 })

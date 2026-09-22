@@ -219,11 +219,26 @@ export const ALL_SDKS: SDK[] = [
         docsLink: 'https://posthog.com/docs/ai-observability/installation/google',
     },
     {
+        name: 'Google ADK',
+        key: SDKKey.GOOGLE_ADK,
+        tags: [SDKTag.FRAMEWORK],
+        image: geminiImage,
+        docsLink: 'https://posthog.com/docs/ai-observability/installation/google-adk',
+    },
+    {
         name: 'Vercel AI SDK',
         key: SDKKey.VERCEL_AI,
         tags: [SDKTag.FRAMEWORK],
         image: 'https://res.cloudinary.com/dmukukwp6/image/upload/vercel_373fa70879.svg',
         docsLink: 'https://posthog.com/docs/ai-observability/installation/vercel-ai',
+    },
+    {
+        name: 'Eve',
+        key: SDKKey.EVE,
+        tags: [SDKTag.FRAMEWORK],
+        searchTerms: ['Vercel Eve', 'agent'],
+        image: 'https://res.cloudinary.com/dmukukwp6/image/upload/vercel_373fa70879.svg',
+        docsLink: 'https://posthog.com/docs/ai-observability/installation/eve',
     },
     {
         name: 'LangChain',

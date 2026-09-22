@@ -23,7 +23,7 @@ jobs:
     sync:
         name: Merge upstream master into desktop
         if: github.repository == 'mariusandra/posthog'
-        runs-on: ubuntu-latest
+        runs-on: ubuntu-24.04
         timeout-minutes: 120
         permissions:
             contents: write
@@ -51,6 +51,7 @@ jobs:
                   git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
                   git remote add upstream https://github.com/PostHog/posthog.git
 
+                  cp products/desktop/scripts/restore-fork-paths.sh "$RUNNER_TEMP/restore-fork-paths.sh"
                   desktop_base=$(git rev-parse HEAD)
                   echo "base=$desktop_base" >> "$GITHUB_OUTPUT"
 
@@ -59,11 +60,16 @@ jobs:
                   # still exists upstream.
                   git fetch --filter=blob:none upstream master
                   refs="upstream/master"
-                  if [ -n "$DESKTOP_PR_BRANCH" ] && git fetch --filter=blob:none upstream "$DESKTOP_PR_BRANCH" 2>/dev/null; then
-                      refs="$refs upstream/$DESKTOP_PR_BRANCH"
-                  else
-                      echo "Desktop PR branch not tracked or not found; merging master only"
+                  if [ -n "$DESKTOP_PR_BRANCH" ]; then
+                      branch_ref=$(git ls-remote --heads upstream "refs/heads/$DESKTOP_PR_BRANCH")
+                      if [ -n "$branch_ref" ]; then
+                          git fetch --filter=blob:none upstream "$DESKTOP_PR_BRANCH"
+                          refs="$refs upstream/$DESKTOP_PR_BRANCH"
+                      else
+                          echo "Desktop PR branch no longer exists; merging master only"
+                      fi
                   fi
+                  echo "refs=$refs" >> "$GITHUB_OUTPUT"
 
                   state=up-to-date
                   for ref in $refs; do
@@ -71,16 +77,16 @@ jobs:
                           echo "Already up to date with $ref"
                           continue
                       fi
-                      if git merge --no-edit --no-commit "$ref"; then
-                          # Keep the fork's workflow definitions. GITHUB_TOKEN
-                          # cannot (and should not) update workflow files.
-                          git restore --source="$desktop_base" --staged --worktree -- .github/workflows
-                          git commit --no-edit
+                      if git merge --no-edit --no-commit --no-ff "$ref"; then
+                          # GITHUB_TOKEN cannot update workflows, and upstream
+                          # owns a different desktop app at the same path.
+                          bash "$RUNNER_TEMP/restore-fork-paths.sh" "$desktop_base"
+                          git commit -m "chore(desktop): sync $ref"
                           if [ "$state" = up-to-date ]; then state=merged; fi
                       else
-                          # Resolve any workflow conflicts to the fork's side
+                          # Resolve fork-owned paths to the fork's side
                           # before handing remaining conflicts to Codex.
-                          git restore --source="$desktop_base" --staged --worktree -- .github/workflows
+                          bash "$RUNNER_TEMP/restore-fork-paths.sh" "$desktop_base"
                           echo "Conflicts merging $ref"
                           state=conflicts
                           break
@@ -91,11 +97,13 @@ jobs:
             # Node comes from setup-node inside the composite; skip the pnpm
             # install here when conflicted — manifests may hold conflict markers,
             # the agent installs after resolving instead.
-            - name: Install desktop dependencies
+            - name: Install desktop and frontend dependencies
+              id: install
               if: steps.merge.outputs.state == 'merged'
+              continue-on-error: true
               uses: ./.github/actions/pnpm-install
               with:
-                  install-command: pnpm install --frozen-lockfile --filter=@posthog/desktop
+                  install-command: pnpm install --frozen-lockfile --filter=@posthog/desktop --filter=@posthog/frontend...
 
             - name: Set up Node.js (conflicted merge)
               if: steps.merge.outputs.state == 'conflicts'
@@ -104,34 +112,48 @@ jobs:
                   node-version-file: .nvmrc
                   token: ${{ github.token }}
 
-            - name: Desktop tests
+            - name: Desktop and frontend checks
               id: tests
-              if: steps.merge.outputs.state == 'merged'
+              if: steps.merge.outputs.state == 'merged' && steps.install.outcome == 'success'
               continue-on-error: true
-              run: pnpm --filter=@posthog/desktop test
+              run: |
+                  pnpm --filter=@posthog/desktop --fail-if-no-match test
+                  pnpm --filter=@posthog/desktop --fail-if-no-match typecheck
+                  pnpm exec turbo --filter=@posthog/frontend prepare
+                  pnpm --filter=@posthog/frontend typescript:check
 
             - name: Install Codex
-              if: steps.merge.outputs.state == 'conflicts' || steps.tests.outcome == 'failure'
-              run: npm install -g @openai/codex pnpm
+              if: steps.merge.outputs.state == 'conflicts' || steps.install.outcome == 'failure' || steps.tests.outcome == 'failure'
+              run: |
+                  npm install -g @openai/codex
+                  corepack enable
 
             - name: Resolve with Codex
-              if: steps.merge.outputs.state == 'conflicts' || steps.tests.outcome == 'failure'
+              if: steps.merge.outputs.state == 'conflicts' || steps.install.outcome == 'failure' || steps.tests.outcome == 'failure'
               env:
                   DESKTOP_SYNC_OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
                   DESKTOP_BASE_SHA: ${{ steps.merge.outputs.base }}
                   MERGE_STATE: ${{ steps.merge.outputs.state }}
+                  SYNC_REFS: ${{ steps.merge.outputs.refs }}
               run: |
-                  CODEX_API_KEY="$DESKTOP_SYNC_OPENAI_API_KEY" codex exec --dangerously-bypass-approvals-and-sandbox "You are running inside the desktop-sync workflow on the mariusandra/posthog fork. Merge state: $MERGE_STATE (either an in-progress conflicted merge of upstream master or the desktop PR branch, or a completed merge whose desktop tests fail). Read .agents/skills/syncing-desktop-fork/SKILL.md and follow it: finish the merge, fix what the merge broke, and leave the working tree committed and clean. Keep .github/workflows exactly as it was at $DESKTOP_BASE_SHA. Do not push."
+                  CODEX_API_KEY="$DESKTOP_SYNC_OPENAI_API_KEY" codex exec --dangerously-bypass-approvals-and-sandbox "You are running inside the desktop-sync workflow on the mariusandra/posthog fork. Merge state: $MERGE_STATE (either an in-progress conflicted merge of upstream master or the desktop PR branch, or a completed merge whose desktop tests fail). Read .agents/skills/syncing-desktop-fork/SKILL.md and follow it: finish the merge, fix what the merge broke, and leave the working tree committed and clean. Keep .github/workflows exactly as it was at $DESKTOP_BASE_SHA. The fork owns products/desktop too: upstream has a different app at that path. Finish every requested merge, including any remaining refs after the conflicted one: $SYNC_REFS. Restore fork-owned paths with the helper copied to $RUNNER_TEMP/restore-fork-paths.sh. Install dependencies, build frontend workspace dependencies, and fix desktop tests, desktop typecheck, and frontend typecheck. Do not push."
 
             - name: Verify merge concluded
               env:
                   DESKTOP_BASE_SHA: ${{ steps.merge.outputs.base }}
+                  SYNC_REFS: ${{ steps.merge.outputs.refs }}
               run: |
-                  if [ -f .git/MERGE_HEAD ]; then
+                  if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
                       echo "::error::Merge is still in progress"
                       exit 1
                   fi
-                  git diff --check
+                  for ref in $SYNC_REFS; do
+                      if ! git merge-base --is-ancestor "$ref" HEAD; then
+                          echo "::error::Requested upstream ref was not merged: $ref"
+                          exit 1
+                      fi
+                  done
+                  git diff --check "$DESKTOP_BASE_SHA" HEAD
                   if [ -n "$(git status --porcelain)" ]; then
                       echo "::error::Working tree is not clean"
                       git status --porcelain
@@ -143,11 +165,20 @@ jobs:
                       exit 1
                   fi
 
-            - name: Desktop tests (final gate)
+            - name: Desktop and frontend checks (final gate)
               if: steps.merge.outputs.state != 'up-to-date'
               run: |
-                  pnpm install --frozen-lockfile --filter=@posthog/desktop
-                  pnpm --filter=@posthog/desktop test
+                  pnpm install --frozen-lockfile --filter=@posthog/desktop --filter=@posthog/frontend...
+                  pnpm --filter=@posthog/desktop --fail-if-no-match test
+                  pnpm --filter=@posthog/desktop --fail-if-no-match typecheck
+                  pnpm exec turbo --filter=@posthog/frontend prepare
+                  pnpm --filter=@posthog/frontend typescript:check
+
+                  if [ -n "$(git status --porcelain)" ]; then
+                      echo "::error::Validation left uncommitted changes"
+                      git status --porcelain
+                      exit 1
+                  fi
 
             - name: Push
               if: steps.merge.outputs.state != 'up-to-date'

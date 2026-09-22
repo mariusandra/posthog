@@ -1,17 +1,11 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.bugherd.bugherd import (
     BugherdResumeConfig,
@@ -32,6 +26,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.bugherd import (
     BugherdSourceConfig,
 )
@@ -105,10 +100,10 @@ class BugherdSource(ResumableSource[BugherdSourceConfig, BugherdResumeConfig]):
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.BUGHERD,
+            name=ExternalDataSourceType.BUGHERD,
             category=DataWarehouseSourceCategory.ENGINEERING___MONITORING,
             label="BugHerd",
-            caption="""Enter your BugHerd API key to sync your organization, projects, tasks, and users into the PostHog Data warehouse.
+            caption="""Enter your BugHerd API key to sync your organization, projects, tasks, task comments, board columns, and users into the PostHog Data warehouse.
 
 Find your API key in BugHerd under **Settings > General Settings** (organization owner/admin access is required).""",
             docsUrl="https://posthog.com/docs/cdp/sources/bugherd",

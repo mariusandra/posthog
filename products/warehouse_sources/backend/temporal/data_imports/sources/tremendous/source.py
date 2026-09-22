@@ -1,19 +1,13 @@
 from typing import Optional, cast
 
-from posthog.schema import (
+from products.warehouse_sources.backend.facade.source_config import (
     DataWarehouseSourceCategory,
-    ExternalDataSourceType as SchemaExternalDataSourceType,
     ReleaseStatus,
     SourceConfig,
     SourceFieldInputConfig,
     SourceFieldInputConfigType,
     SourceFieldSelectConfig,
     SourceFieldSelectConfigOption,
-)
-
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.base import FieldType, ResumableSource
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.canonical_descriptions import (
@@ -25,12 +19,14 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sch
     SourceSchema,
     build_endpoint_schemas,
 )
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.temporal.data_imports.sources.generated_configs.tremendous import (
     TremendousSourceConfig,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.tremendous.settings import (
     ENDPOINTS,
     INCREMENTAL_FIELDS,
+    SHOULD_SYNC_DEFAULT,
     TREMENDOUS_ENDPOINTS,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.tremendous.tremendous import (
@@ -57,7 +53,7 @@ class TremendousSource(ResumableSource[TremendousSourceConfig, TremendousResumeC
     @property
     def get_source_config(self) -> SourceConfig:
         return SourceConfig(
-            name=SchemaExternalDataSourceType.TREMENDOUS,
+            name=ExternalDataSourceType.TREMENDOUS,
             category=DataWarehouseSourceCategory.PAYMENTS___BILLING,
             label="Tremendous",
             releaseStatus=ReleaseStatus.ALPHA,
@@ -116,9 +112,9 @@ You can create an API key under **Team settings → Developers** in [Tremendous]
         force_refresh: bool = False,
         api_version: str | None = None,
     ) -> list[SourceSchema]:
-        # Only /orders exposes a server-side timestamp filter (`created_at[gte]`); everything else
-        # is full refresh (see settings.py).
-        return build_endpoint_schemas(ENDPOINTS, INCREMENTAL_FIELDS, names)
+        # Only /orders and /balance_transactions expose a server-side timestamp filter
+        # (`created_at[gte]`); everything else is full refresh (see settings.py).
+        return build_endpoint_schemas(ENDPOINTS, INCREMENTAL_FIELDS, names, should_sync_default=SHOULD_SYNC_DEFAULT)
 
     def validate_credentials(
         self,

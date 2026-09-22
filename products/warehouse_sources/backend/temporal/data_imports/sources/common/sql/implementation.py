@@ -34,15 +34,11 @@ from structlog.types import FilteringBoundLogger
 
 from posthog.exceptions_capture import capture_exception
 
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.consts import (
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.consts import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_TABLE_SIZE_BYTES,
 )
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.typings import (
-    SourceInputs,
-    SourceResponse,
-)
-from products.warehouse_sources.backend.temporal.data_imports.pipelines.pipeline.utils import (
+from products.warehouse_sources.backend.temporal.data_imports.pipelines.core.partitioning import (
     DEFAULT_PARTITION_TARGET_SIZE_IN_BYTES,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.config import Config
@@ -50,6 +46,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql
     IncrementalFieldFilter,
 )
 from products.warehouse_sources.backend.temporal.data_imports.sources.common.sql.types import Column, Table
+from products.warehouse_sources.backend.temporal.data_imports.sources.common.typings import SourceInputs, SourceResponse
 from products.warehouse_sources.backend.types import PartitionSettings
 
 
@@ -117,11 +114,16 @@ class SQLSourceImplementation(Generic[ConfigT, ConnT, CursorT], ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def connect(self, config: ConfigT) -> AbstractContextManager[ConnT]:
+    def connect(self, config: ConfigT, *, team_id: int | None = None) -> AbstractContextManager[ConnT]:
         """Open a driver connection for the duration of schema discovery.
 
         Implementations own the full lifecycle — SSH tunnel (if any),
         TLS, auth, cursor setup — and clean it up on exit.
+
+        `team_id` feeds the host policy that decides where the connection may go. The
+        internal-analytics teams are exempt from it, so a connect that drops the team fails
+        closed for them; every caller that has a team must pass it. Drivers that reach the
+        vendor over HTTPS through the egress proxy accept it and ignore it.
         """
 
     @abstractmethod

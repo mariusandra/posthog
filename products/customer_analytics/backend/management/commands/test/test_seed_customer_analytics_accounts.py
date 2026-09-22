@@ -11,7 +11,9 @@ from posthog.persons_db import persons_db_connection
 from posthog.persons_seed import insert_seed_group
 
 from products.customer_analytics.backend.models.account import Account
+from products.customer_analytics.backend.models.relationship import AccountRelationship
 from products.customer_analytics.backend.models.team_customer_analytics_config import TeamCustomerAnalyticsConfig
+from products.notebooks.backend.facade.content import is_markdown_notebook_content
 from products.notebooks.backend.models import Notebook, ResourceNotebook
 
 pytestmark = pytest.mark.persons_db_direct
@@ -66,16 +68,19 @@ class TestSeedCustomerAnalyticsAccounts(BaseTest):
         assert set(accounts) == {"acme-id", "globex-id", "initech-id"}
         assert accounts["acme-id"].name == "Acme"
 
-        # Users: a pool joined to the org, assigned as account roles.
+        # Users: a pool joined to the org, assigned as account relationships.
         assert len(self._pool_emails()) == 4
-        owner = accounts["acme-id"].properties.account_owner
-        assert owner is not None
-        assert owner.email in self._pool_emails()
+        holders = AccountRelationship.objects.for_team(self.team.pk).filter(
+            account=accounts["acme-id"], ended_at__isnull=True
+        )
+        assert {rel.definition.name for rel in holders} == {"CSM", "Account executive", "Account owner"}
+        assert all(rel.user is not None and rel.user.email in self._pool_emails() for rel in holders)
 
         # Notes: only the first two accounts (by group key) get two notes each.
         notebooks = Notebook.objects.filter(resources__account__team_id=self.team.pk)
         assert notebooks.count() == 4
         assert all(notebook.visibility == Notebook.Visibility.INTERNAL for notebook in notebooks)
+        assert all(is_markdown_notebook_content(notebook.content) for notebook in notebooks)
         accounts_with_notes = set(
             ResourceNotebook.objects.filter(account__team_id=self.team.pk).values_list("account_id", flat=True)
         )

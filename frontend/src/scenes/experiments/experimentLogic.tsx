@@ -11,12 +11,11 @@ import {
     reducers,
     selectors,
 } from 'kea'
-import { forms } from 'kea-forms'
-import type { DeepPartial, DeepPartialMap, FieldName, ValidationErrorType } from 'kea-forms'
 import { loaders } from 'kea-loaders'
 import { router } from 'kea-router'
 
 import api from 'lib/api'
+import { isApprovalRequiredError } from 'lib/api-error'
 import { tryShowMCPHint } from 'lib/components/MCPHint/mcpHintLogic'
 import { SetupTaskId, globalSetupLogic } from 'lib/components/ProductSetup'
 import { FEATURE_FLAGS } from 'lib/constants'
@@ -25,8 +24,6 @@ import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
 import { featureFlagLogic, type FeatureFlagsSet } from 'lib/logic/featureFlagLogic'
 import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
 import { addProjectIdIfMissing } from 'lib/utils/kea-router'
-import { hasFormErrors } from 'lib/utils/objects'
-import { toParams } from 'lib/utils/url'
 import { showApprovalRequiredToast } from 'scenes/approvals/ApprovalRequiredBanner'
 import { dispatchChangeRequestCreated } from 'scenes/approvals/utils'
 import { billingLogic } from 'scenes/billing/billingLogic'
@@ -35,20 +32,18 @@ import {
     hasMultipleVariantsActive,
     hasZeroRollout,
     featureFlagLogic as sceneFeatureFlagLogic,
-    validateFeatureFlagKey,
 } from 'scenes/feature-flags/featureFlagLogic'
 import { featureFlagsLogic } from 'scenes/feature-flags/featureFlagsLogic'
-import { funnelDataLogic } from 'scenes/funnels/funnelDataLogic'
 import { insightDataLogic } from 'scenes/insights/insightDataLogic'
 import { projectLogic } from 'scenes/projectLogic'
 import { experimentsConfigLogic } from 'scenes/settings/environment/experimentsConfigLogic'
 import { teamLogic } from 'scenes/teamLogic'
-import { trendsDataLogic } from 'scenes/trends/trendsDataLogic'
 import { urls } from 'scenes/urls'
 
 import { refreshTreeItem } from '~/layout/panel-layout/ProjectTree/projectTreeLogic'
 import { cohortsModel } from '~/models/cohortsModel'
 import { groupsModel } from '~/models/groupsModel'
+import { tagsModel } from '~/models/tagsModel'
 import { performQuery } from '~/queries/query'
 import {
     AnyEntityNode,
@@ -63,9 +58,8 @@ import {
     ExperimentTrendsQuery,
     FunnelsQuery,
     InsightVizNode,
+    isExperimentFunnelMetric,
     NodeKind,
-    ProductIntentContext,
-    ProductKey,
     TrendsQuery,
 } from '~/queries/schema/schema-general'
 import { setLatestVersionsOnQuery } from '~/queries/utils'
@@ -73,7 +67,6 @@ import {
     BreakdownAttributionType,
     BreakdownType,
     CohortType,
-    CountPerActorMathType,
     DashboardType,
     Experiment,
     ExperimentConclusion,
@@ -81,8 +74,28 @@ import {
     FeatureFlagType,
     InsightType,
     MultivariateFlagVariant,
-    PropertyMathType,
 } from '~/types'
+
+import {
+    EXPERIMENT_AUTO_REFRESH_INITIAL_INTERVAL_SECONDS,
+    EXPERIMENT_MIN_EXPOSURES_FOR_RESULTS,
+    NEW_EXPERIMENT,
+    NEW_EXPERIMENT_FORCE_REFRESH_AFTER_MINUTES,
+    MetricInsightId,
+} from 'products/experiments/frontend/constants'
+import { hasEnded, isLaunched } from 'products/experiments/frontend/experimentStatus'
+import {
+    legacyExpectedRunningTime,
+    legacyMinimumSampleSizePerVariant,
+    legacyRecommendedExposureForCountData,
+} from 'products/experiments/frontend/legacy/calculations/legacyExperimentCalculations'
+import {
+    experimentsLogic,
+    getShippedVariantKey,
+    isSingleVariantShipped,
+} from 'products/experiments/frontend/scenes/experimentsLogic'
+import { funnelDataLogic } from 'products/product_analytics/frontend/insights/funnels/funnelDataLogic'
+import { trendsDataLogic } from 'products/product_analytics/frontend/insights/trends/trendsDataLogic'
 
 import type { ProductIntentProperties } from '../../lib/utils/product-intents'
 import type { Noun } from '../../models/groupsModel'
@@ -98,29 +111,9 @@ import type {
 } from '../../types'
 import type { TrendResult } from '../../types'
 import type { ExperimentsConfig } from '../settings/environment/experimentsConfigLogic'
-import {
-    EXPERIMENT_AUTO_REFRESH_INITIAL_INTERVAL_SECONDS,
-    EXPERIMENT_MIN_EXPOSURES_FOR_RESULTS,
-    NEW_EXPERIMENT,
-    NEW_EXPERIMENT_FORCE_REFRESH_AFTER_MINUTES,
-    MetricInsightId,
-} from './constants'
 import { experimentMetricsLogic } from './experimentMetricsLogic'
-import { experimentSceneLogic } from './experimentSceneLogic'
-import {
-    experimentsLogic,
-    getShippedVariantKey,
-    hasEnded,
-    isLaunched,
-    isSingleVariantShipped,
-} from './experimentsLogic'
-import { featureFlagVariantProperty } from './exposureContract'
+import { featureFlagVariantProperty, resolvedExposureEvent } from './exposureContract'
 import { holdoutsLogic } from './holdoutsLogic'
-import {
-    legacyExpectedRunningTime,
-    legacyMinimumSampleSizePerVariant,
-    legacyRecommendedExposureForCountData,
-} from './legacy/calculations/legacyExperimentCalculations'
 import {
     addExposureToMetric,
     compose,
@@ -135,13 +128,15 @@ import { SharedMetric } from './SharedMetrics/sharedMetricLogic'
 import { sharedMetricsLogic } from './SharedMetrics/sharedMetricsLogic'
 import {
     type ExperimentUpdatePayload,
-    featureFlagEligibleForExperiment,
     getExperimentVariants,
     getOrderedMetricsWithResults,
     initializeMetricOrdering,
+    conflictPreservedFields,
+    isExperimentConflictError,
     isLegacyExperiment,
-    toExperimentWritePayload,
+    toConcurrencyPayload,
     toFlagVariantsInput,
+    withoutProjectedFlagConfig,
 } from './utils'
 
 export const FORM_MODES = {
@@ -175,7 +170,21 @@ export interface ExperimentLogicProps {
     tabId?: string
 }
 
-export type ExperimentTriggeredBy = 'page_load' | 'manual' | 'auto_refresh' | 'config_change'
+export type ExperimentTriggeredBy =
+    | 'page_load'
+    | 'manual'
+    | 'auto_refresh'
+    | 'experiment_config_change'
+    | 'metric_config_change'
+
+// Triggers that kick off a metrics recalculation. Each is also a valid API ExperimentMetricsRecalculationTriggerEnumApi value, so a
+// narrowed triggeredBy passes straight to triggerRecalculation. page_load and manual are handled elsewhere.
+const RECALCULATION_TRIGGERS = ['experiment_config_change', 'metric_config_change', 'auto_refresh'] as const
+
+const isRecalculationTrigger = (
+    triggeredBy: ExperimentTriggeredBy
+): triggeredBy is (typeof RECALCULATION_TRIGGERS)[number] =>
+    (RECALCULATION_TRIGGERS as readonly string[]).includes(triggeredBy)
 
 export type CurrentRefreshState = 'in_progress' | 'completed' | 'partial' | 'errored'
 export type FinishedRefreshState = Exclude<CurrentRefreshState, 'in_progress'>
@@ -333,7 +342,7 @@ const loadMetrics = async ({
     onSetErrors,
 }: MetricLoadingConfig): Promise<MetricLoadingSummary> => {
     const results: CachedNewExperimentQueryResponse[] = []
-    const currentErrors = new Array(metrics.length).fill(null)
+    const currentErrors = Array.from({ length: metrics.length }).fill(null)
 
     let successfulCount = 0
     let erroredCount = 0
@@ -460,10 +469,22 @@ const sharedMetricsToExperimentMetrics = (
         .filter(({ metadata }) => metadata.type === type)
         .map(({ query, metadata }) => ({
             ...query,
+            /**
+             * for funnel shared metrics, merge the breakdown attribution from metadata into the query
+             */
+            ...(metadata?.breakdownAttributionType !== undefined &&
+                isExperimentFunnelMetric(query) && {
+                    breakdownAttributionType: metadata.breakdownAttributionType,
+                    breakdownAttributionValue: metadata.breakdownAttributionValue,
+                }),
             // Merge breakdowns from metadata into the query
+            /**
+             * merge breakdown limits from metadata into the query
+             */
             breakdownFilter: {
                 ...query?.breakdownFilter,
                 breakdowns: metadata?.breakdowns || [],
+                ...(metadata?.breakdown_limit !== undefined && { breakdown_limit: metadata.breakdown_limit }),
             },
         }))
 
@@ -478,6 +499,9 @@ export type ExperimentSavedMetric = {
     metadata: {
         type: 'primary' | 'secondary'
         breakdowns?: Breakdown[]
+        breakdownAttributionType?: BreakdownAttributionType
+        breakdownAttributionValue?: number
+        breakdown_limit?: number
     }
     created_at: string
     query: ExperimentMetric
@@ -490,6 +514,7 @@ export interface experimentLogicValues {
     defaultMinimumDetectableEffect: number // experimentsConfigLogic
     experimentsConfig: ExperimentsConfig | null // experimentsConfigLogic
     featureFlags: FeatureFlagsSet // featureFlagLogic
+    receivedFeatureFlags: boolean // featureFlagLogic
     conversionMetrics: FunnelTimeConversionMetrics // funnelDataLogic
     funnelResults: FunnelResultType // funnelDataLogic
     aggregationLabel: (groupTypeIndex: number | null | undefined, deferToUserWording?: boolean) => Noun // groupsModel
@@ -508,7 +533,6 @@ export interface experimentLogicValues {
         interval: number
     }
     compatibleSharedMetrics: SharedMetric[]
-    createExperimentLoading: boolean
     currentRefresh: CurrentRefreshSnapshot | null
     editingPrimaryMetricUuid: string | null
     editingSecondaryMetricUuid: string | null
@@ -516,31 +540,20 @@ export interface experimentLogicValues {
     endExperimentLoading: boolean
     excludedVariants: string[]
     experiment: Experiment
-    experimentAllErrors: Record<string, any>
-    experimentChanged: boolean
-    experimentErrors: DeepPartialMap<Experiment, ValidationErrorType>
-    experimentHasErrors: boolean
     experimentId: Experiment['id']
     experimentLoading: boolean
-    experimentManualErrors: Record<string, any>
-    experimentMathAggregationForTrends: () => CountPerActorMathType | PropertyMathType | undefined
     experimentMissing: boolean
-    experimentTouched: boolean
-    experimentTouches: Record<string, boolean>
     experimentUpdate: Experiment | null
     experimentUpdateLoading: boolean
-    experimentValidationErrors: DeepPartialMap<Experiment, ValidationErrorType>
     experimentWarning: ExperimentWarning | null
     exposureCohort: CohortType | null
     exposureCohortLoading: boolean
     exposureCriteria: ExperimentExposureCriteria | undefined
     exposures: any
     exposuresLoading: boolean
-    featureFlagValidationError: string | null
     firstPrimaryMetric: ExperimentFunnelsQuery | ExperimentMetric | ExperimentTrendsQuery | undefined
     formMode: FormModes
     freezeExposureLoading: boolean
-    getExperimentMetricType: (metric: ExperimentMetricUnion | undefined) => ExperimentMetricType
     getInsightType: (
         metric: ExperimentFunnelsQuery | ExperimentMetricUnion | ExperimentTrendsQuery | undefined
     ) => InsightType
@@ -552,15 +565,12 @@ export interface experimentLogicValues {
         result: any
     }[]
     hasMinimumExposureForResults: boolean
-    hasPrimaryMetricSet: boolean
     hogfettiTrigger: (() => void) | null
     isCreatingExperimentDashboard: boolean
     isExperimentDraft: boolean
     isExperimentLaunched: boolean
     isExperimentRunning: boolean
     isExperimentStopped: boolean
-    isExperimentSubmitting: boolean
-    isExperimentValid: boolean
     isFlagActive: boolean
     isPageVisible: boolean
     isSingleVariantShipped: boolean
@@ -588,19 +598,17 @@ export interface experimentLogicValues {
     props: any
     recommendedRunningTime: number
     recommendedSampleSize: number
-    secondaryMetricsLengthWithSharedMetrics: number
+    resolvedExposureEvent: string
     secondaryMetricsResults: CachedNewExperimentQueryResponse[]
     secondaryMetricsResultsErrors: any[]
     secondaryMetricsResultsLoading: boolean
     shippedVariantKey: string | null
     showDebugPanel: boolean
-    showExperimentErrors: boolean
     showNotificationOffer: boolean
     statsMethod: ExperimentStatsMethod
     unfreezeExposureLoading: boolean
     unmodifiedExperiment: Experiment | null
     usesNewQueryRunner: boolean
-    validExistingFeatureFlag: FeatureFlagType | null
     variants: MultivariateFlagVariant[]
 }
 
@@ -715,9 +723,6 @@ export interface experimentLogicActions {
     reportExperimentResultsLoadingTimeout: (experimentId: ExperimentIdType) => {
         experimentId: ExperimentIdType
     } // eventUsageLogic
-    reportExperimentSessionReplaySummaryRequested: (experiment: Experiment) => {
-        experiment: Experiment
-    } // eventUsageLogic
     reportExperimentSharedMetricAssigned: (
         experimentId: ExperimentIdType,
         sharedMetric: SharedMetric
@@ -749,8 +754,14 @@ export interface experimentLogicActions {
         duration: number | null
         experiment: Experiment
     } // eventUsageLogic
-    addToExperiments: (experiment: Experiment) => Experiment // experimentsLogic
     updateExperiments: (experiment: Experiment) => Experiment // experimentsLogic
+    setFeatureFlags: (
+        flags: string[],
+        variants: Record<string, boolean | string>
+    ) => {
+        flags: string[]
+        variants: Record<string, boolean | string>
+    } // featureFlagLogic
     updateFlagFromPartial: (
         flag: Partial<FeatureFlagType> & {
             id: number
@@ -769,16 +780,10 @@ export interface experimentLogicActions {
     closePrimaryMetricModal: () => {
         value: true
     } // modalsLogic
-    closePrimaryMetricsReorderModal: () => {
-        value: true
-    } // modalsLogic
     closeResumeExperimentModal: () => {
         value: true
     } // modalsLogic
     closeSecondaryMetricModal: () => {
-        value: true
-    } // modalsLogic
-    closeSecondaryMetricsReorderModal: () => {
         value: true
     } // modalsLogic
     openPrimaryMetricModal: (uuid: string) => {
@@ -796,6 +801,9 @@ export interface experimentLogicActions {
     openSecondarySharedMetricModal: (sharedMetricId: number | null) => {
         sharedMetricId: number | null
     } // modalsLogic
+    loadTags: () => {
+        value: true
+    } // tagsModel
     addProductIntent: (properties: ProductIntentProperties) => ProductIntentProperties // teamLogic
     addSharedMetricsToExperiment: (
         sharedMetricIds: SharedMetric['id'][],
@@ -819,13 +827,6 @@ export interface experimentLogicActions {
     }
     clearMetricsResults: () => {
         value: true
-    }
-    createExperiment: (
-        draft?: boolean,
-        folder?: string | null
-    ) => {
-        draft: boolean | undefined
-        folder: string | null | undefined
     }
     createExperimentDashboard: () => {
         value: true
@@ -853,24 +854,55 @@ export interface experimentLogicActions {
         newUuid: string
         uuid: string
     }
-    endExperiment: (openCleanupPr?: boolean) => {
-        openCleanupPr: boolean
+    duplicateSharedMetricAsInlineMetric: ({
+        sharedMetricId,
+        isSecondary,
+        newUuid,
+    }: {
+        isSecondary: boolean
+        newUuid: string
+        sharedMetricId: SharedMetric['id']
+    }) => {
+        isSecondary: boolean
+        newUuid: string
+        sharedMetricId: number
     }
-    endExperimentWithoutShipping: (openCleanupPr?: boolean) => {
+    endExperiment: (
+        openCleanupPr?: boolean,
+        repository?: string | null,
+        setRepositoryAsTeamDefault?: boolean
+    ) => {
         openCleanupPr: boolean
+        repository: string | null
+        setRepositoryAsTeamDefault: boolean
+    }
+    endExperimentWithoutShipping: (
+        openCleanupPr?: boolean,
+        repository?: string | null,
+        setRepositoryAsTeamDefault?: boolean
+    ) => {
+        openCleanupPr: boolean
+        repository: string | null
+        setRepositoryAsTeamDefault: boolean
     }
     finishExperiment: ({
         selectedVariantKey,
         releaseToEveryone,
         openCleanupPr,
+        repository,
+        setRepositoryAsTeamDefault,
     }: {
         openCleanupPr?: boolean
         releaseToEveryone: boolean
+        repository?: string | null
         selectedVariantKey: string
+        setRepositoryAsTeamDefault?: boolean
     }) => {
         openCleanupPr: boolean
         releaseToEveryone: boolean
+        repository: string | null
         selectedVariantKey: string
+        setRepositoryAsTeamDefault: boolean
     }
     freezeExposure: () => {
         value: true
@@ -942,6 +974,17 @@ export interface experimentLogicActions {
         refreshId: string
         triggeredBy: ExperimentTriggeredBy
     }
+    moveMetricsBetweenSections: (
+        isSecondary: boolean,
+        orderedUuids: string[],
+        removedUuids: string[],
+        movedUuids: string[]
+    ) => {
+        isSecondary: boolean
+        movedUuids: string[]
+        orderedUuids: string[]
+        removedUuids: string[]
+    }
     pauseExperiment: () => {
         value: true
     }
@@ -976,11 +1019,15 @@ export interface experimentLogicActions {
     removeSharedMetricFromExperiment: (sharedMetricId: SharedMetric['id']) => {
         sharedMetricId: number
     }
+    reorderMetrics: (
+        isSecondary: boolean,
+        orderedUuids: string[]
+    ) => {
+        isSecondary: boolean
+        orderedUuids: string[]
+    }
     resetAutoRefreshInterval: () => {
         value: true
-    }
-    resetExperiment: (values?: Experiment) => {
-        values?: Experiment
     }
     resetRunningExperiment: () => {
         value: true
@@ -997,26 +1044,12 @@ export interface experimentLogicActions {
     retrySecondaryMetric: (index: number) => {
         index: number
     }
-    saveMetricsReorder: (
-        isSecondary: boolean,
-        orderedUuids: string[],
-        removedUuids: string[],
-        movedUuids: string[]
-    ) => {
-        isSecondary: boolean
-        movedUuids: string[]
-        orderedUuids: string[]
-        removedUuids: string[]
-    }
     setAutoRefresh: (
         enabled: boolean,
         interval: number
     ) => {
         enabled: boolean
         interval: number
-    }
-    setCreateExperimentLoading: (loading: boolean) => {
-        loading: boolean
     }
     setEditExperiment: (editing: boolean) => {
         editing: boolean
@@ -1027,27 +1060,11 @@ export interface experimentLogicActions {
     setExperiment: (experiment: Partial<Experiment>) => {
         experiment: Partial<Experiment>
     }
-    setExperimentManualErrors: (errors: Record<string, any>) => {
-        errors: Record<string, any>
-    }
     setExperimentMissing: () => {
         value: true
     }
-    setExperimentValue: (
-        key: FieldName,
-        value: any
-    ) => {
-        name: FieldName
-        value: any
-    }
-    setExperimentValues: (values: DeepPartial<Experiment>) => {
-        values: DeepPartial<Experiment>
-    }
     setExposureCriteria: (exposureCriteria: ExperimentExposureCriteria) => {
         exposureCriteria: ExperimentExposureCriteria
-    }
-    setFeatureFlagValidationError: (error: string) => {
-        error: string
     }
     setFreezeExposureLoading: (loading: boolean) => {
         loading: boolean
@@ -1185,9 +1202,6 @@ export interface experimentLogicActions {
     setUnmodifiedExperiment: (experiment: Experiment) => {
         experiment: Experiment
     }
-    setValidExistingFeatureFlag: (featureFlag: FeatureFlagType | null) => {
-        featureFlag: FeatureFlagType | null
-    }
     setVariantExcluded: (
         variantKey: string,
         excluded: boolean
@@ -1198,30 +1212,11 @@ export interface experimentLogicActions {
     stopAutoRefreshInterval: () => {
         value: true
     }
-    submitExperiment: () => {
-        value: boolean
-    }
-    submitExperimentFailure: (
-        error: Error,
-        errors: Record<string, any>
-    ) => {
-        error: Error
-        errors: Record<string, any>
-    }
-    submitExperimentRequest: (experiment: Experiment) => {
-        experiment: Experiment
-    }
-    submitExperimentSuccess: (experiment: Experiment) => {
-        experiment: Experiment
-    }
     subscribeToResultsNotification: () => {
         value: true
     }
     toggleDebugPanel: () => {
         value: true
-    }
-    touchExperimentField: (key: string) => {
-        key: string
     }
     unarchiveExperiment: () => {
         value: true
@@ -1237,9 +1232,6 @@ export interface experimentLogicActions {
         variants: MultivariateFlagVariant[]
     }
     updateExperiment: (update: ExperimentUpdatePayload) => ExperimentUpdatePayload
-    updateExperimentCollectionGoal: () => {
-        value: true
-    }
     updateExperimentFailure: (
         error: string,
         errorObject?: any
@@ -1276,14 +1268,27 @@ export interface experimentLogicActions {
         breakdown: Breakdown
         uuid: string
     }
-    validateFeatureFlag: (featureFlagKey: string) => {
-        featureFlagKey: string
+    updateMetricBreakdownAttribution: (
+        uuid: string,
+        attributionType: BreakdownAttributionType,
+        attributionValue?: number
+    ) => {
+        attributionType: BreakdownAttributionType
+        attributionValue: number | undefined
+        uuid: string
+    }
+    updateMetricBreakdownLimit: (
+        uuid: string,
+        breakdownLimit: number
+    ) => {
+        breakdownLimit: number
+        uuid: string
     }
 }
 
 // Generated by kea-typegen. Update if you're an agent, ignore if you're human.
 export interface experimentLogicMeta {
-    key: ExperimentIdType
+    key: string
     __keaTypeGenInternalSelectorTypes: {
         props: (arg: any) => any
         experimentId: (arg: any) => Experiment['id']
@@ -1292,12 +1297,10 @@ export interface experimentLogicMeta {
         isExperimentLaunched: (experiment: Experiment) => boolean
         isExperimentRunning: (experiment: Experiment) => boolean
         isFlagActive: (experiment: Experiment) => boolean
+        resolvedExposureEvent: (experiment: Experiment) => string
         isExperimentStopped: (experiment: Experiment) => boolean
         variants: (experiment: Experiment) => MultivariateFlagVariant[]
         excludedVariants: (experiment: Experiment) => string[]
-        experimentMathAggregationForTrends: (
-            experiment: Experiment
-        ) => () => CountPerActorMathType | PropertyMathType | undefined
         minimumDetectableEffect: (experiment: Experiment, defaultMinimumDetectableEffect: number) => number
         recommendedSampleSize: (
             conversionMetrics: FunnelTimeConversionMetrics,
@@ -1327,12 +1330,10 @@ export interface experimentLogicMeta {
             isSingleVariantShipped: boolean,
             shippedVariantKey: string | null
         ) => ExperimentWarning | null
-        hasPrimaryMetricSet: (primaryMetricsLengthWithSharedMetrics: number) => boolean
         firstPrimaryMetric: (
             experiment: Experiment
         ) => ExperimentFunnelsQuery | ExperimentMetric | ExperimentTrendsQuery | undefined
         primaryMetricsLengthWithSharedMetrics: (experiment: Experiment) => number
-        secondaryMetricsLengthWithSharedMetrics: (experiment: Experiment) => number
         compatibleSharedMetrics: (sharedMetrics: SharedMetric[], usesNewQueryRunner: boolean) => SharedMetric[]
         usesNewQueryRunner: (experiment: Experiment) => boolean
         hasMinimumExposureForResults: (exposures: any, usesNewQueryRunner: boolean) => boolean
@@ -1407,7 +1408,7 @@ export const experimentLogic = kea<experimentLogicType>([
             groupsModel,
             ['aggregationLabel', 'groupTypes', 'showGroupsOptions'],
             featureFlagLogic,
-            ['featureFlags'],
+            ['featureFlags', 'receivedFeatureFlags'],
             holdoutsLogic,
             ['holdouts'],
             billingLogic,
@@ -1429,7 +1430,9 @@ export const experimentLogic = kea<experimentLogicType>([
         ],
         actions: [
             experimentsLogic,
-            ['updateExperiments', 'addToExperiments'],
+            ['updateExperiments'],
+            tagsModel,
+            ['loadTags'],
             eventUsageLogic,
             [
                 'reportExperimentCreated',
@@ -1445,7 +1448,6 @@ export const experimentLogic = kea<experimentLogicType>([
                 'reportExperimentTimeseriesViewed',
                 'reportExperimentTimeseriesRecalculated',
                 'reportExperimentAiSummaryRequested',
-                'reportExperimentSessionReplaySummaryRequested',
                 'reportExperimentMetricsRefreshed',
                 'reportExperimentAutoRefreshToggled',
                 'reportExperimentMetricBreakdownAdded',
@@ -1453,6 +1455,8 @@ export const experimentLogic = kea<experimentLogicType>([
             ],
             teamLogic,
             ['addProductIntent'],
+            featureFlagLogic,
+            ['setFeatureFlags'],
             featureFlagsLogic,
             ['updateFlagFromPartial'],
             modalsLogic,
@@ -1467,16 +1471,12 @@ export const experimentLogic = kea<experimentLogicType>([
                 'closeResumeExperimentModal',
                 'closeFinishExperimentModal',
                 'openReleaseConditionsModal',
-                'closePrimaryMetricsReorderModal',
-                'closeSecondaryMetricsReorderModal',
             ],
         ],
     })),
     actions({
         setExperimentMissing: true,
         setExperiment: (experiment: Partial<Experiment>) => ({ experiment }),
-        createExperiment: (draft?: boolean, folder?: string | null) => ({ draft, folder }),
-        setCreateExperimentLoading: (loading: boolean) => ({ loading }),
         setLaunchExperimentLoading: (loading: boolean) => ({ loading }),
         setEndExperimentLoading: (loading: boolean) => ({ loading }),
         setEditExperiment: (editing: boolean) => ({ editing }),
@@ -1499,23 +1499,48 @@ export const experimentLogic = kea<experimentLogicType>([
             finalState,
         }),
         updateExperimentMetrics: true,
-        updateExperimentCollectionGoal: true,
         updateExposureCriteria: true,
         updateExperimentSettings: (update: Partial<Experiment>) => ({ update }),
         changeExperimentStartDate: (startDate: string) => ({ startDate }),
         changeExperimentEndDate: (endDate: string) => ({ endDate }),
         launchExperiment: true,
-        endExperiment: (openCleanupPr: boolean = false) => ({ openCleanupPr }),
-        endExperimentWithoutShipping: (openCleanupPr: boolean = false) => ({ openCleanupPr }),
+        endExperiment: (
+            openCleanupPr: boolean = false,
+            repository: string | null = null,
+            setRepositoryAsTeamDefault: boolean = false
+        ) => ({
+            openCleanupPr,
+            repository,
+            setRepositoryAsTeamDefault,
+        }),
+        endExperimentWithoutShipping: (
+            openCleanupPr: boolean = false,
+            repository: string | null = null,
+            setRepositoryAsTeamDefault: boolean = false
+        ) => ({
+            openCleanupPr,
+            repository,
+            setRepositoryAsTeamDefault,
+        }),
         finishExperiment: ({
             selectedVariantKey,
             releaseToEveryone,
             openCleanupPr,
+            repository,
+            setRepositoryAsTeamDefault,
         }: {
             selectedVariantKey: string
             releaseToEveryone: boolean
             openCleanupPr?: boolean
-        }) => ({ selectedVariantKey, releaseToEveryone, openCleanupPr: openCleanupPr ?? false }),
+            repository?: string | null
+            setRepositoryAsTeamDefault?: boolean
+        }) => ({
+            selectedVariantKey,
+            releaseToEveryone,
+            openCleanupPr: openCleanupPr ?? false,
+            repository: repository ?? null,
+            setRepositoryAsTeamDefault: setRepositoryAsTeamDefault ?? false,
+        }),
         pauseExperiment: true,
         resumeExperiment: true,
         freezeExposure: true,
@@ -1534,9 +1559,6 @@ export const experimentLogic = kea<experimentLogicType>([
         setIsCreatingExperimentDashboard: (isCreating: boolean) => ({ isCreating }),
         setUnmodifiedExperiment: (experiment: Experiment) => ({ experiment }),
         restoreUnmodifiedExperiment: true,
-        setValidExistingFeatureFlag: (featureFlag: FeatureFlagType | null) => ({ featureFlag }),
-        setFeatureFlagValidationError: (error: string) => ({ error }),
-        validateFeatureFlag: (featureFlagKey: string) => ({ featureFlagKey }),
         setHogfettiTrigger: (trigger: (() => void) | null) => ({ trigger }),
         // METRICS
         setMetric: ({
@@ -1626,9 +1648,23 @@ export const experimentLogic = kea<experimentLogicType>([
             isSecondary,
             newUuid,
         }),
+        duplicateSharedMetricAsInlineMetric: ({
+            sharedMetricId,
+            isSecondary,
+            newUuid,
+        }: {
+            sharedMetricId: SharedMetric['id']
+            isSecondary: boolean
+            newUuid: string
+        }) => ({
+            sharedMetricId,
+            isSecondary,
+            newUuid,
+        }),
         // Semantic metric actions - each controls its own reload behavior
         removeMetric: (uuid: string, context: 'primary' | 'secondary') => ({ uuid, context }),
-        saveMetricsReorder: (
+        reorderMetrics: (isSecondary: boolean, orderedUuids: string[]) => ({ isSecondary, orderedUuids }),
+        moveMetricsBetweenSections: (
             isSecondary: boolean,
             orderedUuids: string[],
             removedUuids: string[],
@@ -1636,6 +1672,16 @@ export const experimentLogic = kea<experimentLogicType>([
         ) => ({ isSecondary, orderedUuids, removedUuids, movedUuids }),
         updateMetricBreakdown: (uuid: string, breakdown: Breakdown) => ({ uuid, breakdown }),
         removeMetricBreakdown: (uuid: string, index: number, breakdown: Breakdown) => ({ uuid, index, breakdown }),
+        updateMetricBreakdownAttribution: (
+            uuid: string,
+            attributionType: BreakdownAttributionType,
+            attributionValue?: number
+        ) => ({
+            uuid,
+            attributionType,
+            attributionValue,
+        }),
+        updateMetricBreakdownLimit: (uuid: string, breakdownLimit: number) => ({ uuid, breakdownLimit }),
         // METRICS RESULTS
         clearMetricsResults: true,
         setPrimaryMetricsResults: (results: CachedNewExperimentQueryResponse[]) => ({ results }),
@@ -1845,6 +1891,44 @@ export const experimentLogic = kea<experimentLogicType>([
                         [metricsKey]: metrics,
                     }
                 },
+                duplicateSharedMetricAsInlineMetric: (state, { sharedMetricId, isSecondary, newUuid }) => {
+                    const metricType = isSecondary ? 'secondary' : 'primary'
+                    const savedMetric = (state?.saved_metrics || []).find(
+                        (m: ExperimentSavedMetric) =>
+                            m.saved_metric === sharedMetricId && m.metadata?.type === metricType
+                    )
+
+                    if (!savedMetric) {
+                        return state
+                    }
+
+                    const metricsKey = isSecondary ? 'metrics_secondary' : 'metrics'
+                    const metrics = [...(state?.[metricsKey] || [])]
+
+                    const query = savedMetric.query
+                    const name = `${savedMetric.name || getDefaultMetricTitle(query)} (copy)`
+
+                    /**
+                     * Build a single-use (inline) copy of the shared metric. The shared metric's
+                     * breakdowns live on the join metadata, so merge them into breakdownFilter here
+                     * the same way we do when rendering shared metrics.
+                     */
+                    const newMetric = {
+                        ...query,
+                        uuid: newUuid,
+                        name,
+                        breakdownFilter: {
+                            ...query?.breakdownFilter,
+                            breakdowns: savedMetric.metadata?.breakdowns || [],
+                        },
+                    }
+                    metrics.push(newMetric)
+
+                    return {
+                        ...state,
+                        [metricsKey]: metrics,
+                    }
+                },
                 updateMetricBreakdown: (state, { uuid, breakdown }) => {
                     /**
                      * Check if the UUID belongs to a shared metric
@@ -1957,6 +2041,147 @@ export const experimentLogic = kea<experimentLogicType>([
                         [metricsKey]: metrics,
                     }
                 },
+                updateMetricBreakdownAttribution: (state, { uuid, attributionType, attributionValue }) => {
+                    /**
+                     * if the uuid is a shared metric, update saved_metrics metadata of the many to many
+                     * relationship, so the breakdown limit is exclusive to this experiment
+                     */
+                    const savedMetrics: ExperimentSavedMetric[] = [...(state?.saved_metrics || [])]
+                    const savedMetricIndex = savedMetrics.findIndex(
+                        ({ query: { uuid: savedMetricUuid } }) => savedMetricUuid === uuid
+                    )
+
+                    /**
+                     * if saved metric found...
+                     */
+                    if (savedMetricIndex !== -1) {
+                        const savedMetric = savedMetrics[savedMetricIndex]
+                        savedMetrics[savedMetricIndex] = {
+                            ...savedMetric,
+                            metadata: {
+                                ...savedMetric.metadata,
+                                breakdownAttributionType: attributionType,
+                                breakdownAttributionValue: attributionValue,
+                            },
+                        }
+
+                        /**
+                         * return the experiment state with the updated saved metrics.
+                         */
+                        return {
+                            ...state,
+                            saved_metrics: savedMetrics,
+                        }
+                    }
+
+                    /**
+                     * figure out if it's a primary or secondary metric
+                     */
+                    const metricsKey =
+                        (state?.metrics || ([] as ExperimentMetric[])).findIndex((m) => m.uuid === uuid) > -1
+                            ? 'metrics'
+                            : 'metrics_secondary'
+
+                    /**
+                     * get the metrics group and find the metric index by uuid.
+                     * bail if not found
+                     */
+                    const metrics = [...(state?.[metricsKey] || [])]
+                    const targetIndex = metrics.findIndex((m) => m.uuid === uuid)
+                    if (targetIndex === -1) {
+                        return state
+                    }
+
+                    /**
+                     * reconstruct the metric with the updated breakdown attribution
+                     */
+                    metrics[targetIndex] = {
+                        ...metrics[targetIndex],
+                        breakdownAttributionType: attributionType,
+                        breakdownAttributionValue: attributionValue,
+                    } as ExperimentMetric
+
+                    /**
+                     * return the updated experiment state
+                     */
+                    return {
+                        ...state,
+                        [metricsKey]: metrics,
+                    }
+                },
+                updateMetricBreakdownLimit: (state, { uuid, breakdownLimit }) => {
+                    /**
+                     * if the uuid is a shared metric, update saved_metrics metadata of the many to many
+                     * relationship, so the breakdown limit is exclusive to this experiment
+                     */
+                    const savedMetrics: ExperimentSavedMetric[] = [...(state?.saved_metrics || [])]
+                    const savedMetricIndex = savedMetrics.findIndex(
+                        ({ query: { uuid: savedMetricUuid } }) => savedMetricUuid === uuid
+                    )
+
+                    /**
+                     * if saved metric found...
+                     */
+                    if (savedMetricIndex !== -1) {
+                        /**
+                         * rebuild the saved metrics with the updated breakdown limit
+                         */
+                        const savedMetric = savedMetrics[savedMetricIndex]
+                        savedMetrics[savedMetricIndex] = {
+                            ...savedMetric,
+                            metadata: {
+                                ...savedMetric.metadata,
+                                breakdown_limit: breakdownLimit,
+                            },
+                        }
+
+                        /**
+                         * return the experiment state with the updated saved metrics.
+                         */
+                        return {
+                            ...state,
+                            saved_metrics: savedMetrics,
+                        }
+                    }
+
+                    /**
+                     * figure out if it's a primary or secondary metric
+                     */
+                    const metricsKey =
+                        (state?.metrics || ([] as ExperimentMetric[])).findIndex((m) => m.uuid === uuid) > -1
+                            ? 'metrics'
+                            : 'metrics_secondary'
+
+                    /**
+                     * get the metrics group and find the metric index by uuid.
+                     * bail if not found
+                     */
+                    const metrics = [...(state?.[metricsKey] || [])]
+                    const targetIndex = metrics.findIndex((m) => m.uuid === uuid)
+                    if (targetIndex === -1) {
+                        return state
+                    }
+
+                    /**
+                     * reconstruct the metric with the updated breakdown limit
+                     */
+                    const metric = metrics[targetIndex] as ExperimentMetric
+                    metrics[targetIndex] = {
+                        ...metric,
+                        breakdownFilter: {
+                            ...metric.breakdownFilter,
+                            breakdown_limit: breakdownLimit,
+                        },
+                    } as ExperimentMetric
+
+                    /**
+                     * return the updated experiment state
+                     */
+                    return {
+                        ...state,
+                        [metricsKey]: metrics,
+                    }
+                },
             },
         ],
         experimentMissing: [
@@ -1968,7 +2193,18 @@ export const experimentLogic = kea<experimentLogicType>([
         unmodifiedExperiment: [
             null as Experiment | null,
             {
-                setUnmodifiedExperiment: (_, { experiment }) => experiment,
+                // Every write path (user saves, the running-time auto-save, reorders) absorbs its
+                // response here, and responses can land out of order. An older response arriving
+                // after a newer one must not move this concurrency base backwards: a poisoned base
+                // makes every following save from this tab stale, so it 409s as a false conflict
+                // against the user's own earlier write.
+                setUnmodifiedExperiment: (state, { experiment }) =>
+                    state &&
+                    typeof state.version === 'number' &&
+                    typeof experiment?.version === 'number' &&
+                    experiment.version < state.version
+                        ? state
+                        : experiment,
             },
         ],
         // PRIMARY METRICS
@@ -2052,24 +2288,6 @@ export const experimentLogic = kea<experimentLogicType>([
                 setIsCreatingExperimentDashboard: (_, { isCreating }) => isCreating,
             },
         ],
-        validExistingFeatureFlag: [
-            null as FeatureFlagType | null,
-            {
-                setValidExistingFeatureFlag: (_, { featureFlag }) => featureFlag,
-            },
-        ],
-        featureFlagValidationError: [
-            null as string | null,
-            {
-                setFeatureFlagValidationError: (_, { error }) => error,
-            },
-        ],
-        createExperimentLoading: [
-            false,
-            {
-                setCreateExperimentLoading: (_, { loading }) => loading,
-            },
-        ],
         launchExperimentLoading: [
             false,
             {
@@ -2131,7 +2349,7 @@ export const experimentLogic = kea<experimentLogicType>([
             },
         ],
     }),
-    listeners(({ values, actions, asyncActions, cache }) => ({
+    listeners(({ values, actions, asyncActions, cache, props }) => ({
         beforeUnmount: () => {
             actions.stopAutoRefreshInterval()
             clearTimeout(cache.notificationOfferTimer)
@@ -2155,139 +2373,9 @@ export const experimentLogic = kea<experimentLogicType>([
                 )
             }
         },
-        createExperiment: async ({ draft, folder }) => {
-            actions.setCreateExperimentLoading(true)
-            const { recommendedRunningTime, recommendedSampleSize, minimumDetectableEffect } = values
-
-            actions.touchExperimentField('name')
-            actions.touchExperimentField('feature_flag_key')
-            getExperimentVariants(values.experiment).forEach((_, i) =>
-                actions.touchExperimentField(`feature_flag_config.filters.multivariate.variants.${i}.key`)
-            )
-
-            if (hasFormErrors(values.experimentErrors)) {
-                actions.setCreateExperimentLoading(false)
-                return
-            }
-
-            // Minimum Detectable Effect is calculated based on a loaded insight
-            // Terminate if the insight did not manage to load in time
-            if (!minimumDetectableEffect) {
-                eventUsageLogic.actions.reportExperimentInsightLoadFailed()
-                actions.setCreateExperimentLoading(false)
-                lemonToast.error(
-                    'Failed to load insight. Experiment cannot be saved without this value. Try changing the experiment goal.'
-                )
-                return
-            }
-
-            let response: Experiment | null = null
-            const isUpdate = values.formMode === FORM_MODES.update
-            try {
-                if (isUpdate) {
-                    response = await api.update(
-                        `api/projects/${values.currentProjectId}/experiments/${values.experimentId}`,
-                        {
-                            // Sends variant split and rollout through the feature_flag object,
-                            // dropping the deprecated flag-config parameters keys.
-                            ...toExperimentWritePayload(values.experiment),
-                            running_time_calculation: {
-                                ...values.experiment?.running_time_calculation,
-                                recommended_running_time: recommendedRunningTime,
-                                recommended_sample_size: recommendedSampleSize,
-                                minimum_detectable_effect: minimumDetectableEffect,
-                            },
-                            ...(!draft && { start_date: dayjs() }),
-                            // backwards compatibility: Remove any global properties set on the experiment.
-                            // These were used to change feature flag targeting, but this is controlled directly
-                            // on the feature flag now.
-                            filters: {
-                                events: [],
-                                actions: [],
-                                ...values.experiment.filters,
-                                properties: [],
-                            },
-                            // Signal the backend to sync variant split and rollout
-                            // percentage to the linked feature flag.
-                            update_feature_flag_params: true,
-                        }
-                    )
-
-                    if (response?.id) {
-                        actions.updateExperiments(response)
-                        actions.setEditExperiment(false)
-                        actions.loadExperimentSuccess(response)
-                        return
-                    }
-                } else {
-                    response = await api.create(`api/projects/${values.currentProjectId}/experiments`, {
-                        // A pre-existing flag is linked as-is: the API rejects explicit flag
-                        // config for it, so only send config when the flag will be created.
-                        // Key-aware so a stale match for a previously typed key can't suppress
-                        // config for a fresh key.
-                        ...toExperimentWritePayload(values.experiment, {
-                            omitFlagConfig: values.validExistingFeatureFlag?.key === values.experiment.feature_flag_key,
-                        }),
-                        running_time_calculation:
-                            /**
-                             * only if we are creating a new experiment we need to reset
-                             * the recommended running time. If we are duplicating we want to
-                             * preserve this values.
-                             */
-                            values.formMode === FORM_MODES.create
-                                ? {
-                                      ...values.experiment?.running_time_calculation,
-                                      recommended_running_time: recommendedRunningTime,
-                                      recommended_sample_size: recommendedSampleSize,
-                                      minimum_detectable_effect: minimumDetectableEffect,
-                                  }
-                                : values.experiment?.running_time_calculation,
-                        ...(!draft && { start_date: dayjs() }),
-                        ...(typeof folder === 'string' ? { _create_in_folder: folder } : {}),
-                    })
-
-                    if (response) {
-                        actions.addProductIntent({
-                            product_type: ProductKey.EXPERIMENTS,
-                            intent_context: ProductIntentContext.EXPERIMENT_CREATED,
-                        })
-                        if (response.feature_flag?.id) {
-                            refreshTreeItem('feature_flag', String(response.feature_flag.id))
-                        }
-                    }
-                }
-            } catch (error: any) {
-                lemonToast.error(error.detail || 'Failed to create experiment')
-                actions.setCreateExperimentLoading(false)
-                return
-            }
-
-            if (response?.id) {
-                const experimentId = response.id
-                refreshTreeItem('experiment', String(experimentId))
-                const navigateToExperiment = (): void => {
-                    const tabId = values.props.tabId
-                    const scene = tabId ? experimentSceneLogic.findMounted({ tabId }) : null
-                    if (scene) {
-                        scene.actions.setSceneState(experimentId, FORM_MODES.update)
-                    } else {
-                        router.actions.push(urls.experiment(experimentId))
-                    }
-                }
-
-                navigateToExperiment()
-                actions.addToExperiments(response)
-                lemonToast.success(`Experiment ${isUpdate ? 'updated' : 'created'}`, {
-                    button: {
-                        label: 'View it',
-                        action: navigateToExperiment,
-                    },
-                })
-            }
-            actions.setCreateExperimentLoading(false)
-        },
         loadExperimentSuccess: async ({ experiment, payload }) => {
             const duration = experiment?.start_date ? dayjs().diff(experiment.start_date, 'second') : null
+            // eslint-disable-next-line no-unused-expressions
             experiment && actions.reportExperimentViewed(experiment, duration)
 
             // Load metrics for launched experiments (will set up auto-refresh after load completes).
@@ -2330,15 +2418,17 @@ export const experimentLogic = kea<experimentLogicType>([
         },
         changeExperimentStartDate: async ({ startDate }) => {
             await asyncActions.updateExperiment({ start_date: startDate, update_feature_flag_params: false })
+            // eslint-disable-next-line no-unused-expressions
             values.experiment && eventUsageLogic.actions.reportExperimentStartDateChange(values.experiment, startDate)
-            actions.refreshExperimentResults(true, 'config_change')
+            actions.refreshExperimentResults(true, 'experiment_config_change')
         },
         changeExperimentEndDate: async ({ endDate }) => {
             await asyncActions.updateExperiment({ end_date: endDate, update_feature_flag_params: false })
+            // eslint-disable-next-line no-unused-expressions
             values.experiment && eventUsageLogic.actions.reportExperimentEndDateChange(values.experiment, endDate)
-            actions.refreshExperimentResults(true, 'config_change')
+            actions.refreshExperimentResults(true, 'experiment_config_change')
         },
-        endExperiment: async ({ openCleanupPr }) => {
+        endExperiment: async ({ openCleanupPr, repository, setRepositoryAsTeamDefault }) => {
             actions.setEndExperimentLoading(true)
             try {
                 const response: Experiment = await api.create(
@@ -2347,6 +2437,8 @@ export const experimentLogic = kea<experimentLogicType>([
                         conclusion: values.experiment.conclusion,
                         conclusion_comment: values.experiment.conclusion_comment,
                         open_cleanup_pr: openCleanupPr,
+                        ...(repository ? { repository } : {}),
+                        ...(setRepositoryAsTeamDefault ? { set_repository_as_team_default: true } : {}),
                     }
                 )
                 actions.setExperiment(response)
@@ -2357,8 +2449,8 @@ export const experimentLogic = kea<experimentLogicType>([
                 actions.setEndExperimentLoading(false)
             }
         },
-        endExperimentWithoutShipping: async ({ openCleanupPr }) => {
-            actions.endExperiment(openCleanupPr)
+        endExperimentWithoutShipping: async ({ openCleanupPr, repository, setRepositoryAsTeamDefault }) => {
+            actions.endExperiment(openCleanupPr, repository, setRepositoryAsTeamDefault)
             actions.closeFinishExperimentModal()
             lemonToast.success('Experiment ended successfully')
 
@@ -2453,6 +2545,18 @@ export const experimentLogic = kea<experimentLogicType>([
             }
         },
         refreshExperimentResults: async ({ forceRefresh, triggeredBy, refreshIfStale }) => {
+            // The refresh branches on the recalculation flag. Choosing a branch before the flag has
+            // resolved reads it as off and runs the legacy loaders, which fail for a recalculation
+            // experiment. Defer the refresh until flags arrive; setFeatureFlags replays it once.
+            if (!values.receivedFeatureFlags) {
+                cache.deferredRefresh = { forceRefresh, triggeredBy, refreshIfStale }
+                return
+            }
+
+            // The setFeatureFlags listener re-runs this refresh if a later flag update contradicts this value.
+            cache.branchFlagValue = !!values.featureFlags[FEATURE_FLAGS.EXPERIMENTS_METRICS_RECALCULATION]
+            cache.lastRefreshArgs = { forceRefresh, triggeredBy, refreshIfStale }
+
             const refreshId = generateRefreshId()
             const refreshStart = performance.now()
             const summaries: MetricLoadingSummary[] = []
@@ -2475,7 +2579,7 @@ export const experimentLogic = kea<experimentLogicType>([
                      * Config changes and auto-refresh both re-run metrics, tagged with their cause; page loads
                      * and manual reloads are handled elsewhere. Concurrent triggers coalesce onto one active run.
                      */
-                    if ((triggeredBy === 'config_change' || triggeredBy === 'auto_refresh') && values.experiment) {
+                    if (isRecalculationTrigger(triggeredBy) && values.experiment) {
                         experimentMetricsLogic({ experiment: values.experiment }).actions.triggerRecalculation(
                             triggeredBy
                         )
@@ -2500,124 +2604,164 @@ export const experimentLogic = kea<experimentLogicType>([
                     delete cache.refreshSummariesById[refreshId]
                 }
 
-                const primaryCount =
-                    (values.experiment?.metrics?.length || 0) +
-                    (values.experiment?.saved_metrics?.filter(
-                        (m: { metadata: { type: string } }) => m.metadata.type === 'primary'
-                    ).length || 0)
-                const secondaryCount =
-                    (values.experiment?.metrics_secondary?.length || 0) +
-                    (values.experiment?.saved_metrics?.filter(
-                        (m: { metadata: { type: string } }) => m.metadata.type === 'secondary'
-                    ).length || 0)
-                const successfulCount = refreshSummaries.reduce((sum, s) => sum + s.successfulCount, 0)
-                const erroredCount = refreshSummaries.reduce((sum, s) => sum + s.erroredCount, 0)
-                const cachedCount = refreshSummaries.reduce((sum, s) => sum + s.cachedCount, 0)
-
-                eventUsageLogic.actions.reportExperimentResultsRefreshCompleted(
-                    values.experimentId,
-                    values.currentTeamId,
-                    {
-                        total_duration_ms: totalDurationMs,
-                        primary_metrics_count: primaryCount,
-                        secondary_metrics_count: secondaryCount,
-                        successful_count: successfulCount,
-                        errored_count: erroredCount,
-                        cached_count: cachedCount,
-                        triggered_by: triggeredBy ?? 'manual',
-                        force_refresh: !!forceRefresh,
-                        refresh_id: refreshId,
-                        experiment_duration_hours: values.experiment?.start_date
-                            ? Math.round(
-                                  (Date.now() - new Date(values.experiment.start_date).getTime()) / (1000 * 60 * 60)
-                              )
-                            : null,
-                        experiment_status: values.experiment?.status ?? null,
-                        total_metrics_count: primaryCount + secondaryCount,
-                        execution_mode: getExperimentExecutionMode(values.featureFlags),
-                    }
-                )
-
-                const finalState: FinishedRefreshState = caughtError
-                    ? 'errored'
-                    : erroredCount > 0
-                      ? 'partial'
-                      : 'completed'
-                actions.markRefreshFinished(refreshId, finalState)
-
-                // Clear notification offer timer
+                // Clear notification offer timer (even when unmounted below, so it can't fire later)
                 clearTimeout(cache.notificationOfferTimer)
 
-                // Fire browser notification if user subscribed
-                if (
-                    values.notifyWhenResultsReady &&
-                    'Notification' in window &&
-                    Notification.permission === 'granted'
-                ) {
-                    const notification = new Notification('Experiment results ready', {
-                        body: `Results for "${values.experiment.name}" are now available.`,
-                        icon: '/static/posthog-icon.svg',
-                        tag: `experiment-results-${values.experimentId}`,
-                    })
-                    notification.onclick = () => {
-                        window.focus()
-                        notification.close()
-                    }
-                }
+                // The metric loads above can outlive the page: navigating to another experiment
+                // unmounts this logic and detaches its reducers, so any `values` read below would
+                // throw "[KEA] Can not find path ... in the store". The remaining bookkeeping only
+                // concerns a page that's still showing, so skip it when unmounted.
+                if (experimentLogic.findMounted(props)) {
+                    const primaryCount =
+                        (values.experiment?.metrics?.length || 0) +
+                        (values.experiment?.saved_metrics?.filter(
+                            (m: { metadata: { type: string } }) => m.metadata.type === 'primary'
+                        ).length || 0)
+                    const secondaryCount =
+                        (values.experiment?.metrics_secondary?.length || 0) +
+                        (values.experiment?.saved_metrics?.filter(
+                            (m: { metadata: { type: string } }) => m.metadata.type === 'secondary'
+                        ).length || 0)
+                    const successfulCount = refreshSummaries.reduce((sum, s) => sum + s.successfulCount, 0)
+                    const erroredCount = refreshSummaries.reduce((sum, s) => sum + s.erroredCount, 0)
+                    const cachedCount = refreshSummaries.reduce((sum, s) => sum + s.cachedCount, 0)
 
-                // Reset notification state
-                actions.setShowNotificationOffer(false)
-                actions.setNotifyWhenResultsReady(false)
-
-                // Only set up auto-refresh if enabled AND page is visible
-                // This prevents the interval from restarting when async operations complete after the page becomes invisible
-                if (
-                    values.experiment &&
-                    values.autoRefresh.enabled &&
-                    isLaunched(values.experiment) &&
-                    values.isPageVisible
-                ) {
-                    actions.resetAutoRefreshInterval()
-                }
-
-                // A warming-up experiment can show a stale "no results yet" snapshot on load, so fetch
-                // fresh once. When it has results we leave it to the in-tab auto-refresh, since recomputes
-                // might be expensive. Gated on `!forceRefresh` so the refresh we trigger here can't loop.
-                if (
-                    refreshIfStale &&
-                    !forceRefresh &&
-                    !caughtError &&
-                    !values.hasMinimumExposureForResults &&
-                    experimentResultsAreStale(
-                        [...values.primaryMetricsResults, ...values.secondaryMetricsResults],
-                        NEW_EXPERIMENT_FORCE_REFRESH_AFTER_MINUTES
+                    eventUsageLogic.actions.reportExperimentResultsRefreshCompleted(
+                        values.experimentId,
+                        values.currentTeamId,
+                        {
+                            total_duration_ms: totalDurationMs,
+                            primary_metrics_count: primaryCount,
+                            secondary_metrics_count: secondaryCount,
+                            successful_count: successfulCount,
+                            errored_count: erroredCount,
+                            cached_count: cachedCount,
+                            triggered_by: triggeredBy ?? 'manual',
+                            force_refresh: !!forceRefresh,
+                            refresh_id: refreshId,
+                            experiment_duration_hours: values.experiment?.start_date
+                                ? Math.round(
+                                      (Date.now() - new Date(values.experiment.start_date).getTime()) / (1000 * 60 * 60)
+                                  )
+                                : null,
+                            experiment_status: values.experiment?.status ?? null,
+                            total_metrics_count: primaryCount + secondaryCount,
+                            execution_mode: getExperimentExecutionMode(values.featureFlags),
+                        }
                     )
-                ) {
-                    actions.refreshExperimentResults(true, 'page_load')
+
+                    const finalState: FinishedRefreshState = caughtError
+                        ? 'errored'
+                        : erroredCount > 0
+                          ? 'partial'
+                          : 'completed'
+                    actions.markRefreshFinished(refreshId, finalState)
+
+                    // Fire browser notification if user subscribed
+                    if (
+                        values.notifyWhenResultsReady &&
+                        'Notification' in window &&
+                        Notification.permission === 'granted'
+                    ) {
+                        const notification = new Notification('Experiment results ready', {
+                            body: `Results for "${values.experiment.name}" are now available.`,
+                            icon: '/static/posthog-icon.svg',
+                            tag: `experiment-results-${values.experimentId}`,
+                        })
+                        notification.onclick = () => {
+                            window.focus()
+                            notification.close()
+                        }
+                    }
+
+                    // Reset notification state
+                    actions.setShowNotificationOffer(false)
+                    actions.setNotifyWhenResultsReady(false)
+
+                    // Only set up auto-refresh if enabled AND page is visible
+                    // This prevents the interval from restarting when async operations complete after the page becomes invisible
+                    if (
+                        values.experiment &&
+                        values.autoRefresh.enabled &&
+                        isLaunched(values.experiment) &&
+                        values.isPageVisible
+                    ) {
+                        actions.resetAutoRefreshInterval()
+                    }
+
+                    // A warming-up experiment can show a stale "no results yet" snapshot on load, so fetch
+                    // fresh once. When it has results we leave it to the in-tab auto-refresh, since recomputes
+                    // might be expensive. Gated on `!forceRefresh` so the refresh we trigger here can't loop.
+                    if (
+                        refreshIfStale &&
+                        !forceRefresh &&
+                        !caughtError &&
+                        !values.hasMinimumExposureForResults &&
+                        experimentResultsAreStale(
+                            [...values.primaryMetricsResults, ...values.secondaryMetricsResults],
+                            NEW_EXPERIMENT_FORCE_REFRESH_AFTER_MINUTES
+                        )
+                    ) {
+                        actions.refreshExperimentResults(true, 'page_load')
+                    }
                 }
             }
         },
+        setFeatureFlags: () => {
+            // Flags have now resolved. Replay a refresh that arrived before them so the branch decision
+            // uses the real flag value. One-shot: clear the deferred request before re-firing.
+            const deferred = cache.deferredRefresh
+            if (deferred) {
+                cache.deferredRefresh = undefined
+                actions.refreshExperimentResults(deferred.forceRefresh, deferred.triggeredBy, deferred.refreshIfStale)
+                return
+            }
+            /**
+             * A refresh that branched on a wrong early flag value ran the wrong loaders, and nothing
+             * re-runs it when the real flag response lands (see the setFeatureFlags listener in
+             * experimentMetricsLogic for why the first flag set of a page load can be wrong). Re-run the
+             * last refresh when the current value contradicts the recorded one; equal values no-op.
+             */
+            const flagValue = !!values.featureFlags[FEATURE_FLAGS.EXPERIMENTS_METRICS_RECALCULATION]
+            const lastArgs = cache.lastRefreshArgs
+            if (lastArgs && cache.branchFlagValue !== undefined && flagValue !== cache.branchFlagValue) {
+                actions.refreshExperimentResults(lastArgs.forceRefresh, lastArgs.triggeredBy, lastArgs.refreshIfStale)
+            }
+        },
         updateExperimentMetrics: async () => {
-            await asyncActions.updateExperiment({
+            actions.updateExperiment({
                 metrics: values.experiment.metrics,
                 metrics_secondary: values.experiment.metrics_secondary,
                 update_feature_flag_params: false,
             })
-            // Reload results for added/edited metrics
-            actions.refreshExperimentResults(true, 'config_change')
-        },
-        updateExperimentCollectionGoal: async () => {
-            const { recommendedRunningTime, recommendedSampleSize, minimumDetectableEffect } = values
 
-            actions.updateExperiment({
-                running_time_calculation: {
-                    ...values.experiment?.running_time_calculation,
-                    recommended_running_time: recommendedRunningTime,
-                    recommended_sample_size: recommendedSampleSize,
-                    minimum_detectable_effect: minimumDetectableEffect || 0,
-                },
-                update_feature_flag_params: false,
-            })
+            // kea-loaders turns a rejected loader into a failure action, so awaiting its async action does
+            // not throw. Await the underlying queued request instead to keep the existing result caches when
+            // the save fails. The loader still owns error reporting and optimistic-concurrency recovery.
+            const updatePromise = cache.inflightUpdate?.promise
+            if (!updatePromise) {
+                return
+            }
+            try {
+                await updatePromise
+            } catch {
+                return
+            }
+
+            // Metric results are positional. Once the metric list has saved, keeping the previous arrays
+            // around can briefly pair a result with the wrong metric (and gives no feedback while the
+            // updated results are computed). Clear both result stores so every metric in the updated list
+            // renders its existing per-variant loading skeleton. Do this only after a successful save: if
+            // the update fails, the previous experiment and its results remain valid and visible.
+            actions.clearMetricsResults()
+            const metricsLogic = experimentMetricsLogic({ experiment: values.experiment })
+            metricsLogic.actions.setPrimaryMetricsResults([])
+            metricsLogic.actions.setPrimaryMetricsResultsErrors([])
+            metricsLogic.actions.setSecondaryMetricsResults([])
+            metricsLogic.actions.setSecondaryMetricsResultsErrors([])
+
+            // Reload results for added/edited metrics
+            actions.refreshExperimentResults(true, 'metric_config_change')
         },
         updateExposureCriteria: async () => {
             actions.updateExperiment({
@@ -2626,13 +2770,17 @@ export const experimentLogic = kea<experimentLogicType>([
                 },
                 update_feature_flag_params: false,
             })
-            actions.refreshExperimentResults(true, 'config_change')
+            actions.refreshExperimentResults(true, 'experiment_config_change')
         },
         updateExperimentSettings: async ({ update }) => {
             // Settings like stats config, CUPED, and conversion-window handling change
             // how metrics and exposures are computed, so persist then re-query.
             await asyncActions.updateExperiment({ ...update, update_feature_flag_params: false })
-            actions.refreshExperimentResults(true, 'config_change')
+            // Unlaunched experiments have no results to recalculate, so don't promise a recalculation.
+            lemonToast.success(
+                values.isExperimentLaunched ? 'Settings saved. Recalculating results…' : 'Settings saved'
+            )
+            actions.refreshExperimentResults(true, 'experiment_config_change')
         },
         resetRunningExperiment: async () => {
             try {
@@ -2652,6 +2800,10 @@ export const experimentLogic = kea<experimentLogicType>([
                 actions.updateExperiments(experimentUpdate)
                 if (payload?.update_feature_flag_params && experimentUpdate.feature_flag) {
                     actions.updateFlagFromPartial(experimentUpdate.feature_flag)
+                }
+                if (payload?.tags) {
+                    // Newly created tags must reach tagsModel or the tag filters won't offer them.
+                    actions.loadTags()
                 }
             }
             // NOTE: No implicit metric reload here. Each action that calls updateExperiment
@@ -2673,7 +2825,13 @@ export const experimentLogic = kea<experimentLogicType>([
                 })
             }
         },
-        finishExperiment: async ({ selectedVariantKey, releaseToEveryone, openCleanupPr }) => {
+        finishExperiment: async ({
+            selectedVariantKey,
+            releaseToEveryone,
+            openCleanupPr,
+            repository,
+            setRepositoryAsTeamDefault,
+        }) => {
             actions.setEndExperimentLoading(true)
             try {
                 const response: Experiment = await api.create(
@@ -2684,6 +2842,8 @@ export const experimentLogic = kea<experimentLogicType>([
                         conclusion: values.experiment.conclusion,
                         conclusion_comment: values.experiment.conclusion_comment,
                         open_cleanup_pr: openCleanupPr,
+                        ...(repository ? { repository } : {}),
+                        ...(setRepositoryAsTeamDefault ? { set_repository_as_team_default: true } : {}),
                     }
                 )
                 actions.setExperiment(response)
@@ -2704,10 +2864,11 @@ export const experimentLogic = kea<experimentLogicType>([
                 }
             } catch (error: any) {
                 actions.closeFinishExperimentModal()
-                if (error.status === 409 && error.data?.change_request_id) {
+                if (isApprovalRequiredError(error)) {
                     showApprovalRequiredToast(
                         error.data.change_request_id,
-                        'end this experiment and roll out the winning variant'
+                        'end this experiment and roll out the winning variant',
+                        error.data.code
                     )
                     dispatchChangeRequestCreated({
                         resourceType: 'feature_flag',
@@ -2723,38 +2884,68 @@ export const experimentLogic = kea<experimentLogicType>([
         updateExperimentVariantImages: async ({ variantPreviewMediaIds }) => {
             try {
                 const updatedParameters = {
-                    ...values.experiment.parameters,
+                    ...withoutProjectedFlagConfig(values.experiment.parameters),
                     variant_screenshot_media_ids: variantPreviewMediaIds,
                 }
-                await api.update(`api/projects/${values.currentProjectId}/experiments/${values.experimentId}`, {
-                    parameters: updatedParameters,
-                    update_feature_flag_params: false,
-                })
+                const response: Experiment = await api.update(
+                    `api/projects/${values.currentProjectId}/experiments/${values.experimentId}`,
+                    {
+                        ...toConcurrencyPayload(values.unmodifiedExperiment),
+                        parameters: updatedParameters,
+                        update_feature_flag_params: false,
+                    }
+                )
+                actions.setUnmodifiedExperiment(structuredClone(initializeMetricOrdering(response)))
                 actions.setExperiment({
                     parameters: updatedParameters,
                 })
-            } catch {
-                lemonToast.error('Failed to update experiment variant images')
+            } catch (error: any) {
+                if (isExperimentConflictError(error)) {
+                    lemonToast.error(
+                        error.data?.detail ||
+                            'This experiment was changed while you were editing it. Review the latest changes and try again.'
+                    )
+                    actions.loadExperiment()
+                } else {
+                    lemonToast.error('Failed to update experiment variant images')
+                }
             }
         },
         updateExperimentVariantNotes: async ({ variantNotes }) => {
             try {
                 const updatedParameters = {
-                    ...values.experiment.parameters,
+                    ...withoutProjectedFlagConfig(values.experiment.parameters),
                     variant_notes: variantNotes,
                 }
-                await api.update(`api/projects/${values.currentProjectId}/experiments/${values.experimentId}`, {
-                    parameters: updatedParameters,
-                    update_feature_flag_params: false,
-                })
+                const response: Experiment = await api.update(
+                    `api/projects/${values.currentProjectId}/experiments/${values.experimentId}`,
+                    {
+                        ...toConcurrencyPayload(values.unmodifiedExperiment),
+                        parameters: updatedParameters,
+                        update_feature_flag_params: false,
+                    }
+                )
+                actions.setUnmodifiedExperiment(structuredClone(initializeMetricOrdering(response)))
                 actions.setExperiment({
                     parameters: updatedParameters,
                 })
-            } catch {
-                lemonToast.error('Failed to update experiment variant notes')
+            } catch (error: any) {
+                if (isExperimentConflictError(error)) {
+                    lemonToast.error(
+                        error.data?.detail ||
+                            'This experiment was changed while you were editing it. Review the latest changes and try again.'
+                    )
+                    actions.loadExperiment()
+                } else {
+                    lemonToast.error('Failed to update experiment variant notes')
+                }
             }
         },
         updateDistribution: async ({ variants, rolloutPercentage }) => {
+            // Resending an unchanged holdout would make every stale distribution save read as a
+            // holdout edit server-side; include it only when the selector actually changed it.
+            const holdoutChanged =
+                (values.experiment.holdout_id ?? null) !== (values.unmodifiedExperiment?.holdout_id ?? null)
             actions.updateExperiment({
                 feature_flag: {
                     filters: {
@@ -2764,7 +2955,7 @@ export const experimentLogic = kea<experimentLogicType>([
                             : {}),
                     },
                 },
-                holdout_id: values.experiment.holdout_id,
+                ...(holdoutChanged ? { holdout_id: values.experiment.holdout_id } : {}),
                 update_feature_flag_params: true,
             })
         },
@@ -2783,12 +2974,31 @@ export const experimentLogic = kea<experimentLogicType>([
             })
             const combinedMetricsIds = [...existingMetricsIds, ...newMetricsIds]
 
-            await api.update(`api/projects/${values.currentProjectId}/experiments/${values.experimentId}`, {
-                saved_metrics_ids: combinedMetricsIds,
-                update_feature_flag_params: false,
-            })
+            try {
+                await api.update(`api/projects/${values.currentProjectId}/experiments/${values.experimentId}`, {
+                    ...toConcurrencyPayload(values.unmodifiedExperiment),
+                    saved_metrics_ids: combinedMetricsIds,
+                    update_feature_flag_params: false,
+                })
+            } catch (error: any) {
+                if (isExperimentConflictError(error)) {
+                    lemonToast.error(
+                        error.data?.detail ||
+                            'This experiment was changed while you were editing it. Review the latest changes and try again.'
+                    )
+                } else {
+                    throw error
+                }
+            }
 
-            actions.loadExperiment({ triggeredBy: 'config_change' })
+            actions.loadExperiment({ triggeredBy: 'metric_config_change' })
+        },
+        duplicateSharedMetricAsInlineMetric: ({ isSecondary, newUuid }) => {
+            // Listeners run after reducers, so the copy is only there if the shared metric was actually found
+            const metrics = (isSecondary ? values.experiment.metrics_secondary : values.experiment.metrics) || []
+            if (metrics.some((metric) => metric.uuid === newUuid)) {
+                lemonToast.success('Metric duplicated as a single-use metric')
+            }
         },
         removeSharedMetricFromExperiment: async ({ sharedMetricId }) => {
             const sharedMetricsIds = values.experiment.saved_metrics
@@ -2806,14 +3016,26 @@ export const experimentLogic = kea<experimentLogicType>([
                 (m) => !('isSharedMetric' in m && m.isSharedMetric && m.sharedMetricId === sharedMetricId)
             )
 
-            await api.update(`api/projects/${values.currentProjectId}/experiments/${values.experimentId}`, {
-                saved_metrics_ids: sharedMetricsIds,
-                metrics: cleanedMetrics,
-                metrics_secondary: cleanedMetricsSecondary,
-                update_feature_flag_params: false,
-            })
+            try {
+                await api.update(`api/projects/${values.currentProjectId}/experiments/${values.experimentId}`, {
+                    ...toConcurrencyPayload(values.unmodifiedExperiment),
+                    saved_metrics_ids: sharedMetricsIds,
+                    metrics: cleanedMetrics,
+                    metrics_secondary: cleanedMetricsSecondary,
+                    update_feature_flag_params: false,
+                })
+            } catch (error: any) {
+                if (isExperimentConflictError(error)) {
+                    lemonToast.error(
+                        error.data?.detail ||
+                            'This experiment was changed while you were editing it. Review the latest changes and try again.'
+                    )
+                } else {
+                    throw error
+                }
+            }
 
-            actions.loadExperiment({ triggeredBy: 'config_change' })
+            actions.loadExperiment({ triggeredBy: 'metric_config_change' })
         },
         createExperimentDashboard: async () => {
             actions.setIsCreatingExperimentDashboard(true)
@@ -2921,52 +3143,6 @@ export const experimentLogic = kea<experimentLogicType>([
                 actions.setExperiment(structuredClone(values.unmodifiedExperiment))
             }
         },
-        validateFeatureFlag: async ({ featureFlagKey }: { featureFlagKey: string }, breakpoint) => {
-            await breakpoint(200)
-            const response = await api.get(
-                `api/projects/${values.currentProjectId}/feature_flags/?${toParams({ search: featureFlagKey })}`
-            )
-            const existingErrors = {
-                // :KLUDGE: If there is no name error, we don't want to trigger the 'required' error early
-                name: undefined,
-                ...values.experimentErrors,
-            }
-            if (response.results.length > 0) {
-                const matchingFlag = response.results.find((flag: FeatureFlagType) => flag.key === featureFlagKey)
-                if (matchingFlag) {
-                    let isValid
-                    try {
-                        isValid = featureFlagEligibleForExperiment(matchingFlag)
-                    } catch {
-                        isValid = false
-                    }
-                    actions.setValidExistingFeatureFlag(isValid ? matchingFlag : null)
-                    actions.setFeatureFlagValidationError(
-                        isValid ? '' : 'Existing feature flag is not eligible for experiments.'
-                    )
-                    actions.setExperimentManualErrors({
-                        ...existingErrors,
-                        feature_flag_key: values.featureFlagValidationError || undefined,
-                    })
-                    return
-                }
-            }
-
-            actions.setValidExistingFeatureFlag(null)
-            actions.setFeatureFlagValidationError(validateFeatureFlagKey(featureFlagKey) || '')
-            actions.setExperimentManualErrors({
-                ...existingErrors,
-                feature_flag_key: values.featureFlagValidationError || undefined,
-            })
-        },
-        touchExperimentField: ({ key }) => {
-            // :KLUDGE: Persist the existing feature_flag_key validation when the field is blurred.
-            if (key === 'feature_flag_key') {
-                actions.setExperimentManualErrors({
-                    feature_flag_key: values.featureFlagValidationError || undefined,
-                })
-            }
-        },
         loadPrimaryMetricsResults: async ({ refresh, refreshId }: { refresh?: boolean; refreshId?: string }) => {
             actions.setPrimaryMetricsResultsLoading(true)
             actions.setPrimaryMetricsResults([])
@@ -3001,8 +3177,9 @@ export const experimentLogic = kea<experimentLogicType>([
 
             actions.setPrimaryMetricsResultsLoading(false)
 
-            // Mark the review results task as complete when results are loaded for a launched experiment
-            if (values.experiment && isLaunched(values.experiment)) {
+            // Mark the review results task as complete when results are loaded for a launched experiment.
+            // Mounted check first: the load can outlive the page, and `values` reads throw once unmounted.
+            if (experimentLogic.findMounted(props) && values.experiment && isLaunched(values.experiment)) {
                 globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.ReviewExperimentResults)
             }
         },
@@ -3149,24 +3326,51 @@ export const experimentLogic = kea<experimentLogicType>([
                 update_feature_flag_params: false,
             })
         },
-        saveMetricsReorder: async ({ isSecondary, orderedUuids, removedUuids, movedUuids }) => {
+        reorderMetrics: async ({ isSecondary, orderedUuids }, breakpoint) => {
+            const orderingField = isSecondary ? 'secondary_metrics_ordered_uuids' : 'primary_metrics_ordered_uuids'
+            const previousOrder = values.experiment[orderingField] ?? []
+
+            // Only the ordering array changes, so the positional results arrays stay aligned
+            // to the metrics and nothing needs reloading.
+            actions.setExperiment({ [orderingField]: orderedUuids })
+
+            // Coalesce a flurry of drops into one request.
+            await breakpoint(300)
+
+            try {
+                // Deliberately not the updateExperiment loader: kea-loaders swallows the rejection
+                // into a Failure action, and a silent failure here would leave the table showing an
+                // order that never saved.
+                const response: Experiment = await api.update(
+                    `api/projects/${values.currentProjectId}/experiments/${values.experimentId}`,
+                    {
+                        ...toConcurrencyPayload(values.unmodifiedExperiment),
+                        [orderingField]: orderedUuids,
+                        update_feature_flag_params: false,
+                    }
+                )
+                // A newer reorder may have started while this request was in flight.
+                breakpoint()
+                const responseWithMetricsOrdering = initializeMetricOrdering(response)
+                // Refreshing unmodifiedExperiment too, so a later edit-cancel doesn't revert the
+                // order the user just set.
+                actions.setUnmodifiedExperiment(structuredClone(responseWithMetricsOrdering))
+                actions.setExperiment(responseWithMetricsOrdering)
+            } catch (error) {
+                // Swallowing the breakpoint would roll a superseded reorder back over a newer one.
+                if (isBreakpoint(error as Error)) {
+                    throw error
+                }
+                actions.setExperiment({
+                    [orderingField]: values.unmodifiedExperiment?.[orderingField] ?? previousOrder,
+                })
+                lemonToast.error('Could not save the new metric order')
+            }
+        },
+        moveMetricsBetweenSections: async ({ isSecondary, orderedUuids, removedUuids, movedUuids }) => {
             const removed = new Set(removedUuids)
             const moved = new Set(movedUuids)
             const orderingField = isSecondary ? 'secondary_metrics_ordered_uuids' : 'primary_metrics_ordered_uuids'
-            const closeModal = isSecondary
-                ? actions.closeSecondaryMetricsReorderModal
-                : actions.closePrimaryMetricsReorderModal
-
-            // Pure reorder: only the ordering array changes, so the positional
-            // results arrays stay aligned and nothing needs reloading.
-            if (removed.size === 0 && moved.size === 0) {
-                await asyncActions.updateExperiment({
-                    [orderingField]: orderedUuids,
-                    update_feature_flag_params: false,
-                })
-                closeModal()
-                return
-            }
 
             // Moves and removals don't change any metric's definition, so existing
             // results stay valid — they only need realigning to the new positional
@@ -3226,10 +3430,9 @@ export const experimentLogic = kea<experimentLogicType>([
             }
 
             await asyncActions.updateExperiment(update)
-            closeModal()
 
             if (!canReuseResults) {
-                actions.refreshExperimentResults(true, 'config_change')
+                actions.refreshExperimentResults(true, 'metric_config_change')
                 return
             }
 
@@ -3299,10 +3502,11 @@ export const experimentLogic = kea<experimentLogicType>([
 
             actions.updateExperiment(updatePayload)
 
-            // Adding a breakdown changes how the metric is computed, so re-run results — recalculation
-            // flow triggers a fresh recalc via config_change; legacy flow reloads per-metric results.
+            // Adding a breakdown changes how the metric is computed, so re-run results. The recalculation
+            // flow reuses the current window (metric_config_change), so this breakdown recomputes on its
+            // changed fingerprint while unchanged metrics load from cache; legacy reloads per-metric results.
             if (values.featureFlags[FEATURE_FLAGS.EXPERIMENTS_METRICS_RECALCULATION]) {
-                actions.refreshExperimentResults(true, 'config_change')
+                actions.refreshExperimentResults(true, 'metric_config_change')
             } else if (isPrimary) {
                 actions.loadPrimaryMetricsResults(true)
             } else {
@@ -3335,10 +3539,99 @@ export const experimentLogic = kea<experimentLogicType>([
             actions.updateExperiment(updatePayload)
 
             // Removing a breakdown changes how the metric is computed, so re-run results. On the
-            // recalculation flow this routes through refreshExperimentResults('config_change') (which
-            // triggers a fresh recalculation); the legacy flow reloads the per-metric results directly.
+            // recalculation flow this reuses the current window (metric_config_change), so this metric
+            // recomputes on its changed fingerprint while others load from cache; legacy reloads per-metric.
             if (values.featureFlags[FEATURE_FLAGS.EXPERIMENTS_METRICS_RECALCULATION]) {
-                actions.refreshExperimentResults(true, 'config_change')
+                actions.refreshExperimentResults(true, 'metric_config_change')
+            } else if (isPrimary) {
+                actions.loadPrimaryMetricsResults(true)
+            } else {
+                actions.loadSecondaryMetricsResults(true)
+            }
+        },
+        updateMetricBreakdownAttribution: async ({ uuid }) => {
+            /**
+             * build the experiment payload with all experiment metrics
+             */
+            const updatePayload: Partial<Experiment> & { update_feature_flag_params?: boolean } = {
+                metrics: values.experiment.metrics,
+                metrics_secondary: values.experiment.metrics_secondary,
+                update_feature_flag_params: false,
+            }
+
+            /**
+             * for shared metrics, we save the breakdown attribution on the many to many relationship metadata
+             */
+            const savedMetrics: ExperimentSavedMetric[] = [...(values.experiment.saved_metrics || [])]
+            const sharedMetric = savedMetrics.find(({ query: { uuid: savedMetricUuid } }) => savedMetricUuid === uuid)
+            if (sharedMetric) {
+                updatePayload.saved_metrics_ids = savedMetrics.map(({ saved_metric, metadata }) => ({
+                    id: saved_metric,
+                    metadata,
+                }))
+            }
+
+            /**
+             * guard against failed persist calling recalculations by awaiting the experiment save
+             */
+            await asyncActions.updateExperiment(updatePayload)
+
+            /**
+             * figure out if it's a primary metric
+             */
+            const isPrimary = sharedMetric
+                ? sharedMetric.metadata.type === 'primary'
+                : values.experiment.metrics.some((m) => m.uuid === uuid)
+
+            /**
+             * updating a breakdown limit triggers a recalculation.
+             */
+            if (values.featureFlags[FEATURE_FLAGS.EXPERIMENTS_METRICS_RECALCULATION]) {
+                actions.refreshExperimentResults(true, 'metric_config_change')
+            } else if (isPrimary) {
+                actions.loadPrimaryMetricsResults(true)
+            } else {
+                actions.loadSecondaryMetricsResults(true)
+            }
+        },
+        updateMetricBreakdownLimit: async ({ uuid }) => {
+            /**
+             * build the update payload with all experiment metrics
+             */
+            const updatePayload: Partial<Experiment> & { update_feature_flag_params?: boolean } = {
+                metrics: values.experiment.metrics,
+                metrics_secondary: values.experiment.metrics_secondary,
+                update_feature_flag_params: false,
+            }
+
+            /**
+             * for shared metrics, we save the breakdown limit on the many to many relationship metadata
+             */
+            const savedMetrics: ExperimentSavedMetric[] = [...(values.experiment.saved_metrics || [])]
+            const sharedMetric = savedMetrics.find(({ query: { uuid: savedMetricUuid } }) => savedMetricUuid === uuid)
+            if (sharedMetric) {
+                updatePayload.saved_metrics_ids = savedMetrics.map(({ saved_metric, metadata }) => ({
+                    id: saved_metric,
+                    metadata,
+                }))
+            }
+
+            /**
+             * guard against failed persist calling recalculations by awaiting the experiment save
+             */
+            await asyncActions.updateExperiment(updatePayload)
+
+            /**
+             * find if the updated metris is primary
+             */
+            const isPrimary = sharedMetric
+                ? sharedMetric.metadata.type === 'primary'
+                : values.experiment.metrics.some((m) => m.uuid === uuid)
+            /**
+             * updating a breakdown limit triggers a recalculation.
+             */
+            if (values.featureFlags[FEATURE_FLAGS.EXPERIMENTS_METRICS_RECALCULATION]) {
+                actions.refreshExperimentResults(true, 'metric_config_change')
             } else if (isPrimary) {
                 actions.loadPrimaryMetricsResults(true)
             } else {
@@ -3370,12 +3663,14 @@ export const experimentLogic = kea<experimentLogicType>([
                         },
                     }
                 )
-                // Re-fetch results since the variant set changed. On the recalculation flow this means a
-                // fresh recalc; on the legacy flow it's the per-metric loaders. Exposures refresh either way.
+                // Re-fetch results since the variant set changed. On the recalculation flow this advances the
+                // window (experiment_config_change), so every metric recomputes; legacy uses the per-metric
+                // loaders. Exposures refresh either way.
                 if (values.featureFlags[FEATURE_FLAGS.EXPERIMENTS_METRICS_RECALCULATION]) {
+                    // eslint-disable-next-line no-unused-expressions
                     values.experiment &&
                         experimentMetricsLogic({ experiment: values.experiment }).actions.triggerRecalculation(
-                            'config_change'
+                            'experiment_config_change'
                         )
                 } else {
                     actions.loadPrimaryMetricsResults(true)
@@ -3406,9 +3701,15 @@ export const experimentLogic = kea<experimentLogicType>([
             // Clear any existing interval first
             cache.disposables.dispose('autoRefreshInterval')
 
-            if (values.autoRefresh.enabled) {
+            // Completed experiments have final results — never poll them
+            if (values.autoRefresh.enabled && !hasEnded(values.experiment)) {
                 cache.disposables.add(() => {
                     const intervalId = window.setInterval(() => {
+                        // The experiment may have ended while the interval was running
+                        if (hasEnded(values.experiment)) {
+                            cache.disposables.dispose('autoRefreshInterval')
+                            return
+                        }
                         // Track auto-refresh trigger
                         actions.reportExperimentMetricsRefreshed(values.experiment, true, {
                             triggered_by: 'auto-refresh',
@@ -3423,39 +3724,15 @@ export const experimentLogic = kea<experimentLogicType>([
             }
         },
     })),
-    loaders(({ actions, values }) => ({
+    loaders(({ actions, values, cache }) => ({
         experiment: {
             loadExperiment: async (payload?: { triggeredBy?: ExperimentTriggeredBy }) => {
                 void payload?.triggeredBy
                 if (values.experimentId && values.experimentId !== 'new') {
                     try {
-                        let response: Experiment = await api.get(
+                        const response: Experiment = await api.get(
                             `api/projects/${values.currentProjectId}/experiments/${values.experimentId}`
                         )
-
-                        /**
-                         * if we are duplicating, we need to clear a lot of props to ensure that
-                         * the experiment will be in draft mode and available for launch
-                         */
-                        if (values.formMode === FORM_MODES.duplicate) {
-                            response = {
-                                ...response,
-                                name: `${response.name} (duplicate)`,
-                                // A duplicate starts as a fresh draft with a new flag: seed default
-                                // draft flag config and drop the source's linked flag.
-                                feature_flag_config: structuredClone(NEW_EXPERIMENT.feature_flag_config),
-                                feature_flag: undefined,
-                                feature_flag_key: '',
-                                archived: false,
-                                start_date: undefined,
-                                end_date: undefined,
-                                conclusion: undefined,
-                                conclusion_comment: undefined,
-                                created_by: null,
-                                created_at: null,
-                                updated_at: null,
-                            }
-                        }
 
                         const responseWithMetricsOrdering = initializeMetricOrdering(response)
 
@@ -3477,16 +3754,68 @@ export const experimentLogic = kea<experimentLogicType>([
             null as Experiment | null,
             {
                 updateExperiment: async (update: ExperimentUpdatePayload) => {
-                    const response: Experiment = await api.update(
-                        `api/projects/${values.currentProjectId}/experiments/${values.experimentId}`,
-                        update
-                    )
-                    const responseWithMetricsOrdering = initializeMetricOrdering(response)
-                    refreshTreeItem('experiment', String(values.experimentId))
-                    actions.setUnmodifiedExperiment(structuredClone(responseWithMetricsOrdering))
-                    // Also update the main experiment state
-                    actions.setExperiment(responseWithMetricsOrdering)
-                    return responseWithMetricsOrdering
+                    // The concurrency payload is built inside `send`, when the request actually
+                    // runs, so a queued update reads the version absorbed from its predecessor's
+                    // response instead of the one both dispatches started from.
+                    const send = async (): Promise<Experiment> => {
+                        try {
+                            const response: Experiment = await api.update(
+                                `api/projects/${values.currentProjectId}/experiments/${values.experimentId}`,
+                                { ...toConcurrencyPayload(values.unmodifiedExperiment), ...update }
+                            )
+                            const responseWithMetricsOrdering = initializeMetricOrdering(response)
+                            refreshTreeItem('experiment', String(values.experimentId))
+                            actions.setUnmodifiedExperiment(structuredClone(responseWithMetricsOrdering))
+                            // Also update the main experiment state
+                            actions.setExperiment(responseWithMetricsOrdering)
+                            return responseWithMetricsOrdering
+                        } catch (error: any) {
+                            if (isExperimentConflictError(error)) {
+                                lemonToast.error(
+                                    error.data?.detail ||
+                                        'This experiment was changed while you were editing it. Review the latest changes and try again.'
+                                )
+                                // Reload so the next save carries the current version and base state,
+                                // but keep this update's rejected scalar fields in local state so the
+                                // user's edit isn't lost — they can review the fresh state and save again.
+                                const preserved = conflictPreservedFields(update)
+                                try {
+                                    const fresh: Experiment = await api.get(
+                                        `api/projects/${values.currentProjectId}/experiments/${values.experimentId}`
+                                    )
+                                    const freshWithOrdering = initializeMetricOrdering(fresh)
+                                    actions.setUnmodifiedExperiment(structuredClone(freshWithOrdering))
+                                    actions.setExperiment({ ...freshWithOrdering, ...preserved })
+                                } catch {
+                                    actions.loadExperiment()
+                                }
+                            }
+                            throw error
+                        }
+                    }
+
+                    // Concurrent dispatches would race each other into the server's lock window
+                    // carrying the same version, so the loser 409s even though its change saved.
+                    // A dispatch identical to the in-flight one (double click, twin listeners)
+                    // shares its request; a different one queues behind it.
+                    const key = JSON.stringify(update)
+                    const inflight: { key: string; promise: Promise<Experiment> } | undefined = cache.inflightUpdate
+                    if (inflight && inflight.key === key) {
+                        return inflight.promise
+                    }
+                    // Swallow the predecessor's error: it surfaces on its own dispatch, and a
+                    // failed save must not block the queued one.
+                    const promise = (inflight ? inflight.promise.catch(() => {}) : Promise.resolve()).then(send)
+                    const record = { key, promise }
+                    cache.inflightUpdate = record
+                    void promise
+                        .catch(() => {})
+                        .finally(() => {
+                            if (cache.inflightUpdate === record) {
+                                cache.inflightUpdate = undefined
+                            }
+                        })
+                    return promise
                 },
             },
         ],
@@ -3561,13 +3890,6 @@ export const experimentLogic = kea<experimentLogicType>([
                         : InsightType.FUNNELS
                 },
         ],
-        getExperimentMetricType: [
-            () => [],
-            () =>
-                (metric: ExperimentMetric | undefined): ExperimentMetricType => {
-                    return metric?.metric_type || ExperimentMetricType.MEAN
-                },
-        ],
         isExperimentDraft: [
             (s) => [s.experiment],
             (experiment: Experiment): boolean => {
@@ -3592,6 +3914,15 @@ export const experimentLogic = kea<experimentLogicType>([
                 return !!experiment?.feature_flag?.active
             },
         ],
+        /**
+         * The event this experiment's default exposure is actually counted on, resolved by the
+         * backend so the UI names the same event the results queries read. Falls back to
+         * `$feature_flag_called` for an experiment that hasn't been loaded from the API yet.
+         */
+        resolvedExposureEvent: [
+            (s) => [s.experiment],
+            (experiment: Experiment): string => resolvedExposureEvent(experiment ?? {}),
+        ],
         isExperimentStopped: [
             (s) => [s.experiment],
             (experiment: Experiment): boolean => {
@@ -3605,32 +3936,6 @@ export const experimentLogic = kea<experimentLogicType>([
         excludedVariants: [
             (s) => [s.experiment],
             (experiment: Experiment): string[] => experiment?.excluded_variants ?? [],
-        ],
-        experimentMathAggregationForTrends: [
-            (s) => [s.experiment],
-            (experiment: Experiment) => (): PropertyMathType | CountPerActorMathType | undefined => {
-                const query = experiment?.metrics?.[0] as ExperimentTrendsQuery
-                if (!query) {
-                    return undefined
-                }
-                const entities = query.count_query?.series || []
-
-                // Find out if we're using count per actor math aggregates averages per user
-                const userMathValue = entities.filter((entity) =>
-                    Object.values(CountPerActorMathType).includes(entity?.math as CountPerActorMathType)
-                )[0]?.math
-
-                // alternatively, if we're using property math
-                // remove 'sum' property math from the list of math types
-                // since we can handle that as a regular case
-                const targetValues = Object.values(PropertyMathType).filter((value) => value !== PropertyMathType.Sum)
-
-                const propertyMathValue = entities.filter((entity) =>
-                    (targetValues as readonly PropertyMathType[]).includes(entity?.math as PropertyMathType)
-                )[0]?.math
-
-                return (userMathValue ?? propertyMathValue) as PropertyMathType | CountPerActorMathType | undefined
-            },
         ],
         minimumDetectableEffect: [
             (s) => [s.experiment, s.defaultMinimumDetectableEffect],
@@ -3781,12 +4086,6 @@ export const experimentLogic = kea<experimentLogicType>([
                 return null
             },
         ],
-        hasPrimaryMetricSet: [
-            (s) => [s.primaryMetricsLengthWithSharedMetrics],
-            (primaryMetricsLengthWithSharedMetrics: number): boolean => {
-                return primaryMetricsLengthWithSharedMetrics > 0
-            },
-        ],
         firstPrimaryMetric: [
             (s) => [s.experiment],
             (experiment: Experiment): ExperimentMetric | ExperimentTrendsQuery | ExperimentFunnelsQuery | undefined => {
@@ -3805,15 +4104,6 @@ export const experimentLogic = kea<experimentLogicType>([
                 return (
                     experiment.metrics.length +
                     experiment.saved_metrics.filter((savedMetric) => savedMetric.metadata.type === 'primary').length
-                )
-            },
-        ],
-        secondaryMetricsLengthWithSharedMetrics: [
-            (s) => [s.experiment],
-            (experiment: Experiment): number => {
-                return (
-                    experiment.metrics_secondary.length +
-                    experiment.saved_metrics.filter((savedMetric) => savedMetric.metadata.type === 'secondary').length
                 )
             },
         ],
@@ -3935,35 +4225,4 @@ export const experimentLogic = kea<experimentLogicType>([
             },
         ],
     }),
-    forms(({ actions, values }) => ({
-        experiment: {
-            options: { showErrorsOnTouch: true },
-            defaults: { ...NEW_EXPERIMENT } as Experiment,
-            errors: ({ name, feature_flag_config }) => ({
-                name: !name && 'Please enter a name',
-                // feature_flag_key is handled asynchronously
-                feature_flag_config: {
-                    filters: {
-                        multivariate: {
-                            variants: feature_flag_config?.filters?.multivariate?.variants?.map(({ key }) => ({
-                                key: !key.match?.(/^([A-z]|[a-z]|[0-9]|-|_)+$/)
-                                    ? 'Only letters, numbers, hyphens (-) & underscores (_) are allowed.'
-                                    : undefined,
-                            })),
-                        },
-                    },
-                },
-            }),
-            submit: () => {
-                if (
-                    values.experimentId &&
-                    ([FORM_MODES.create, FORM_MODES.duplicate] as FormModes[]).includes(values.formMode)
-                ) {
-                    actions.createExperiment(true)
-                } else {
-                    actions.createExperiment(true, 'Unfiled/Experiments')
-                }
-            },
-        },
-    })),
 ])

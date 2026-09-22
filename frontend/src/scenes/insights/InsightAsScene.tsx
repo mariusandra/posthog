@@ -18,6 +18,7 @@ import { teamLogic } from '../teamLogic'
 import { InsightRetentionBanner } from './dataRetention/InsightRetentionBanner'
 import { insightDataLogic } from './insightDataLogic'
 import { insightLogic } from './insightLogic'
+import { InsightQueryScanBanner } from './InsightQueryScanBanner'
 import { InsightSceneHeader } from './InsightSceneHeader'
 import { insightVizDataLogic } from './insightVizDataLogic'
 import { SqlInsightFilters } from './SqlInsightFilters'
@@ -93,6 +94,8 @@ export function InsightAsScene({ insightId, attachTo, tabId }: InsightAsScenePro
                 )}
 
                 <InsightRetentionBanner insightProps={insightProps} />
+
+                <InsightQueryScanBanner insightProps={insightProps} />
 
                 <SqlInsightFilters query={query} setQuery={setQuery}>
                     {isDataVisualizationNode(query) && insightLoading ? (

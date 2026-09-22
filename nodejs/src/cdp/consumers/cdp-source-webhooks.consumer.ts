@@ -11,7 +11,7 @@ import { HealthCheckResult, HealthCheckResultOk, PluginsServerConfig } from '../
 import { createHogFlowInvocation } from '../services/hogflows/hogflow-executor.service'
 import { actionIdForLogging } from '../services/hogflows/hogflow-utils'
 import { JobQueue } from '../services/job-queue/job-queue.interface'
-import { HogWatcherFunctionState, HogWatcherState } from '../services/monitoring/hog-watcher.service'
+import { HogWatcherFunctionState, HogWatcherState, sameWatcherState } from '../services/monitoring/hog-watcher.service'
 import {
     CyclotronJobInvocationHogFunction,
     CyclotronJobInvocationResult,
@@ -22,6 +22,7 @@ import {
     MinimalAppMetric,
 } from '../types'
 import { logEntry } from '../utils'
+import { dualRead, dualWrite } from '../utils/dual-store'
 import { createInvocation, createInvocationResult } from '../utils/invocation-utils'
 import { CdpConsumerBase, CdpConsumerBaseDeps } from './cdp-base.consumer'
 
@@ -233,7 +234,10 @@ export class CdpSourceWebhooksConsumer extends CdpConsumerBase<PluginsServerConf
         try {
             const globals: HogFunctionInvocationGlobals = this.buildRequestGlobals(hogFunction, req)
 
-            const globalsWithInputs = await this.hogExecutor.buildInputsWithGlobals(hogFunction, globals)
+            const globalsWithInputs = await this.hogExecutorAsync.hogExecutor.buildInputsWithGlobals(
+                hogFunction,
+                globals
+            )
             const invocation = createInvocation(globalsWithInputs, hogFunction)
 
             // Slightly different handling for hog flows
@@ -295,11 +299,13 @@ export class CdpSourceWebhooksConsumer extends CdpConsumerBase<PluginsServerConf
                     count: 1,
                 })
 
-                addMetric({
-                    metric_kind: 'billing',
-                    metric_name: 'billable_invocation',
-                    count: 1,
-                })
+                // Queued before queueInvocations serializes the invocation, because
+                // queueLifecycleRow stamps `state.firstScheduledAt` and only a stamp set before
+                // serialization reaches cyclotron.
+                this.invocationResultsService.invocationResultsRowsService.queueLifecycleRow(
+                    hogFlowInvocation,
+                    'running'
+                )
 
                 await this.hogflowQueue.queueInvocations([hogFlowInvocation])
             } else {
@@ -315,6 +321,9 @@ export class CdpSourceWebhooksConsumer extends CdpConsumerBase<PluginsServerConf
             return functionResult
         } catch (error) {
             logger.error('Error triggering hog flow', { error })
+            // The 'running' row is queued before the invocation reaches cyclotron, so a throw after
+            // that point leaves a row for a run that does not exist and would never terminate.
+            this.invocationResultsService.invocationResultsRowsService.dropQueuedRowsFor([invocationId])
             addMetric({
                 metric_kind: 'failure',
                 metric_name: 'trigger_failed',
@@ -344,7 +353,10 @@ export class CdpSourceWebhooksConsumer extends CdpConsumerBase<PluginsServerConf
 
         try {
             const globals: HogFunctionInvocationGlobals = this.buildRequestGlobals(hogFunction, req)
-            const globalsWithInputs = await this.hogExecutor.buildInputsWithGlobals(hogFunction, globals)
+            const globalsWithInputs = await this.hogExecutorAsync.hogExecutor.buildInputsWithGlobals(
+                hogFunction,
+                globals
+            )
             const invocation = createInvocation(globalsWithInputs, hogFunction)
 
             if (hogFunctionState?.state === HogWatcherState.degraded) {
@@ -376,7 +388,7 @@ export class CdpSourceWebhooksConsumer extends CdpConsumerBase<PluginsServerConf
                 }
             } else {
                 // Run the initial step - this allows functions not using fetches to respond immediately
-                result = await this.hogExecutor.execute(invocation)
+                result = await this.hogExecutorAsync.execute(invocation)
 
                 // Queue any queued work here. This allows us to enable delayed work like fetching eventually without blocking the API.
                 if (!result.finished) {
@@ -432,7 +444,12 @@ export class CdpSourceWebhooksConsumer extends CdpConsumerBase<PluginsServerConf
 
         const [webhook, hogFunctionState] = await Promise.all([
             this.getWebhook(webhookId),
-            this.hogWatcher.getCachedEffectiveState(webhookId),
+            dualRead(
+                'hog-watcher.getCachedEffectiveState',
+                () => this.hogWatcher.getCachedEffectiveState(webhookId),
+                () => this.hogWatcherMirror.getCachedEffectiveState(webhookId),
+                sameWatcherState
+            ),
         ])
 
         if (!webhook) {
@@ -461,7 +478,11 @@ export class CdpSourceWebhooksConsumer extends CdpConsumerBase<PluginsServerConf
 
         void this.promiseScheduler.schedule(
             this.invocationResultsService.flush(),
-            this.hogWatcher.observeResultsBuffered(result)
+            dualWrite(
+                'hog-watcher.observeResultsBuffered',
+                () => this.hogWatcher.observeResultsBuffered(result),
+                () => this.hogWatcherMirror.observeResultsBuffered(result)
+            )
         )
 
         return result

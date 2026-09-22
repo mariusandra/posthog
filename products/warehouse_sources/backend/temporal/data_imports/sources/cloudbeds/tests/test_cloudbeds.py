@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -8,6 +9,8 @@ from parameterized import parameterized
 from requests import Response
 
 from products.warehouse_sources.backend.temporal.data_imports.sources.cloudbeds.cloudbeds import (
+    CLOUDBEDS_API_VERSION_V1_2,
+    CLOUDBEDS_API_VERSION_V1_3,
     PAGE_SIZE,
     CloudbedsResumeConfig,
     cloudbeds_source,
@@ -16,6 +19,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.cloudbeds.
 from products.warehouse_sources.backend.temporal.data_imports.sources.cloudbeds.settings import (
     CLOUDBEDS_ENDPOINTS,
     ENDPOINTS,
+    RATE_PLAN_WINDOW_DAYS,
 )
 
 # RESTClient builds its session via make_tracked_session in the rest_client module.
@@ -81,6 +85,7 @@ def _source(
     *,
     manager: mock.MagicMock | None = None,
     property_id: str | None = None,
+    api_version: str = CLOUDBEDS_API_VERSION_V1_3,
 ) -> Any:
     return cloudbeds_source(
         api_key="cbat_key",
@@ -88,6 +93,7 @@ def _source(
         team_id=1,
         job_id="j",
         resumable_source_manager=manager if manager is not None else _make_manager(),
+        api_version=api_version,
         property_id=property_id,
     )
 
@@ -202,6 +208,94 @@ class TestPagination:
             {"roomID": "r2", "roomName": "102", "propertyID": "1"},
         ]
 
+    @mock.patch(CLIENT_SESSION_PATCH)
+    def test_users_are_exploded_out_of_the_per_property_map(self, MockSession: mock.MagicMock) -> None:
+        session = MockSession.return_value
+        # getUsers keys `data` by property ID instead of returning a list, so each property's users
+        # arrive nested under the ID they belong to.
+        _wire(
+            session,
+            [
+                _response(
+                    None,
+                    body={
+                        "success": True,
+                        "data": {
+                            "1": [{"userID": "u1", "email": "a@example.com"}, {"userID": "u2"}],
+                            "2": [{"userID": "u1", "email": "a@example.com"}],
+                        },
+                    },
+                )
+            ],
+        )
+
+        rows = _rows(_source("users", manager=_make_manager()))
+
+        # The same user at two properties must stay two rows, each carrying its own propertyID -
+        # that is what makes the ["propertyID", "userID"] key unique.
+        assert rows == [
+            {"userID": "u1", "email": "a@example.com", "propertyID": "1"},
+            {"userID": "u2", "propertyID": "1"},
+            {"userID": "u1", "email": "a@example.com", "propertyID": "2"},
+        ]
+
+    @mock.patch(CLIENT_SESSION_PATCH)
+    def test_rate_plans_request_the_required_forward_stay_window(self, MockSession: mock.MagicMock) -> None:
+        session = MockSession.return_value
+        params = _wire(session, [_response([{"rateID": "r1"}])])
+
+        before = datetime.now(UTC).date()
+        _rows(_source("rate_plans", manager=_make_manager(), property_id="12345"))
+        after = datetime.now(UTC).date()
+
+        start = date.fromisoformat(params[0]["startDate"])
+        end = date.fromisoformat(params[0]["endDate"])
+        # getRatePlans rejects a request without a stay window, so the window has to be built for it,
+        # and it has to start on the sync date rather than drift into the past.
+        assert before <= start <= after
+        assert end - start == timedelta(days=RATE_PLAN_WINDOW_DAYS)
+
+    @parameterized.expand([("rate_plans", "propertyIDs"), ("users", "property_ids")])
+    @mock.patch(CLIENT_SESSION_PATCH)
+    def test_property_is_scoped_under_the_param_the_endpoint_accepts(
+        self, endpoint: str, param: str, MockSession: mock.MagicMock
+    ) -> None:
+        session = MockSession.return_value
+        params = _wire(session, [_response(None, body={"success": True, "data": {}})])
+
+        _rows(_source(endpoint, manager=_make_manager(), property_id="12345"))
+
+        # These two methods spell the property filter their own way; sending `propertyID` instead
+        # would leave a group credential reading every property it can see.
+        assert params[0][param] == "12345"
+        assert "propertyID" not in params[0]
+
+
+class TestApiVersion:
+    def _capture_urls(self, session: mock.MagicMock, responses: list[Response]) -> list[str]:
+        session.headers = {}
+        urls: list[str] = []
+
+        def _prepare(request: Any) -> mock.MagicMock:
+            urls.append(getattr(request, "url", ""))
+            return mock.MagicMock()
+
+        session.prepare_request.side_effect = _prepare
+        session.send.side_effect = responses
+        return urls
+
+    @parameterized.expand([(CLOUDBEDS_API_VERSION_V1_2,), (CLOUDBEDS_API_VERSION_V1_3,)])
+    @mock.patch(CLIENT_SESSION_PATCH)
+    def test_requested_version_is_the_url_segment(self, api_version: str, MockSession: mock.MagicMock) -> None:
+        session = MockSession.return_value
+        urls = self._capture_urls(session, [_response([{"reservationID": "1"}])])
+
+        _rows(_source(manager=_make_manager(), api_version=api_version))
+
+        # The resolved pin must reach the request path verbatim so a v1.2-pinned source never drifts
+        # onto v1.3 (the default) or vice versa.
+        assert urls and all(f"/api/{api_version}/getReservations" in url for url in urls)
+
 
 class TestFailLoud:
     @parameterized.expand(
@@ -275,19 +369,30 @@ class TestValidateCredentials:
         mock_session: mock.MagicMock,
     ) -> None:
         mock_session.return_value.get.return_value = mock.MagicMock(status_code=status)
-        assert validate_credentials("cbat_key") == (expected_valid, expected_message)
+        assert validate_credentials("cbat_key", CLOUDBEDS_API_VERSION_V1_3) == (expected_valid, expected_message)
 
     @mock.patch(CLOUDBEDS_SESSION_PATCH)
     def test_connection_error_is_not_valid(self, mock_session: mock.MagicMock) -> None:
         mock_session.return_value.get.side_effect = Exception("boom")
-        assert validate_credentials("cbat_key") == (False, "Could not connect to Cloudbeds")
+        assert validate_credentials("cbat_key", CLOUDBEDS_API_VERSION_V1_3) == (
+            False,
+            "Could not connect to Cloudbeds",
+        )
 
     @mock.patch(CLOUDBEDS_SESSION_PATCH)
     def test_probe_scopes_to_property_when_configured(self, mock_session: mock.MagicMock) -> None:
         mock_session.return_value.get.return_value = mock.MagicMock(status_code=200)
-        validate_credentials("cbat_key", property_id="12345")
+        validate_credentials("cbat_key", CLOUDBEDS_API_VERSION_V1_3, property_id="12345")
         called_url = mock_session.return_value.get.call_args.args[0]
         assert "propertyID=12345" in called_url
+
+    @parameterized.expand([(CLOUDBEDS_API_VERSION_V1_2,), (CLOUDBEDS_API_VERSION_V1_3,)])
+    @mock.patch(CLOUDBEDS_SESSION_PATCH)
+    def test_probe_url_carries_requested_version(self, api_version: str, mock_session: mock.MagicMock) -> None:
+        mock_session.return_value.get.return_value = mock.MagicMock(status_code=200)
+        validate_credentials("cbat_key", api_version)
+        called_url = mock_session.return_value.get.call_args.args[0]
+        assert called_url.startswith(f"https://api.cloudbeds.com/api/{api_version}/getHotels")
 
 
 class TestCloudbedsSourceResponse:

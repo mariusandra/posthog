@@ -35,7 +35,7 @@ describe('feature-flag-get-definition-by-key', () => {
         expect(request).toHaveBeenCalledWith({
             method: 'GET',
             path: '/api/projects/42/feature_flags/',
-            query: { key: 'new-checkout', limit: 5 },
+            query: { key: 'new-checkout', limit: 20 },
         })
         expect(result).toMatchObject({ id: 7, key: 'new-checkout', found: true })
     })
@@ -64,14 +64,32 @@ describe('feature-flag-get-definition-by-key', () => {
         )
     })
 
-    it('returns a non-error found:false result naming the missing key when no flag matches', async () => {
+    it('returns a non-error found:false result naming the missing key when no flag matches, live or archived', async () => {
         const request = vi.fn().mockResolvedValue({ results: [] })
 
         const result = await tool.handler(createMockContext(request), { key: 'checkout' })
 
         expect(result).toMatchObject({ found: false, key: 'checkout' })
         expect((result as { message: string }).message).toContain('checkout')
-        expect(request).toHaveBeenCalledTimes(1)
+        // The list hides archived flags by default, so a miss is confirmed against them too.
+        expect(request).toHaveBeenCalledTimes(2)
+        expect(request).toHaveBeenNthCalledWith(2, {
+            method: 'GET',
+            path: '/api/projects/42/feature_flags/',
+            query: { key: 'checkout', archived: true, limit: 20 },
+        })
+    })
+
+    it('finds an archived flag on the retry instead of reporting it missing', async () => {
+        const request = vi
+            .fn()
+            .mockResolvedValueOnce({ results: [] })
+            .mockResolvedValueOnce({ results: [{ ...flag(9, 'old-checkout'), archived: true }] })
+
+        const result = await tool.handler(createMockContext(request), { key: 'old-checkout' })
+
+        expect(result).toMatchObject({ id: 9, key: 'old-checkout', archived: true, found: true })
+        expect(request).toHaveBeenCalledTimes(2)
     })
 
     it('raises a validation error for a blank key without calling the API', async () => {
@@ -81,5 +99,32 @@ describe('feature-flag-get-definition-by-key', () => {
             ToolInputValidationError
         )
         expect(request).not.toHaveBeenCalled()
+    })
+
+    // Agents reconstruct this call from the tool name in exec mode and send the
+    // key as `flagKey` / `flag_key` / `feature_flag_key`; production traces show
+    // that mismatch as the dominant validation failure. Every alias must
+    // normalize onto `key` (canonical wins on conflict) or those failures return.
+    describe('key aliases', () => {
+        it.each([
+            ['key', { key: 'new-checkout' }],
+            ['flagKey', { flagKey: 'new-checkout' }],
+            ['flag_key', { flag_key: 'new-checkout' }],
+            ['feature_flag_key', { feature_flag_key: 'new-checkout' }],
+            ['featureFlagKey', { featureFlagKey: 'new-checkout' }],
+            ['key over an alias on conflict', { key: 'new-checkout', flagKey: 'other' }],
+        ])('normalizes %s to `key`', (_label, input) => {
+            const result = tool.schema.safeParse(input)
+            expect(result.success).toBe(true)
+            const data = result.data as Record<string, unknown>
+            expect(data.key).toBe('new-checkout')
+            for (const alias of ['flagKey', 'flag_key', 'feature_flag_key', 'featureFlagKey']) {
+                expect(data).not.toHaveProperty(alias)
+            }
+        })
+
+        it('still rejects a call with no key under any accepted name', () => {
+            expect(tool.schema.safeParse({}).success).toBe(false)
+        })
     })
 })

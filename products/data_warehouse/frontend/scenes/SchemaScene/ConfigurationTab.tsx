@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { IconInfo } from '@posthog/icons'
 import {
+    LemonBanner,
     LemonButton,
     LemonDialog,
     LemonInput,
@@ -18,14 +19,13 @@ import {
 
 import api from 'lib/api'
 import { TZLabel } from 'lib/components/TZLabel'
-import { FEATURE_FLAGS } from 'lib/constants'
 import { dayjs } from 'lib/dayjs'
-import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
 import { newInternalTab } from 'lib/utils/newInternalTab'
 import { teamLogic } from 'scenes/teamLogic'
 import { urls } from 'scenes/urls'
 
 import {
+    AvailableColumn,
     DataWarehouseSyncInterval,
     ExternalDataSchemaSourceSummary,
     ExternalDataSource,
@@ -38,10 +38,11 @@ import {
     SyncMethodFormHandle,
 } from 'products/data_warehouse/frontend/shared/components/forms/SyncMethodForm'
 import {
-    SourceEditorAction,
-    useSourceEditorAccess,
+    SchemaEditorAction,
+    useSchemaEditorAccess,
 } from 'products/data_warehouse/frontend/shared/components/SourceEditorAction'
 import {
+    IncrementalSyncBlockedMessageMap,
     StatusTagSetting,
     SyncFrequencyLabelMap,
     SyncTypeLabelMap,
@@ -55,6 +56,7 @@ import { ColumnSelectionPicker } from '../SourceScene/tabs/ColumnSelectionModal'
 import { RowFilterEditor } from '../SourceScene/tabs/RowFilterEditor'
 import { validateRowFilters } from '../SourceScene/tabs/rowFilterUtils'
 import { columnAnnotationsLogic } from './columnAnnotationsLogic'
+import { DestinationsSection } from './DestinationsSection'
 import { SchemaConfigurationSection, schemaSceneLogic } from './schemaSceneLogic'
 
 // null means "all columns" on either side, so switching to null after a partial list flags
@@ -83,7 +85,8 @@ export interface ConfigurationTabProps {
     source: SchemaSceneSource | null
     section: SchemaConfigurationSection
     onConfigureSyncMethod: () => void
-    onViewSyncHistory: () => void
+    /** Omitted when the source has no sync history to link to. */
+    syncHistoryUrl?: string
 }
 
 export function ConfigurationTab({
@@ -92,34 +95,34 @@ export function ConfigurationTab({
     source,
     section,
     onConfigureSyncMethod,
-    onViewSyncHistory,
+    syncHistoryUrl,
 }: ConfigurationTabProps): JSX.Element {
     const logic = schemaSceneLogic({ sourceId, schemaId: schema.id })
     const { isProjectTime, refreshingSchemas, resyncingSchema, supportsRowFilters } = useValues(logic)
     const { setIsProjectTime, updateSchema, reloadSchema, resyncSchema, cancelSchema, deleteTable, refreshSchemas } =
         useActions(logic)
-    const { featureFlags } = useValues(featureFlagLogic)
 
     switch (section) {
         case 'details':
             return (
                 <DetailsSection
-                    source={source}
                     schema={schema}
                     reloadSchema={reloadSchema}
                     cancelSchema={cancelSchema}
                     updateSchema={updateSchema}
                     onConfigureSyncMethod={onConfigureSyncMethod}
-                    onViewSyncHistory={onViewSyncHistory}
+                    syncHistoryUrl={syncHistoryUrl}
                 />
             )
         case 'sync-method':
             return (
                 <div className="flex flex-col gap-6">
-                    <SyncMethodSection sourceId={sourceId} source={source} schema={schema} />
+                    <SyncMethodSection sourceId={sourceId} schema={schema} />
                     <ApiVersionSection sourceId={sourceId} source={source} schema={schema} />
                 </div>
             )
+        case 'destinations':
+            return <DestinationsSection schemaId={schema.id} />
         case 'columns':
             return (
                 <ColumnsAndRowFiltersSection
@@ -136,19 +139,13 @@ export function ConfigurationTab({
             return (
                 <ScheduleSection
                     sourceId={sourceId}
-                    source={source}
                     schema={schema}
                     isProjectTime={isProjectTime}
                     setIsProjectTime={setIsProjectTime}
                 />
             )
         case 'descriptions':
-            // Deep-link guard: the section nav already hides this when the flag is off.
-            return featureFlags[FEATURE_FLAGS.DATA_WAREHOUSE_SEMANTIC_ENRICHMENT] ? (
-                <DescriptionsSection schema={schema} />
-            ) : (
-                <></>
-            )
+            return <DescriptionsSection schema={schema} />
         case 'danger-zone':
             return (
                 <DangerZoneSection
@@ -172,21 +169,19 @@ function SectionHeader({ title, description }: { title: string; description?: st
 }
 
 function DetailsSection({
-    source,
     schema,
     reloadSchema,
     cancelSchema,
     updateSchema,
     onConfigureSyncMethod,
-    onViewSyncHistory,
+    syncHistoryUrl,
 }: {
-    source: ExternalDataSource | null
     schema: ExternalDataSourceSchema
     reloadSchema: (schema: ExternalDataSourceSchema) => void
     cancelSchema: (schema: ExternalDataSourceSchema) => void
     updateSchema: (schema: ExternalDataSourceSchema) => void
     onConfigureSyncMethod: () => void
-    onViewSyncHistory: () => void
+    syncHistoryUrl?: string
 }): JSX.Element {
     const syncedTableName = schema.table?.hogql_name ?? schema.table?.name
 
@@ -197,6 +192,14 @@ function DetailsSection({
                 description="Enable or disable syncing for this schema, see its current state, and trigger a sync on demand."
             />
             <div className="border rounded p-4 bg-surface-primary flex flex-col gap-3">
+                {schema.incremental_sync_blocked && (
+                    <LemonBanner
+                        type="warning"
+                        action={{ children: 'Change sync method', onClick: onConfigureSyncMethod }}
+                    >
+                        {IncrementalSyncBlockedMessageMap[schema.incremental_sync_blocked]}
+                    </LemonBanner>
+                )}
                 <div className="flex items-start justify-between gap-4">
                     <div className="flex flex-col">
                         <span>Enabled</span>
@@ -206,11 +209,14 @@ function DetailsSection({
                             re-enable.
                         </span>
                     </div>
-                    <SourceEditorAction source={source}>
+                    <SchemaEditorAction schema={schema}>
                         <LemonSwitch
                             checked={schema.should_sync}
                             label={schema.should_sync ? 'Syncing' : 'Disabled'}
                             onChange={(active) => {
+                                // A blocked table is not routed away here on purpose. An operator who fixed
+                                // the duplicates or added the key at the source has to be able to turn the
+                                // table back on themselves; the banner above says what the last run found.
                                 if (active && !schema.sync_type) {
                                     // No sync method saved yet — open the sync method section to set one up.
                                     onConfigureSyncMethod()
@@ -256,7 +262,7 @@ function DetailsSection({
                                 }
                             }}
                         />
-                    </SourceEditorAction>
+                    </SchemaEditorAction>
                 </div>
                 <div className="flex items-center justify-between">
                     <span className="text-muted">Current status</span>
@@ -277,7 +283,7 @@ function DetailsSection({
                     )}
                 </div>
                 <div className="flex items-center justify-between">
-                    <span className="text-muted">Rows synced</span>
+                    <span className="text-muted">Row count</span>
                     <span>{schema.table?.row_count?.toLocaleString() ?? '—'}</span>
                 </div>
                 <div className="flex items-center justify-between">
@@ -304,7 +310,7 @@ function DetailsSection({
                 </div>
             </div>
             <div className="mt-4 flex gap-2 flex-wrap">
-                <SourceEditorAction source={source}>
+                <SchemaEditorAction schema={schema}>
                     {({ disabledReason }) => (
                         <Tooltip
                             title={
@@ -331,9 +337,9 @@ function DetailsSection({
                             </LemonButton>
                         </Tooltip>
                     )}
-                </SourceEditorAction>
+                </SchemaEditorAction>
                 {schema.status === 'Running' && (
-                    <SourceEditorAction source={source}>
+                    <SchemaEditorAction schema={schema}>
                         {({ disabledReason }) => (
                             <LemonButton
                                 type="secondary"
@@ -344,25 +350,19 @@ function DetailsSection({
                                 Cancel current sync
                             </LemonButton>
                         )}
-                    </SourceEditorAction>
+                    </SchemaEditorAction>
                 )}
-                <LemonButton type="secondary" onClick={onViewSyncHistory}>
-                    View sync history
-                </LemonButton>
+                {syncHistoryUrl && (
+                    <LemonButton type="secondary" to={syncHistoryUrl}>
+                        View sync history
+                    </LemonButton>
+                )}
             </div>
         </div>
     )
 }
 
-function SyncMethodSection({
-    sourceId,
-    source,
-    schema,
-}: {
-    sourceId: string
-    source: ExternalDataSource | null
-    schema: ExternalDataSourceSchema
-}): JSX.Element {
+function SyncMethodSection({ sourceId, schema }: { sourceId: string; schema: ExternalDataSourceSchema }): JSX.Element {
     // Incremental fields + saving both go through schemaSceneLogic — deliberately NOT
     // syncMethodModalLogic, which connects sourceManagementLogic and would mount + poll the full
     // sources list (the heavy `external_data_sources` fetch this page is meant to avoid).
@@ -374,7 +374,7 @@ function SyncMethodSection({
     const [saveDisabledReason, setSaveDisabledReason] = useState<string | undefined>()
     const [saving, setSaving] = useState(false)
 
-    const { disabledReason: accessDisabledReason } = useSourceEditorAccess(source)
+    const { disabledReason: accessDisabledReason } = useSchemaEditorAccess(schema)
 
     // Load incremental fields only when the schema id changes. We intentionally exclude the kea
     // action refs from the deps — if they aren't stable, the effect would re-fire on every parent
@@ -386,6 +386,20 @@ function SyncMethodSection({
     }, [schema.id])
 
     const loading = schemaIncrementalFieldsLoading || !schemaIncrementalFields
+
+    // Only offer these as merge keys when the source reported them. Without source metadata the API
+    // fills the list from the synced table instead, whose names went through the snake_case naming
+    // convention, so `createdAt` reads back as `created_at` and a key picked from it names a column
+    // the source query cannot resolve. That is also the state where the API accepts a keyless
+    // incremental switch, so there is no refusal left without a remedy.
+    const storedColumns: AvailableColumn[] = schema.source_column_metadata_available
+        ? (schema.available_columns ?? []).map((column) => ({
+              field: column.name,
+              label: column.name,
+              type: column.data_type ?? '',
+              nullable: column.is_nullable ?? false,
+          }))
+        : []
 
     const persistSyncMethod = async (
         syncType: ExternalDataSourceSchema['sync_type'],
@@ -483,12 +497,15 @@ function SyncMethodSection({
                                 incremental_fields: schemaIncrementalFields.incremental_fields,
                                 supports_webhooks: schemaIncrementalFields.supports_webhooks ?? false,
                                 primary_key_columns: schema.primary_key_columns ?? null,
-                                available_columns: [],
+                                available_columns: storedColumns,
                                 detected_primary_keys: null,
                             }}
                             availableColumns={schemaIncrementalFields.available_columns ?? []}
                             detectedPrimaryKeys={schemaIncrementalFields.detected_primary_keys ?? null}
-                            primaryKeyLocked={!!schema.table}
+                            primaryKeyDetectionSupported={
+                                schemaIncrementalFields.primary_key_detection_supported ?? false
+                            }
+                            primaryKeyLocked={!!schema.table && !!schema.primary_key_columns?.length}
                             onClose={() => {}}
                             onSave={persistSyncMethod}
                         />
@@ -521,7 +538,7 @@ function ApiVersionSection({
     schema: ExternalDataSourceSchema
 }): JSX.Element | null {
     const { loadSchema, resyncSchema } = useActions(schemaSceneLogic({ sourceId, schemaId: schema.id }))
-    const { disabledReason: accessDisabledReason } = useSourceEditorAccess(source)
+    const { disabledReason: accessDisabledReason } = useSchemaEditorAccess(schema)
 
     const supportedVersions = source?.supported_api_versions ?? []
     const sourceVersion = source?.api_version
@@ -667,7 +684,7 @@ function ColumnsAndRowFiltersSection({
     refreshingSchemas,
     supportsRowFilters,
 }: {
-    source: ExternalDataSource | null
+    source: SchemaSceneSource | null
     schema: ExternalDataSourceSchema
     updateSchema: (schema: ExternalDataSourceSchema) => void
     resyncSchema: (schema: ExternalDataSourceSchema) => void
@@ -677,10 +694,12 @@ function ColumnsAndRowFiltersSection({
 }): JSX.Element {
     const available = schema.available_columns ?? []
     const hasAvailableColumns = available.length > 0
+    const columnSelectionNeedsRefresh =
+        !!source?.requires_exact_column_metadata && schema.source_column_metadata_available === false
 
-    // Plain value, not the render-prop form of SourceEditorAction: a fresh inline render-prop on
-    // every edit would remount the editors and wipe their drafts. See useSourceEditorAccess's docstring.
-    const { disabledReason: editorDisabledReason } = useSourceEditorAccess(source)
+    // Plain value, not the render-prop form of SchemaEditorAction: a fresh inline render-prop on
+    // every edit would remount the editors and wipe their drafts. See useSchemaEditorAccess's docstring.
+    const { disabledReason: editorDisabledReason } = useSchemaEditorAccess(schema)
 
     // Both editors run in `hideActions` mode and report edits up here, so one Save commits both.
     const [draftColumns, setDraftColumns] = useState<string[] | null>(schema.enabled_columns ?? null)
@@ -775,14 +794,16 @@ function ColumnsAndRowFiltersSection({
                     description="Choose which columns from this table get synced. Primary keys and the active incremental field are always synced."
                 />
                 <div className="border rounded p-4 bg-surface-primary flex flex-col gap-3">
-                    {!hasAvailableColumns ? (
+                    {!hasAvailableColumns || columnSelectionNeedsRefresh ? (
                         <div className="flex flex-col items-center gap-2 text-center text-muted-alt py-6">
                             <span className="text-sm">
-                                {!schema.last_synced_at
-                                    ? 'No columns discovered yet for this schema — they will appear after the first successful sync.'
-                                    : 'No columns discovered yet for this schema.'}
+                                {columnSelectionNeedsRefresh
+                                    ? 'Pull the latest source schema before changing columns. Existing synced columns remain available under Descriptions.'
+                                    : !schema.last_synced_at
+                                      ? 'No columns discovered yet for this schema — they will appear after the first successful sync.'
+                                      : 'No columns discovered yet for this schema.'}
                             </span>
-                            <SourceEditorAction source={source}>
+                            <SchemaEditorAction schema={schema}>
                                 <LemonButton
                                     type="secondary"
                                     size="small"
@@ -791,7 +812,7 @@ function ColumnsAndRowFiltersSection({
                                 >
                                     Pull new schemas
                                 </LemonButton>
-                            </SourceEditorAction>
+                            </SchemaEditorAction>
                         </div>
                     ) : (
                         <>
@@ -811,7 +832,7 @@ function ColumnsAndRowFiltersSection({
                         description="Sync only rows that match these conditions. Filters are ANDed together and applied on the next sync — they don't remove rows already synced."
                     />
                     <div className="border rounded p-4 bg-surface-primary flex flex-col gap-3">
-                        {!hasAvailableColumns ? (
+                        {!hasAvailableColumns || columnSelectionNeedsRefresh ? (
                             <div className="text-sm text-muted-alt py-2 text-center">
                                 No columns discovered yet — pull schemas from the Columns section above to add row
                                 filters.
@@ -852,29 +873,28 @@ function ColumnsAndRowFiltersSection({
 
 function ScheduleSection({
     sourceId,
-    source,
     schema,
     isProjectTime,
     setIsProjectTime,
 }: {
     sourceId: string
-    source: ExternalDataSource | null
     schema: ExternalDataSourceSchema
     isProjectTime: boolean
     setIsProjectTime: (v: boolean) => void
 }): JSX.Element {
     const { loadSchema } = useActions(schemaSceneLogic({ sourceId, schemaId: schema.id }))
     const isCdc = schema.sync_type === 'cdc'
-    const frequencyOptions: LemonSelectOption<DataWarehouseSyncInterval>[] = allowedSyncFrequencies(
-        schema.sync_type
-    ).map((value) => ({ value, label: SyncFrequencyLabelMap[value] }))
+    const frequencyOptions: LemonSelectOption<DataWarehouseSyncInterval>[] = allowedSyncFrequencies().map((value) => ({
+        value,
+        label: SyncFrequencyLabelMap[value],
+    }))
 
     const [draftFrequency, setDraftFrequency] = useState<DataWarehouseSyncInterval>(
         schema.sync_frequency || (isCdc ? '5min' : '6hour')
     )
     const [draftSyncTimeOfDay, setDraftSyncTimeOfDay] = useState<string | null>(schema.sync_time_of_day ?? null)
     const [saving, setSaving] = useState(false)
-    const { disabledReason: accessDisabledReason } = useSourceEditorAccess(source)
+    const { disabledReason: accessDisabledReason } = useSchemaEditorAccess(schema)
 
     const serverFrequency = schema.sync_frequency || (isCdc ? '5min' : '6hour')
     const serverSyncTimeOfDay = schema.sync_time_of_day ?? null
@@ -936,7 +956,6 @@ function ScheduleSection({
                     />
                 </div>
                 <AnchorTimeField
-                    source={source}
                     schema={schema}
                     draftFrequency={draftFrequency}
                     draftSyncTimeOfDay={draftSyncTimeOfDay}
@@ -960,7 +979,6 @@ function ScheduleSection({
 }
 
 function AnchorTimeField({
-    source,
     schema,
     draftFrequency,
     draftSyncTimeOfDay,
@@ -968,7 +986,6 @@ function AnchorTimeField({
     isProjectTime,
     setIsProjectTime,
 }: {
-    source: ExternalDataSource | null
     schema: ExternalDataSourceSchema
     draftFrequency: DataWarehouseSyncInterval
     draftSyncTimeOfDay: string | null
@@ -977,14 +994,13 @@ function AnchorTimeField({
     setIsProjectTime: (v: boolean) => void
 }): JSX.Element {
     const { currentTeam } = useValues(teamLogic)
-    const { disabledReason: accessDisabledReason } = useSourceEditorAccess(source)
+    const { disabledReason: accessDisabledReason } = useSchemaEditorAccess(schema)
 
     const isSyncTimeSet = draftSyncTimeOfDay !== null
     const utcTime = draftSyncTimeOfDay || '00:00:00'
     const localTime = isProjectTime
         ? dayjs
               .utc(`${dayjs().format('YYYY-MM-DD')}T${utcTime}`)
-              .local()
               .tz(currentTeam?.timezone || 'UTC')
               .format('HH:mm:00')
         : utcTime
@@ -1038,7 +1054,7 @@ function AnchorTimeField({
                         accessDisabledReason ?? (!schema.should_sync ? 'Enable syncing to set anchor time' : undefined)
                     }
                     onChange={(checked) => {
-                        setDraftSyncTimeOfDay(checked ? (isProjectTime ? localTime : utcTime) : null)
+                        setDraftSyncTimeOfDay(checked ? utcTime : null)
                     }}
                 />
                 <LemonInput
@@ -1048,9 +1064,11 @@ function AnchorTimeField({
                     value={isSyncTimeSet ? localTime.substring(0, 5) : undefined}
                     onChange={(value) => {
                         const newValue = `${value}:00`
+                        // dayjs.tz(str, zone) interprets the wall-clock time in the project
+                        // timezone; plain dayjs(str) would parse it in the browser's timezone.
                         const utcValue = isProjectTime
-                            ? dayjs(`${dayjs().format('YYYY-MM-DD')}T${newValue}`)
-                                  .tz(currentTeam?.timezone || 'UTC')
+                            ? dayjs
+                                  .tz(`${dayjs().format('YYYY-MM-DD')}T${newValue}`, currentTeam?.timezone || 'UTC')
                                   .utc()
                                   .format('HH:mm:00')
                             : newValue
@@ -1104,7 +1122,7 @@ function DangerZoneSection({
                 description="Destructive actions that rebuild or remove data. Use only if you understand the impact."
             />
             <div className="border border-danger/40 rounded p-4 bg-surface-primary flex flex-col gap-2">
-                <SourceEditorAction source={source}>
+                <SchemaEditorAction schema={schema}>
                     {({ disabledReason }) => (
                         <>
                             {hasFullCdcResync && (
@@ -1199,7 +1217,7 @@ function DangerZoneSection({
                             )}
                         </>
                     )}
-                </SourceEditorAction>
+                </SchemaEditorAction>
             </div>
         </div>
     )
@@ -1230,6 +1248,7 @@ function DescriptionRow({
     source,
     saving,
     onSave,
+    disabledReason,
 }: {
     columnName: string
     label: string
@@ -1238,6 +1257,7 @@ function DescriptionRow({
     source?: string
     saving: boolean
     onSave: (columnName: string, description: string) => void
+    disabledReason?: string
 }): JSX.Element {
     const [value, setValue] = useState(description)
     // Keep local state in sync when the annotation reloads (e.g. after a save or AI enrichment).
@@ -1257,6 +1277,7 @@ function DescriptionRow({
                 onChange={setValue}
                 placeholder="Describe what this means…"
                 onPressEnter={() => dirty && onSave(columnName, value)}
+                disabled={!!disabledReason}
             />
             <DescriptionSourceTag source={source} />
             <LemonButton
@@ -1264,7 +1285,7 @@ function DescriptionRow({
                 type="secondary"
                 onClick={() => onSave(columnName, value)}
                 loading={saving}
-                disabledReason={!dirty ? 'No changes to save' : undefined}
+                disabledReason={disabledReason ?? (!dirty ? 'No changes to save' : undefined)}
             >
                 Save
             </LemonButton>
@@ -1274,6 +1295,7 @@ function DescriptionRow({
 
 function DescriptionsSection({ schema }: { schema: ExternalDataSourceSchema }): JSX.Element {
     const tableId = schema.table?.id
+    const { disabledReason: accessDisabledReason } = useSchemaEditorAccess(schema)
 
     if (!tableId) {
         return (
@@ -1286,15 +1308,23 @@ function DescriptionsSection({ schema }: { schema: ExternalDataSourceSchema }): 
         )
     }
 
-    return <DescriptionsSectionContent tableId={tableId} columns={schema.available_columns ?? []} />
+    return (
+        <DescriptionsSectionContent
+            tableId={tableId}
+            columns={schema.available_columns ?? []}
+            disabledReason={accessDisabledReason}
+        />
+    )
 }
 
 function DescriptionsSectionContent({
     tableId,
     columns,
+    disabledReason,
 }: {
     tableId: string
     columns: { name: string; data_type?: string; is_nullable?: boolean }[]
+    disabledReason?: string
 }): JSX.Element {
     const logic = columnAnnotationsLogic({ tableId })
     const { annotationByColumn, annotationsLoading, savingColumn } = useValues(logic)
@@ -1316,6 +1346,7 @@ function DescriptionsSectionContent({
                     source={tableAnnotation?.description_source}
                     saving={savingColumn === ''}
                     onSave={saveDescription}
+                    disabledReason={disabledReason}
                 />
                 {annotationsLoading && columns.length === 0 ? (
                     <LemonSkeleton className="w-full h-8 mt-2" />
@@ -1334,6 +1365,7 @@ function DescriptionsSectionContent({
                                 source={annotation?.description_source}
                                 saving={savingColumn === column.name}
                                 onSave={saveDescription}
+                                disabledReason={disabledReason}
                             />
                         )
                     })

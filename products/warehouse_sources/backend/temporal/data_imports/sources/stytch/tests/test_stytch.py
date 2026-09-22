@@ -99,6 +99,28 @@ class TestValidateCredentials:
         assert validate_credentials("project-live-x", "secret") is False
 
 
+class TestCheckEndpointAccess:
+    @pytest.mark.parametrize(
+        "error_type, expected_reason",
+        [
+            (
+                "invalid_consumer_endpoint",
+                "The users and sessions tables only exist for Stytch consumer projects, and this is a B2B project. Sync the organizations and members tables instead.",
+            ),
+            (
+                "invalid_b2b_endpoint",
+                "The organizations and members tables only exist for Stytch B2B projects, and this is a consumer project. Sync the users and sessions tables instead.",
+            ),
+            ("some_other_denial", "Not available for this Stytch project (some_other_denial)"),
+        ],
+    )
+    @mock.patch(MOCK_PATH)
+    def test_product_line_mismatch_names_the_tables_to_use_instead(self, mock_session, error_type, expected_reason):
+        mock_session.return_value.post.return_value = _response({"error_type": error_type}, 400)
+
+        assert check_endpoint_access("project-live-x", "secret", "/v1/users/search") == expected_reason
+
+
 class TestGetRowsUsers:
     @mock.patch(MOCK_PATH)
     def test_paginates_via_body_cursor_and_saves_state_after_yield(self, mock_session):
@@ -165,6 +187,20 @@ class TestGetRowsUsers:
 
         with pytest.raises(StytchAPIError, match="error_type=invalid_secret_authentication"):
             list(get_rows("project-live-x", "secret", "users", mock.MagicMock(), _make_manager()))
+
+    @mock.patch(MOCK_PATH)
+    def test_search_timeout_is_retried_and_recovers(self, mock_session):
+        # Stytch's own backend search timeout comes back as a 400, not a 5xx, but it's the same
+        # transient condition — it must be retried in-process rather than raised as a hard error.
+        mock_session.return_value.request.side_effect = [
+            _response({"error_type": "search_timeout"}, 400),
+            _response(_search_page("results", [{"user_id": "u1"}], None)),
+        ]
+
+        batches = list(get_rows("project-live-x", "secret", "users", mock.MagicMock(), _make_manager()))
+
+        assert [item["user_id"] for batch in batches for item in batch] == ["u1"]
+        assert mock_session.return_value.request.call_count == 2
 
 
 class TestGetRowsSessions:
