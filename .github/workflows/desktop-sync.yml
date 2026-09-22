@@ -1,7 +1,7 @@
 name: Desktop Fork Sync
 
 # Fork-only (mariusandra/posthog): merges PostHog/posthog master AND the open
-# desktop PR branch into the fork's `desktop` branch daily, with the OpenAI
+# desktop PR branch into the fork's `desktop` branch weekly, with the OpenAI
 # Codex CLI resolving conflicts and merge fallout per
 # .agents/skills/syncing-desktop-fork/SKILL.md. Inert in PostHog/posthog.
 # The fork keeps its own .github/workflows tree: GITHUB_TOKEN deliberately lacks
@@ -12,7 +12,7 @@ name: Desktop Fork Sync
 
 on:
     schedule:
-        - cron: '23 5 * * *'
+        - cron: '23 5 * * 1'
     workflow_dispatch:
 
 concurrency:

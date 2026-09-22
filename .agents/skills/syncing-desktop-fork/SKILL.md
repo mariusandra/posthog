@@ -1,13 +1,13 @@
 ---
 name: syncing-desktop-fork
-description: Merge PostHog/posthog master into the desktop fork branch (mariusandra/posthog, branch `desktop`), resolving conflicts and adapting incoming frontend changes for the desktop app. Use when running the daily desktop fork sync, when the desktop-sync workflow needs conflict resolution, or when asked to sync the desktop branch with upstream master. Trigger terms: desktop sync, fork sync, merge master into desktop, desktop-sync workflow.
+description: Merge PostHog/posthog master into the desktop fork branch (mariusandra/posthog, branch `desktop`), resolving conflicts and adapting incoming frontend changes for the desktop app. Use when running the weekly desktop fork sync, when the desktop-sync workflow needs conflict resolution, or when asked to sync the desktop branch with upstream master. Trigger terms: desktop sync, fork sync, merge master into desktop, desktop-sync workflow.
 ---
 
 # Syncing the desktop fork with upstream master
 
 The PostHog desktop app lives on the `desktop` branch of the fork `mariusandra/posthog` (default branch there).
 It is upstream `PostHog/posthog` master plus the desktop changes (`products/desktop/`, scene-awareness work in `frontend/`).
-The `.github/workflows/desktop-sync.yml` workflow merges into it daily; this skill is the procedure, both for that workflow's automated agent step (OpenAI Codex CLI) and for running a sync by hand.
+The `.github/workflows/desktop-sync.yml` workflow merges into it every Monday at 05:23 UTC; this skill is the procedure, both for that workflow's automated agent step (OpenAI Codex CLI) and for running a sync by hand.
 
 ## The merge
 
