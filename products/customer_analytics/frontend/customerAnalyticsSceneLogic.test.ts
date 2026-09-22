@@ -58,7 +58,7 @@ describe('customerAnalyticsSceneLogic', () => {
             sceneLogic.actions.setScene(
                 Scene.CustomerAnalytics,
                 'customerAnalyticsFeatureRequests',
-                'test-tab',
+                sceneLogic.values.activeTabId!,
                 emptySceneParams
             )
 
@@ -66,7 +66,12 @@ describe('customerAnalyticsSceneLogic', () => {
         })
 
         it('activates the Tasks tab for its scene key', () => {
-            sceneLogic.actions.setScene(Scene.CustomerAnalytics, 'customerAnalyticsTasks', 'test-tab', emptySceneParams)
+            sceneLogic.actions.setScene(
+                Scene.CustomerAnalytics,
+                'customerAnalyticsTasks',
+                sceneLogic.values.activeTabId!,
+                emptySceneParams
+            )
 
             expectLogic(logic).toMatchValues({ activeTab: 'tasks' })
         })
@@ -75,7 +80,7 @@ describe('customerAnalyticsSceneLogic', () => {
             sceneLogic.actions.setScene(
                 Scene.CustomerAnalyticsAccount,
                 'customerAnalyticsAccount',
-                'test-tab',
+                sceneLogic.values.activeTabId!,
                 emptySceneParams
             )
 

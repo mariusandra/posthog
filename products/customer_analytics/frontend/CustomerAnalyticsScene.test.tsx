@@ -55,13 +55,18 @@ describe('CustomerAnalyticsScene', () => {
         initKeaTests()
         featureFlagLogic.mount()
         sceneLogic.mount()
-        customerAnalyticsSceneLogic.mount()
-        sceneLogic.actions.setScene(Scene.CustomerAnalytics, 'customerAnalyticsTasks', 'test-tab', emptySceneParams)
+        customerAnalyticsSceneLogic({ tabId: sceneLogic.values.activeTabId! }).mount()
+        sceneLogic.actions.setScene(
+            Scene.CustomerAnalytics,
+            'customerAnalyticsTasks',
+            sceneLogic.values.activeTabId!,
+            emptySceneParams
+        )
     })
 
     afterEach(() => {
         cleanup()
-        customerAnalyticsSceneLogic.unmount()
+        customerAnalyticsSceneLogic({ tabId: sceneLogic.values.activeTabId! }).unmount()
         sceneLogic.unmount()
         featureFlagLogic.unmount()
     })
@@ -81,7 +86,7 @@ describe('CustomerAnalyticsScene', () => {
         ],
     ])('does not carry task filters across tabs from %s', (scene, path, label, destination) => {
         router.actions.push(path, { status: 'open', archive: 'active', due: 'overdue', assignee: 'me' })
-        sceneLogic.actions.setScene(Scene.CustomerAnalytics, scene, 'test-tab', emptySceneParams)
+        sceneLogic.actions.setScene(Scene.CustomerAnalytics, scene, sceneLogic.values.activeTabId!, emptySceneParams)
         featureFlagLogic.actions.setFeatureFlags(
             [
                 FEATURE_FLAGS.CUSTOMER_ANALYTICS,
@@ -96,7 +101,7 @@ describe('CustomerAnalyticsScene', () => {
         )
         render(
             <Provider>
-                <CustomerAnalyticsScene />
+                <CustomerAnalyticsScene tabId={sceneLogic.values.activeTabId!} />
             </Provider>
         )
         expect(screen.getByText(label).closest('a')).toHaveAttribute('href', `/project/997${destination}`)
@@ -113,7 +118,7 @@ describe('CustomerAnalyticsScene', () => {
 
         const { rerender } = render(
             <Provider>
-                <CustomerAnalyticsScene />
+                <CustomerAnalyticsScene tabId={sceneLogic.values.activeTabId!} />
             </Provider>
         )
 
@@ -125,7 +130,7 @@ describe('CustomerAnalyticsScene', () => {
         })
         rerender(
             <Provider>
-                <CustomerAnalyticsScene />
+                <CustomerAnalyticsScene tabId={sceneLogic.values.activeTabId!} />
             </Provider>
         )
 

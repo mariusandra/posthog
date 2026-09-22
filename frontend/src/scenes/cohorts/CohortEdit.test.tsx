@@ -508,7 +508,7 @@ describe('cohortEditLogic', () => {
         ])(
             'isPendingCalculation=$isPending / isCalculatingOrPending=$isCalcOrPending for %o',
             async ({ version, pending_version, is_calculating, errors_calculating, isPending, isCalcOrPending }) => {
-                logic = cohortEditLogic({ id: 1 })
+                logic = cohortEditLogic({ id: 1, tabId: 'test-tab' })
                 logic.mount()
 
                 await expectLogic(logic, () => {
@@ -763,7 +763,7 @@ describe('cohortEditLogic', () => {
                 })
                 await userEvent.click(q(`[data-attr="${pick}"]`))
 
-                logic = cohortEditLogic({ id: 1 })
+                logic = cohortEditLogic({ id: 1, tabId: 'test-tab' })
                 await waitFor(() => {
                     const group = logic.values.cohort.filters.properties.values[0] as {
                         values: AnyCohortCriteriaType[]
