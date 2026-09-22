@@ -25,6 +25,8 @@ jobs:
         if: github.repository == 'mariusandra/posthog'
         runs-on: ubuntu-24.04
         timeout-minutes: 120
+        env:
+            GOMEMLIMIT: 10GiB
         permissions:
             contents: write
             # to dispatch desktop-release.yml (a GITHUB_TOKEN push can't trigger it)
@@ -93,6 +95,15 @@ jobs:
                       fi
                   done
                   echo "state=$state" >> "$GITHUB_OUTPUT"
+
+            - name: Add memory headroom for frontend typechecking
+              if: steps.merge.outputs.state != 'up-to-date'
+              run: |
+                  sudo fallocate -l 8G /mnt/desktop-sync.swap
+                  sudo chmod 600 /mnt/desktop-sync.swap
+                  sudo mkswap /mnt/desktop-sync.swap
+                  sudo swapon /mnt/desktop-sync.swap
+                  free -h
 
             # Node comes from setup-node inside the composite; skip the pnpm
             # install here when conflicted — manifests may hold conflict markers,

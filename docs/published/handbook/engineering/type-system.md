@@ -15,6 +15,12 @@ PostHog has two type generation systems that keep frontend and backend in sync. 
 
 These are independent systems. Don't conflate them.
 
+### Frontend typechecking in the desktop fork
+
+Run `pnpm --filter=@posthog/frontend typescript:check` after building workspace dependencies with `pnpm exec turbo --filter=@posthog/frontend prepare`.
+The full frontend type graph can exceed a standard GitHub runner's available memory.
+The desktop fork's sync workflow adds 8 GiB of swap and sets `GOMEMLIMIT=10GiB` to give the typechecker more headroom on a standard runner.
+
 ## Backend → Frontend (API responses)
 
 We use [Orval](https://orval.dev/) to generate TypeScript types and API client functions from our OpenAPI schema.
