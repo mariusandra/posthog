@@ -41,11 +41,16 @@ function getPersistedFeatureFlags(appContext: AppContext | undefined = getAppCon
     // experiment arm) — those values ride this always-merged baseline and survive the
     // empty `onFeatureFlags` callback that posthog-js fires on load.
     if (!Array.isArray(persistedFeatureFlags)) {
-        return { ...persistedFeatureFlags, [FEATURE_FLAGS.SIMPLE_SIDEPANEL]: true }
+        return {
+            ...persistedFeatureFlags,
+            [FEATURE_FLAGS.SIMPLE_SIDEPANEL]: true,
+            [FEATURE_FLAGS.POSTHOG_TERMINAL]: true,
+        }
     }
     return {
         ...Object.fromEntries(persistedFeatureFlags.map((f) => [f, true])),
         [FEATURE_FLAGS.SIMPLE_SIDEPANEL]: true,
+        [FEATURE_FLAGS.POSTHOG_TERMINAL]: true,
     }
 }
 
@@ -61,6 +66,7 @@ function spyOnFeatureFlags(featureFlags: FeatureFlagsSet): FeatureFlagsSet {
             : persistedFlags
 
     availableFlags[FEATURE_FLAGS.SIMPLE_SIDEPANEL] = true
+    availableFlags[FEATURE_FLAGS.POSTHOG_TERMINAL] = true
 
     const serialized = JSON.stringify(availableFlags)
     if (serialized === cachedFlagsSerialized && cachedFlagsProxy) {
@@ -146,9 +152,17 @@ export const featureFlagLogic = kea<featureFlagLogicType>([
         ],
     }),
     afterMount(({ actions, values }) => {
-        if (!values.featureFlags[FEATURE_FLAGS.SIMPLE_SIDEPANEL]) {
+        if (
+            !values.featureFlags[FEATURE_FLAGS.SIMPLE_SIDEPANEL] ||
+            !values.featureFlags[FEATURE_FLAGS.POSTHOG_TERMINAL]
+        ) {
             actions.setFeatureFlags([], values.featureFlags)
         }
         posthog.onFeatureFlags(actions.setFeatureFlags)
+        if (posthog.config?.advanced_disable_flags) {
+            // posthog-js never calls back when flags are off, and the app holds its first render
+            // until this arrives. A page with no project key has no flags to wait for.
+            actions.setFeatureFlags([], {})
+        }
     }),
 ])

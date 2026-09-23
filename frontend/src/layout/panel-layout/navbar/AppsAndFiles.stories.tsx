@@ -15,6 +15,9 @@ import { navAppsTabLogic } from './tabs/navAppsTabLogic'
 import { navRecentsLogic } from './tabs/navRecentsLogic'
 
 const files: FileSystemEntry[] = [
+    { id: 'users-folder', path: 'Users', type: 'folder' },
+    { id: 'home-folder', path: 'Users/Alex Example', type: 'folder' },
+    { id: 'other-home-folder', path: 'Users/Alex Example (1)', type: 'folder' },
     { id: 'folder-1', path: 'Getting started', type: 'folder' },
     { id: 'dashboard-1', path: 'Getting started/Overview', type: 'dashboard', ref: '1', href: '/dashboard/1' },
     {
@@ -25,6 +28,7 @@ const files: FileSystemEntry[] = [
         href: '/insights/signup01',
     },
     { id: 'folder-2', path: 'Product research', type: 'folder' },
+    { id: 'folder-3', path: 'Product research/Ideas', type: 'folder' },
     {
         id: 'notebook-1',
         path: 'Product research/Onboarding notes',
@@ -35,9 +39,11 @@ const files: FileSystemEntry[] = [
     { id: 'flag-1', path: 'New checkout', type: 'feature_flag', ref: '1', href: '/feature_flags/1' },
 ]
 const starred: FileSystemEntry[] = [
+    { id: 'star-home', path: 'Alex Example', type: 'folder', ref: 'Users/Alex Example' },
     { id: 'star-1', path: 'Product analytics', type: 'product_analytics', href: '/insights' },
     { id: 'star-2', path: 'Overview', type: 'dashboard', ref: '1', href: '/dashboard/1' },
     { id: 'star-3', path: 'Product research', type: 'folder', ref: 'Product research' },
+    { id: 'star-4', path: 'Ideas', type: 'folder', ref: 'Product research/Ideas' },
 ]
 
 function SidebarStory({
@@ -104,6 +110,10 @@ const meta: Meta<typeof SidebarStory> = {
                 '/api/environments/:team_id/file_system_shortcut/': [200, { results: starred }],
             },
             post: {
+                '/api/projects/:team_id/file_system/home_folder/': [
+                    200,
+                    { id: 'home-folder', path: 'Users/Alex Example' },
+                ],
                 '/api/environments/:team_id/file_system_shortcut/': async ({ request: req }) => [
                     201,
                     { ...((await req.json()) as object), id: 'star-new' },

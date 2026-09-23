@@ -18,6 +18,7 @@ import { getExperimentStatus, isExperimentPaused } from 'products/experiments/fr
 import { experimentLogic } from '../experimentLogic'
 import type { ExperimentSceneLogicProps } from '../experimentSceneLogic'
 import { modalsLogic } from '../modalsLogic'
+import { ConclusionComment } from './ConclusionComment'
 import { ExperimentDuration } from './ExperimentDuration'
 import { ExperimentReloadActionContainer } from './ExperimentReloadActionContainer'
 import { flagCleanupTaskLogic } from './flagCleanupTaskLogic'
@@ -255,9 +256,7 @@ export function Info({ tabId }: Pick<ExperimentSceneLogicProps, 'tabId'>): JSX.E
                             {CONCLUSION_DISPLAY_CONFIG[experiment.conclusion]?.title || experiment.conclusion}
                         </span>
                     </div>
-                    <p className="metric-cell font-normal m-0 mt-1 leading-relaxed whitespace-pre-wrap break-words">
-                        {experiment.conclusion_comment}
-                    </p>
+                    <ConclusionComment comment={experiment.conclusion_comment} />
                 </LemonCard>
             )}
         </>

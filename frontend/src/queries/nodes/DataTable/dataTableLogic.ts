@@ -50,6 +50,7 @@ import type {
     TraceSpansAttributeBreakdownQueryResponse,
     TraceSpansQueryResponse,
 } from '../../schema/schema-general'
+import type { TraceSpansTreeQueryResponse } from '../../schema/schema-general'
 import { getColumnsForQuery, removeExpressionComment } from './utils'
 
 export interface DataTableLogicProps {
@@ -89,6 +90,7 @@ export interface dataTableLogicValues {
         | TraceSpansAggregationQueryResponse
         | TraceSpansAttributeBreakdownQueryResponse
         | TraceSpansQueryResponse
+        | TraceSpansTreeQueryResponse
         | null // dataNodeLogic
     responseError: string | null // dataNodeLogic
     responseLoading: boolean // dataNodeLogic
@@ -157,6 +159,7 @@ export interface dataTableLogicMeta {
                 | TraceSpansAggregationQueryResponse
                 | TraceSpansAttributeBreakdownQueryResponse
                 | TraceSpansQueryResponse
+                | TraceSpansTreeQueryResponse
                 | null
         ) => string[] | null
         dataTableRows: (
@@ -176,6 +179,7 @@ export interface dataTableLogicMeta {
                 | TraceSpansAggregationQueryResponse
                 | TraceSpansAttributeBreakdownQueryResponse
                 | TraceSpansQueryResponse
+                | TraceSpansTreeQueryResponse
                 | null,
             columnsInResponse: string[] | null,
             arg: any,

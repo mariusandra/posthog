@@ -22,7 +22,7 @@ export function InsightScene({ tabId }: InsightSceneProps = {}): JSX.Element {
     if (!tabId) {
         throw new Error('<InsightScene /> must receive a tabId prop')
     }
-    const { insightId, insight, insightLogicRef, insightMode, dashboardId } = useValues(insightSceneLogic({ tabId }))
+    const { insightId, insight, insightLoading, insightMode, dashboardId } = useValues(insightSceneLogic({ tabId }))
 
     useAttachedContext(
         insight?.short_id && insight?.query
@@ -53,7 +53,7 @@ export function InsightScene({ tabId }: InsightSceneProps = {}): JSX.Element {
         return <InsightAsScene insightId={insightId} tabId={tabId} attachTo={insightSceneLogic({ tabId })} />
     }
 
-    if (insightLogicRef?.logic?.values?.insightLoading) {
+    if (insightLoading) {
         return <InsightSkeleton />
     }
 

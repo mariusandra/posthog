@@ -32,6 +32,7 @@ import type {
     TraceSpansAttributeBreakdownQueryResponse,
     TraceSpansQueryResponse,
 } from '../../../frontend/src/queries/schema/schema-general'
+import type { TraceSpansTreeQueryResponse } from '../../../frontend/src/queries/schema/schema-general'
 import { type TraceGitMetadata, aiObservabilityTraceLogic } from './aiObservabilityTraceLogic'
 import { llmPersonsLazyLoaderLogic } from './llmPersonsLazyLoaderLogic'
 import { captureNormalizationFailure, normalizeMessages } from './messageNormalization'
@@ -325,6 +326,7 @@ export interface aiObservabilityTraceDataLogicValues {
         | TraceSpansAggregationQueryResponse
         | TraceSpansAttributeBreakdownQueryResponse
         | TraceSpansQueryResponse
+        | TraceSpansTreeQueryResponse
         | null // dataNodeLogic
     responseError: string | null // dataNodeLogic
     responseLoading: boolean // dataNodeLogic
@@ -391,6 +393,7 @@ export interface aiObservabilityTraceDataLogicMeta {
                 | TraceSpansAggregationQueryResponse
                 | TraceSpansAttributeBreakdownQueryResponse
                 | TraceSpansQueryResponse
+                | TraceSpansTreeQueryResponse
                 | null
         ) => LLMTrace | undefined
         showableEvents: (trace: LLMTrace | undefined) => LLMTraceEvent[]

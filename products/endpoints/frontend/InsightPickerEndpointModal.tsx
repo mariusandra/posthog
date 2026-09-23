@@ -14,7 +14,7 @@ import { urls } from 'scenes/urls'
 
 import { EndpointQueryNode, HogQLQuery, NodeKind } from '~/queries/schema/schema-general'
 import { isNodeWithSource } from '~/queries/utils'
-import { InsightType, QueryBasedInsightModel } from '~/types'
+import { InsightType, InsightModel } from '~/types'
 
 import { EndpointFromInsightModal } from './EndpointFromInsightModal'
 import { endpointLogic } from './endpointLogic'
@@ -36,7 +36,7 @@ const UNSUPPORTED_QUERY_KINDS = new Set([
     NodeKind.StickinessQuery,
 ])
 
-function isInsightSupported(insight: QueryBasedInsightModel): boolean {
+function isInsightSupported(insight: InsightModel): boolean {
     const query = insight.query
     if (!query) {
         return true
@@ -146,7 +146,7 @@ export function InsightPickerEndpointModal({ tabId }: InsightPickerEndpointModal
                                 Create an endpoint from an existing insight
                             </div>
                             <SavedInsightsTable
-                                onToggle={(insight: QueryBasedInsightModel) => {
+                                onToggle={(insight: InsightModel) => {
                                     selectInsight(insight)
                                     openCreateFromInsightModal()
                                 }}
