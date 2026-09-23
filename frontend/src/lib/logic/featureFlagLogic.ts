@@ -1,7 +1,7 @@
 import { MakeLogicType, actions, afterMount, kea, path, reducers } from 'kea'
 import posthog from 'posthog-js'
 
-import { FeatureFlagKey } from 'lib/constants'
+import { FEATURE_FLAGS, FeatureFlagKey } from 'lib/constants'
 import { getAppContext } from 'lib/utils/getAppContext'
 
 import { AppContext, PreflightStatus } from '~/types'
@@ -41,9 +41,12 @@ function getPersistedFeatureFlags(appContext: AppContext | undefined = getAppCon
     // experiment arm) — those values ride this always-merged baseline and survive the
     // empty `onFeatureFlags` callback that posthog-js fires on load.
     if (!Array.isArray(persistedFeatureFlags)) {
-        return { ...persistedFeatureFlags }
+        return { ...persistedFeatureFlags, [FEATURE_FLAGS.SIMPLE_SIDEPANEL]: true }
     }
-    return Object.fromEntries(persistedFeatureFlags.map((f) => [f, true]))
+    return {
+        ...Object.fromEntries(persistedFeatureFlags.map((f) => [f, true])),
+        [FEATURE_FLAGS.SIMPLE_SIDEPANEL]: true,
+    }
 }
 
 let cachedFlagsSerialized: string | null = null
@@ -56,6 +59,8 @@ function spyOnFeatureFlags(featureFlags: FeatureFlagsSet): FeatureFlagsSet {
         areClientFeatureFlagsHonored(appContext?.preflight ?? null) || process.env.NODE_ENV === 'test'
             ? { ...persistedFlags, ...featureFlags }
             : persistedFlags
+
+    availableFlags[FEATURE_FLAGS.SIMPLE_SIDEPANEL] = true
 
     const serialized = JSON.stringify(availableFlags)
     if (serialized === cachedFlagsSerialized && cachedFlagsProxy) {
@@ -140,7 +145,10 @@ export const featureFlagLogic = kea<featureFlagLogicType>([
             },
         ],
     }),
-    afterMount(({ actions }) => {
+    afterMount(({ actions, values }) => {
+        if (!values.featureFlags[FEATURE_FLAGS.SIMPLE_SIDEPANEL]) {
+            actions.setFeatureFlags([], values.featureFlags)
+        }
         posthog.onFeatureFlags(actions.setFeatureFlags)
     }),
 ])

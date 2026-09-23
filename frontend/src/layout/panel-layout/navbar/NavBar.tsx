@@ -2,35 +2,30 @@ import './NavBar.scss'
 
 import { Tabs } from '@base-ui/react/tabs'
 import { cva } from 'cva'
-import { useActions, useMountedLogic, useValues } from 'kea'
+import { useActions, useValues } from 'kea'
 import { router } from 'kea-router'
 import posthog from 'posthog-js'
 import { Suspense, useEffect, useRef } from 'react'
 
-import { IconApps, IconChat, IconChevronRight, IconFolderOpen, IconPlusSmall, IconTerminal } from '@posthog/icons'
+import { IconApps, IconChat, IconChevronRight, IconFolderOpen, IconTerminal } from '@posthog/icons'
 
 import { NewAccountMenu } from 'lib/components/Account/NewAccountMenu'
 import { commandLogic } from 'lib/components/Command/commandLogic'
-import { KeyboardShortcut } from 'lib/components/KeyboardShortcut/KeyboardShortcut'
 import { Resizer } from 'lib/components/Resizer/Resizer'
 import { ResizerLogicProps, resizerLogic } from 'lib/components/Resizer/resizerLogic'
 import { keyBinds } from 'lib/components/Shortcuts/shortcuts'
 import { useShortcut } from 'lib/components/Shortcuts/useShortcut'
 import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
-import { LemonButton } from 'lib/lemon-ui/LemonButton'
 import { ButtonPrimitive } from 'lib/ui/Button/ButtonPrimitives'
 import { Collapsible } from 'lib/ui/Collapsible/Collapsible'
-import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from 'lib/ui/DropdownMenu/DropdownMenu'
 import { Label } from 'lib/ui/Label/Label'
 import { WrappingLoadingSkeleton } from 'lib/ui/WrappingLoadingSkeleton/WrappingLoadingSkeleton'
 import { cn } from 'lib/utils/css-classes'
 import { isDesktopApp, isDesktopAppMac } from 'lib/utils/isDesktopApp'
 import { lazyWithRetry } from 'lib/utils/retryImport'
-import { newDashboardLogic } from 'scenes/dashboard/newDashboardLogic'
 import { urls } from 'scenes/urls'
 
 import {
-    DESKTOP_PANEL_NAVBAR_DEFAULT_WIDTH,
     NavExperimentTab,
     PANEL_NAVBAR_COLLAPSE_THRESHOLD,
     PANEL_NAVBAR_DEFAULT_WIDTH,
@@ -41,7 +36,6 @@ import { uiCustomizationLogic } from '~/layout/uiCustomizationLogic'
 
 import { NavSearchBar, NavSearchButton } from '../../../lib/components/NavSearchButton/NavSearchButton'
 import { navigation3000Logic } from '../../navigation-3000/navigationLogic'
-import { CreateMenu } from '../menus/CreateMenu'
 import { NavBarFooter } from './NavBarFooter'
 import { PanelLayoutPanels } from './PanelLayoutPanels'
 import { FlatNavBrowse } from './tabs/flat-nav/FlatNavBrowse'
@@ -108,25 +102,17 @@ export function PanelIndicatorIcon(): JSX.Element | null {
     )
 }
 
-const WEB_TAB_CONFIG: { id: NavExperimentTab; label: string; icon: JSX.Element }[] = [
+// The Apps tab keeps the persisted tab ID and analytics identifiers used by Browse.
+const SIMPLE_TAB_CONFIG: { id: NavExperimentTab; label: string; icon: JSX.Element }[] = [
+    { id: 'home', label: 'Apps', icon: <IconApps /> },
+    { id: 'files', label: 'Files', icon: <IconFolderOpen /> },
+    { id: 'chat', label: 'Chat', icon: <IconChat className="text-ai" /> },
+]
+
+const TAB_CONFIG: { id: NavExperimentTab; label: string; icon: JSX.Element }[] = [
     { id: 'home', label: 'Browse', icon: <IconApps /> },
     { id: 'chat', label: 'Chat', icon: <IconChat className="text-ai" /> },
 ]
-
-// The desktop app (products/desktop) restructures the sidepanel into Apps / Files / Chat / Code
-const DESKTOP_TAB_CONFIG: { id: NavExperimentTab; label: string; icon: JSX.Element }[] = [
-    { id: 'apps', label: 'Apps', icon: <IconApps /> },
-    { id: 'files', label: 'Files', icon: <IconFolderOpen /> },
-    { id: 'chat', label: 'Chat', icon: <IconChat className="text-ai" /> },
-    { id: 'code', label: 'Code', icon: <IconTerminal /> },
-]
-
-// Keeps newDashboardLogic mounted while the Create button is visible, so the "Start from scratch"
-// flow completes (and redirects) even after the menu closes and unmounts its own logic reference.
-function CreateMenuLogics(): null {
-    useMountedLogic(newDashboardLogic)
-    return null
-}
 
 export function NavBar(): JSX.Element {
     const containerRef = useRef<HTMLDivElement | null>(null)
@@ -137,10 +123,12 @@ export function NavBar(): JSX.Element {
         showLayoutPanel,
         clearActivePanelIdentifier,
         setNavbarWidth,
+        setNavOverlayOpen,
     } = useActions(panelLayoutLogic)
     const {
         isLayoutPanelVisible,
-        isLayoutNavCollapsed,
+        isLayoutNavCollapsed: isNavCollapsed,
+        isNavOverlayOpen,
         navExperimentActiveTab,
         activePanelIdentifier,
         visitedNavTabs,
@@ -148,7 +136,21 @@ export function NavBar(): JSX.Element {
     const { mobileLayout: isMobileLayout } = useValues(navigation3000Logic)
     const { toggleCommand } = useActions(commandLogic)
     const { sidebarDensity } = useValues(uiCustomizationLogic)
+    const isSimpleSidepanelEnabled = useFeatureFlag('SIMPLE_SIDEPANEL')
+    const visibleTabs = isSimpleSidepanelEnabled ? SIMPLE_TAB_CONFIG : TAB_CONFIG
+    const tabs = isDesktopApp()
+        ? [...visibleTabs, { id: 'code' as const, label: 'Code', icon: <IconTerminal /> }]
+        : visibleTabs
+    const isOverlayOpen = isSimpleSidepanelEnabled && isNavCollapsed && isNavOverlayOpen
+    const isLayoutNavCollapsed = isNavCollapsed && !isOverlayOpen
     const isFlatNavEnabled = useFeatureFlag('FLAT_NAV', 'test')
+    const activeTab =
+        !isSimpleSidepanelEnabled &&
+        (navExperimentActiveTab === 'files' || (isLayoutNavCollapsed && navExperimentActiveTab === 'chat'))
+            ? 'home'
+            : navExperimentActiveTab === 'apps'
+              ? 'home'
+              : navExperimentActiveTab
 
     const resizerLogicProps: ResizerLogicProps = {
         logicKey: 'panel-layout-navbar',
@@ -163,26 +165,13 @@ export function NavBar(): JSX.Element {
 
     // Grow to any width upward; never render narrower than the collapse snap so the live drag
     // stays in sync with where onToggleClosed flips to collapsed mode.
-    const defaultNavbarWidth = isDesktopApp() ? DESKTOP_PANEL_NAVBAR_DEFAULT_WIDTH : PANEL_NAVBAR_DEFAULT_WIDTH
-    const openWidth = Math.max(Math.round(desiredSize ?? defaultNavbarWidth), PANEL_NAVBAR_COLLAPSE_THRESHOLD)
+    const openWidth = Math.max(Math.round(desiredSize ?? PANEL_NAVBAR_DEFAULT_WIDTH), PANEL_NAVBAR_COLLAPSE_THRESHOLD)
 
     useEffect(() => {
-        if (!isLayoutNavCollapsed && !isMobileLayout) {
+        if (!isNavCollapsed && !isMobileLayout) {
             setNavbarWidth(openWidth)
         }
-    }, [openWidth, isLayoutNavCollapsed, isMobileLayout, setNavbarWidth])
-
-    // macOS desktop app: the title bar is hidden, so a full-width strip at the very top
-    // reserves room for the traffic lights (and doubles as the window drag region)
-    const trafficLightsSpace = isDesktopAppMac()
-
-    const visibleTabs = isDesktopApp() ? DESKTOP_TAB_CONFIG : WEB_TAB_CONFIG
-    // Persisted tab values from the other platform's tab set fall back to the first tab
-    const activeTab = visibleTabs.some((tab) => tab.id === navExperimentActiveTab)
-        ? navExperimentActiveTab
-        : visibleTabs[0].id
-    // Four tabs with icons + labels need ~300px; below that, drop the labels
-    const iconOnlyTabs = visibleTabs.length === 4 && openWidth < 300
+    }, [openWidth, isNavCollapsed, isMobileLayout, setNavbarWidth])
 
     useShortcut({
         name: 'ToggleLeftNav',
@@ -202,102 +191,28 @@ export function NavBar(): JSX.Element {
         }
     }
 
-    // The search (and collapsed-mode chat) row. On the web it's the 40px navbar header at the
-    // very top; in the desktop app it renders compact, below the Browse/Chat/Code tab strip.
-    const headerRow = (
-        <div
-            className={cn(
-                'flex justify-between items-center',
-                isLayoutNavCollapsed
-                    ? 'justify-center'
-                    : !isDesktopApp()
-                      ? 'h-[var(--scene-layout-header-height)]'
-                      : undefined
-            )}
-        >
-            <div
-                className={cn('flex gap-1 rounded-md w-full px-2', isDesktopApp() ? 'py-1' : 'pt-2 pb-1', {
-                    'flex-col items-center pt-2 pb-0': isLayoutNavCollapsed,
-                })}
-            >
-                {/* Desktop app: the org/project switcher moves to the NavBarFooter (below
-                    "More"), leaving only the traffic lights, tabs, and search up here */}
-                {!isDesktopApp() && <NewAccountMenu isLayoutNavCollapsed={isLayoutNavCollapsed} />}
-
-                {isLayoutNavCollapsed && <NavSearchButton toggleCommand={toggleCommand} />}
-
-                {isLayoutNavCollapsed && (
-                    <ButtonPrimitive
-                        className="group w-full justify-center"
-                        data-attr="nav-tab-chat-collapsed"
-                        iconOnly
-                        tooltip="Chat"
-                        tooltipPlacement="right"
-                        active={activePanelIdentifier === 'Chat'}
-                        onClick={() => {
-                            const isOpening = activePanelIdentifier !== 'Chat'
-                            posthog.capture('nav chat panel toggled', {
-                                is_open: isOpening,
-                            })
-                            handlePanelTriggerClick('Chat')
-                            if (isOpening) {
-                                router.actions.push(urls.ai())
-                            }
-                        }}
-                    >
-                        <span
-                            className={cn(
-                                'relative flex size-4 text-secondary group-hover:text-primary opacity-50 group-hover:opacity-100 transition-all duration-50',
-                                activePanelIdentifier === 'Chat' && 'text-primary opacity-100'
-                            )}
-                        >
-                            <IconChat
-                                className={cn(
-                                    'text-secondary group-hover:text-ai',
-                                    activePanelIdentifier === 'Chat' && 'text-primary'
-                                )}
-                            />
-
-                            <PanelIndicatorIcon />
-                        </span>
-                    </ButtonPrimitive>
-                )}
-            </div>
-        </div>
-    )
-
-    const createButton = isDesktopApp() ? (
-        <div className={cn('px-2 py-1', isLayoutNavCollapsed && 'flex justify-center px-0')}>
-            <CreateMenuLogics />
-            <DropdownMenu
-                onOpenChange={(open) => {
-                    if (open) {
-                        posthog.capture('nav create button clicked')
-                    }
-                }}
-            >
-                <DropdownMenuTrigger asChild>
-                    <LemonButton
-                        type="secondary"
-                        size="small"
-                        icon={<IconPlusSmall />}
-                        fullWidth={!isLayoutNavCollapsed}
-                        center={!isLayoutNavCollapsed}
-                        title={isLayoutNavCollapsed ? 'Create' : undefined}
-                        data-attr="nav-create-button"
-                    >
-                        {!isLayoutNavCollapsed ? 'Create' : null}
-                    </LemonButton>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent side="bottom" align="start" className="min-w-[220px]">
-                    <CreateMenu />
-                </DropdownMenuContent>
-            </DropdownMenu>
-        </div>
-    ) : null
+    function openCollapsedTab(tab: NavExperimentTab): void {
+        if (isSimpleSidepanelEnabled && isNavCollapsed) {
+            if (tab === 'chat') {
+                toggleLayoutNavCollapsed(false)
+            } else {
+                setNavOverlayOpen(true)
+            }
+        }
+    }
 
     return (
-        <div className="flex gap-0 relative">
+        <div className={cn('flex gap-0 relative', isOverlayOpen && 'w-[var(--project-navbar-width-collapsed)]')}>
+            {isOverlayOpen && (
+                <button
+                    type="button"
+                    className="fixed inset-0 z-[var(--z-layout-navbar)] cursor-default"
+                    aria-label="Close navigation"
+                    data-attr="nav-overlay-dismiss"
+                    tabIndex={-1}
+                    onClick={() => setNavOverlayOpen(false)}
+                />
+            )}
             <nav
                 className={cn(
                     navBarStyles({
@@ -305,84 +220,133 @@ export function NavBar(): JSX.Element {
                         isMobileLayout,
                     }),
                     isLayoutNavCollapsed && 'gap-px',
-                    // Desktop app: product icons in the sidepanel keep their brand colors (the web
-                    // app's flyout panels opt in per-panel via PanelLayoutPanel instead)
-                    isDesktopApp() && 'group/colorful-product-icons colorful-product-icons-true'
+                    isSimpleSidepanelEnabled && '@container/sidebar',
+                    isOverlayOpen && 'absolute top-0 left-0 shadow-lg border-r'
                 )}
                 data-nav-density={sidebarDensity}
+                data-nav-overlay={isOverlayOpen || undefined}
+                onKeyDown={(event) => {
+                    if (isOverlayOpen && event.key === 'Escape' && !event.defaultPrevented) {
+                        event.stopPropagation()
+                        setNavOverlayOpen(false)
+                        containerRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus()
+                    }
+                }}
                 ref={containerRef}
             >
-                {trafficLightsSpace && (
-                    <div className="desktop-traffic-lights-spacer h-7 w-full shrink-0 flex items-center justify-end pr-1">
-                        {/* Compact search in the title-bar strip, next to the traffic lights.
-                            Collapsed mode keeps the icon button in the nav column instead. */}
-                        {!isLayoutNavCollapsed && (
-                            <ButtonPrimitive
-                                size="xs"
-                                onClick={() => toggleCommand('nav-search-button')}
-                                tooltip={
-                                    <>
-                                        Search <KeyboardShortcut command k />
-                                    </>
-                                }
-                                tooltipPlacement="bottom"
-                                className="relative top-1 h-5 px-1.5 text-xs text-secondary hover:text-primary"
-                                data-attr="desktop-titlebar-search"
-                            >
-                                Search
-                            </ButtonPrimitive>
+                {isDesktopAppMac() && <div className="desktop-traffic-lights-spacer h-7 w-full shrink-0" />}
+                <div
+                    className={cn(
+                        'flex justify-between items-center',
+                        isLayoutNavCollapsed ? 'justify-center' : 'h-[var(--scene-layout-header-height)]'
+                    )}
+                >
+                    <div
+                        className={cn('flex gap-1 rounded-md w-full px-2 pt-2 pb-1', {
+                            'items-center': isSimpleSidepanelEnabled,
+                            'flex-col items-center pt-2 pb-0': isLayoutNavCollapsed,
+                        })}
+                    >
+                        <NewAccountMenu isLayoutNavCollapsed={isLayoutNavCollapsed} />
+
+                        {isSimpleSidepanelEnabled ? (
+                            <NavSearchButton toggleCommand={toggleCommand} showShortcut={!isLayoutNavCollapsed} />
+                        ) : (
+                            <>
+                                {/* Collapsed nav has no room for the search bar, so it keeps the icon-only trigger */}
+                                {isLayoutNavCollapsed && <NavSearchButton toggleCommand={toggleCommand} />}
+
+                                {isLayoutNavCollapsed && (
+                                    <ButtonPrimitive
+                                        className="group w-full justify-center"
+                                        data-attr="nav-tab-chat-collapsed"
+                                        iconOnly
+                                        tooltip="Chat"
+                                        tooltipPlacement="right"
+                                        active={activePanelIdentifier === 'Chat'}
+                                        onClick={() => {
+                                            const isOpening = activePanelIdentifier !== 'Chat'
+                                            posthog.capture('nav chat panel toggled', {
+                                                is_open: isOpening,
+                                            })
+                                            handlePanelTriggerClick('Chat')
+                                            if (isOpening) {
+                                                router.actions.push(urls.ai())
+                                            }
+                                        }}
+                                    >
+                                        <span
+                                            className={cn(
+                                                'relative flex size-4 text-secondary group-hover:text-primary opacity-50 group-hover:opacity-100 transition-all duration-50',
+                                                activePanelIdentifier === 'Chat' && 'text-primary opacity-100'
+                                            )}
+                                        >
+                                            <IconChat
+                                                className={cn(
+                                                    'text-secondary group-hover:text-ai',
+                                                    activePanelIdentifier === 'Chat' && 'text-primary'
+                                                )}
+                                            />
+
+                                            <PanelIndicatorIcon />
+                                        </span>
+                                    </ButtonPrimitive>
+                                )}
+                            </>
                         )}
                     </div>
-                )}
-                {/* Web: search header at the very top. Desktop app: the Browse/Chat/Code tab
-                    strip comes first (right below the traffic lights), then the search row —
-                    both render inside Tabs.Root below. */}
-                {!isDesktopApp() && (
-                    <>
-                        {headerRow}
-                        {!isLayoutNavCollapsed && (
-                            <div className="px-2 py-1">
-                                <NavSearchBar toggleCommand={toggleCommand} />
-                            </div>
-                        )}
-                        {createButton}
-                    </>
+                </div>
+
+                {!isSimpleSidepanelEnabled && !isLayoutNavCollapsed && (
+                    <div className="px-2 py-1">
+                        <NavSearchBar toggleCommand={toggleCommand} />
+                    </div>
                 )}
 
                 <Tabs.Root
                     className="z-[var(--z-main-nav)] flex flex-col flex-1 overflow-hidden"
-                    value={isLayoutNavCollapsed && activeTab !== 'home' ? 'home' : activeTab}
+                    value={activeTab}
                     onValueChange={(value) => {
                         posthog.capture('nav tab clicked', { tab: value })
                         setNavExperimentTab(value as NavExperimentTab)
-                        // In the desktop app, switching the sidepanel tab must not replace the
-                        // current scene tab's content — the panels are self-sufficient
+                        openCollapsedTab(value as NavExperimentTab)
+                        if (isSimpleSidepanelEnabled) {
+                            clearActivePanelIdentifier()
+                            showLayoutPanel(false)
+                        }
                         if (value === 'chat' && !isDesktopApp()) {
                             router.actions.push(urls.ai())
                         }
                     }}
                     orientation={isLayoutNavCollapsed ? 'vertical' : 'horizontal'}
                 >
-                    <div className={cn('p-1', isLayoutNavCollapsed && 'hidden')}>
-                        <Tabs.List className="relative flex items-center gap-1 shrink-0 z-0 p-1 rounded-lg bg-(--color-bg-fill-highlight-50) dark:bg-surface-primary">
-                            {visibleTabs.map((tab) => (
+                    <div className={cn('p-1', !isSimpleSidepanelEnabled && isLayoutNavCollapsed && 'hidden')}>
+                        <Tabs.List
+                            className={cn(
+                                'relative flex items-center gap-1 shrink-0 z-0 p-1 rounded-lg bg-(--color-bg-fill-highlight-50) dark:bg-surface-primary',
+                                isSimpleSidepanelEnabled && isLayoutNavCollapsed && 'flex-col'
+                            )}
+                        >
+                            {tabs.map((tab) => (
                                 <Tabs.Tab
                                     key={tab.id}
                                     value={tab.id}
+                                    onClick={() => openCollapsedTab(tab.id)}
                                     render={(props) => (
                                         <ButtonPrimitive
                                             {...props}
                                             className={cn(
                                                 'group data-[composite-item-active]:bg-surface-tertiary justify-center',
-                                                visibleTabs.length === 4
-                                                    ? 'w-1/4'
-                                                    : visibleTabs.length === 3
-                                                      ? 'w-1/3'
-                                                      : 'w-1/2'
+                                                isSimpleSidepanelEnabled ? 'flex-1 min-w-0' : 'w-1/2'
                                             )}
-                                            data-attr={`nav-tab-${tab.id}`}
-                                            tooltip={iconOnlyTabs ? tab.label : undefined}
-                                            tooltipPlacement="bottom"
+                                            iconOnly={isSimpleSidepanelEnabled && isLayoutNavCollapsed}
+                                            tooltip={isSimpleSidepanelEnabled ? tab.label : undefined}
+                                            aria-label={tab.label}
+                                            data-attr={
+                                                isSimpleSidepanelEnabled && isLayoutNavCollapsed && tab.id === 'chat'
+                                                    ? 'nav-tab-chat-collapsed'
+                                                    : `nav-tab-${tab.id}`
+                                            }
                                         >
                                             <span
                                                 className={cn(
@@ -394,10 +358,14 @@ export function NavBar(): JSX.Element {
                                             >
                                                 {tab.icon}
                                             </span>
-                                            {!iconOnlyTabs && (
+                                            {!isLayoutNavCollapsed && (
                                                 <span
                                                     className={cn(
                                                         'text-xs',
+                                                        isSimpleSidepanelEnabled &&
+                                                            (isDesktopApp()
+                                                                ? '@max-[280px]/sidebar:hidden'
+                                                                : '@max-[200px]/sidebar:hidden'),
                                                         activeTab === tab.id
                                                             ? 'text-primary'
                                                             : 'text-secondary group-hover:text-primary'
@@ -413,30 +381,22 @@ export function NavBar(): JSX.Element {
                         </Tabs.List>
                     </div>
 
-                    {isDesktopApp() && (
-                        <>
-                            {/* Expanded desktop nav gets its search from the title-bar strip up
-                                top; the header row only remains for the collapsed icon column */}
-                            {isLayoutNavCollapsed && headerRow}
-                            {createButton}
-                        </>
-                    )}
-
-                    <div className="flex-1 overflow-hidden relative">
-                        <Tabs.Panel value="home" className="absolute inset-0 flex flex-col" keepMounted tabIndex={-1}>
-                            {isFlatNavEnabled ? <FlatNavBrowse /> : <NavTabBrowse />}
-                        </Tabs.Panel>
-                        {isDesktopApp() && (
-                            <Tabs.Panel
-                                value="apps"
-                                className="absolute inset-0 flex flex-col"
-                                keepMounted
-                                tabIndex={-1}
-                            >
-                                <NavTabApps />
-                            </Tabs.Panel>
+                    <div
+                        className={cn(
+                            'flex-1 overflow-hidden relative',
+                            isSimpleSidepanelEnabled && isLayoutNavCollapsed && '[&>*]:hidden'
                         )}
-                        {isDesktopApp() && visitedNavTabs.includes('files') && (
+                    >
+                        <Tabs.Panel value="home" className="absolute inset-0 flex flex-col" keepMounted tabIndex={-1}>
+                            {isSimpleSidepanelEnabled ? (
+                                <NavTabApps />
+                            ) : isFlatNavEnabled ? (
+                                <FlatNavBrowse />
+                            ) : (
+                                <NavTabBrowse />
+                            )}
+                        </Tabs.Panel>
+                        {isSimpleSidepanelEnabled && visitedNavTabs.includes('files') && (
                             <Tabs.Panel
                                 value="files"
                                 className="absolute inset-0 flex flex-col"
@@ -444,6 +404,24 @@ export function NavBar(): JSX.Element {
                                 tabIndex={-1}
                             >
                                 <NavTabFiles />
+                            </Tabs.Panel>
+                        )}
+                        {isDesktopApp() && visitedNavTabs.includes('code') && (
+                            <Tabs.Panel
+                                value="code"
+                                className="absolute inset-0 flex flex-col"
+                                keepMounted
+                                tabIndex={-1}
+                            >
+                                <Suspense
+                                    fallback={
+                                        <WrappingLoadingSkeleton fullWidth>
+                                            <ButtonPrimitive aria-hidden inert menuItem />
+                                        </WrappingLoadingSkeleton>
+                                    }
+                                >
+                                    <NavTabCode />
+                                </Suspense>
                             </Tabs.Panel>
                         )}
                         {/* Lazy until first activated: the visited list only ever grows, so once
@@ -471,40 +449,17 @@ export function NavBar(): JSX.Element {
                                 </Suspense>
                             </Tabs.Panel>
                         )}
-                        {/* Same lazy pattern as chat: mounted on first visit, kept mounted after */}
-                        {isDesktopApp() && visitedNavTabs.includes('code') && (
-                            <Tabs.Panel
-                                value="code"
-                                className="absolute inset-0 flex flex-col"
-                                keepMounted
-                                tabIndex={-1}
-                            >
-                                <Suspense
-                                    fallback={
-                                        <div className="flex flex-col gap-px px-1 pt-2">
-                                            {Array.from({ length: 15 }).map((_, index) => (
-                                                <WrappingLoadingSkeleton fullWidth key={index}>
-                                                    <ButtonPrimitive aria-hidden inert menuItem />
-                                                </WrappingLoadingSkeleton>
-                                            ))}
-                                        </div>
-                                    }
-                                >
-                                    <NavTabCode />
-                                </Suspense>
-                            </Tabs.Panel>
-                        )}
                     </div>
 
                     <div className="px-2">
                         <div className="h-px bg-border-primary " />
                     </div>
 
-                    <div className="p-1">
+                    <div className={cn('p-1', !isSimpleSidepanelEnabled && isLayoutNavCollapsed && 'hidden')}>
                         <NavBarFooter isLayoutNavCollapsed={isLayoutNavCollapsed} />
                     </div>
                 </Tabs.Root>
-                {!isMobileLayout && (
+                {!isMobileLayout && !isOverlayOpen && (
                     <Resizer
                         {...resizerLogicProps}
                         data-attr="tree-navbar-resizer"

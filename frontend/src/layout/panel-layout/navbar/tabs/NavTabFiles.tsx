@@ -1,31 +1,60 @@
-import { BindLogic } from 'kea'
-import { useRef } from 'react'
+import { useValues } from 'kea'
 
-import { ScrollableShadows } from 'lib/components/ScrollableShadows/ScrollableShadows'
-import { LemonTreeRef } from 'lib/lemon-ui/LemonTree/LemonTree'
+import { Spinner } from '@posthog/lemon-ui'
 
-import { PROJECT_TREE_KEY, ProjectTree } from '~/layout/panel-layout/ProjectTree/ProjectTree'
-import { projectTreeLogic } from '~/layout/panel-layout/ProjectTree/projectTreeLogic'
-import { TreeSearchField } from '~/layout/panel-layout/ProjectTree/TreeSearchField'
+import { panelLayoutLogic } from '../../panelLayoutLogic'
+import { ProjectTree } from '../../ProjectTree/ProjectTree'
+import { projectTreeDataLogic } from '../../ProjectTree/projectTreeDataLogic'
+import { projectTreeLogic } from '../../ProjectTree/projectTreeLogic'
+import { FlatNavRecents } from './flat-nav/FlatNavRecents'
 
-/**
- * The desktop app's "Files" navbar tab: the project tree (same logic key as the web app's
- * Files flyout panel), rendered inline in the sidepanel with its own search on top.
- */
 export function NavTabFiles(): JSX.Element {
-    const projectTreeLogicProps = { key: PROJECT_TREE_KEY, root: 'project://' }
-    // The inline tree doesn't expose its LemonTree ref; search's ArrowDown-into-tree is a no-op here
-    const treeRef = useRef<LemonTreeRef>(null)
+    const { navExperimentActiveTab } = useValues(panelLayoutLogic)
+    const { shortcutDataHasLoaded } = useValues(projectTreeDataLogic)
+    const { fullFileSystemFiltered: starredFiles } = useValues(
+        projectTreeLogic({ key: 'navbar-files-starred', root: 'shortcuts://', shortcutScope: 'files' })
+    )
     return (
         <div className="flex flex-col h-full min-h-0">
-            <div className="px-2 pt-2 pb-1">
-                <BindLogic logic={projectTreeLogic} props={projectTreeLogicProps}>
-                    <TreeSearchField root="project://" placeholder="Search files" treeRef={treeRef} />
-                </BindLogic>
+            <div className="flex-1 min-h-0">
+                <ProjectTree
+                    panelName="files"
+                    root="project://"
+                    logicKey="navbar-files"
+                    searchPlaceholder="Filter files"
+                    showRecents
+                    layout="inline"
+                    beforeTree={
+                        <>
+                            <div className="px-1 pb-2">
+                                <div className="px-2 pt-1 pb-1">
+                                    <span className="text-xs font-semibold text-secondary">Starred</span>
+                                </div>
+                                {!shortcutDataHasLoaded ? (
+                                    <Spinner className="m-2" />
+                                ) : starredFiles.length > 0 ? (
+                                    <ProjectTree
+                                        root="shortcuts://"
+                                        shortcutScope="files"
+                                        logicKey="navbar-files-starred"
+                                        onlyTree
+                                        showShortcutHelp={false}
+                                    />
+                                ) : (
+                                    <p className="text-xs text-tertiary px-2 py-1 mb-0">
+                                        Star files or folders to keep them here.
+                                    </p>
+                                )}
+                            </div>
+                            <h3 className="px-3 pt-1 pb-1 mb-0 text-xs font-semibold text-secondary">Files</h3>
+                        </>
+                    }
+                    isActiveInPanel={navExperimentActiveTab === 'files'}
+                />
             </div>
-            <ScrollableShadows direction="vertical" className="flex-1 min-h-0" innerClassName="pb-2">
-                <ProjectTree root="project://" logicKey={PROJECT_TREE_KEY} onlyTree showRecents />
-            </ScrollableShadows>
+            <div className="max-h-1/3 overflow-y-auto px-2 border-t">
+                <FlatNavRecents />
+            </div>
         </div>
     )
 }

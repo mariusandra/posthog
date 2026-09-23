@@ -47,6 +47,11 @@ The PostHog web application, built with React and TypeScript. Uses [Kea](https:/
 - `src/queries` – Query builder and data visualization components
 - `src/toolbar` – Code for the [PostHog Toolbar](https://posthog.com/docs/user-guides/toolbar)
 
+The desktop build always enables `simple-sidepanel` and uses the shared Apps, Files, and Chat sidebar with Code as its fourth tab.
+Apps and Files have their own filters.
+Opening a tab from the collapsed sidebar temporarily expands it over the page; Chat expands the sidebar in place.
+Selecting a destination, clicking outside, or pressing Escape closes the temporary navigation.
+
 ### `posthog`
 
 The Django backend application. Key subdirectories:

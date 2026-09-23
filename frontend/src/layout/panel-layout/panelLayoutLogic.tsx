@@ -15,15 +15,13 @@ export type PanelLayoutNavIdentifier =
     | 'DataAndPeople'
     | 'Chat'
     | 'Notifications'
-export type NavExperimentTab = 'home' | 'chat' | 'code' | 'apps' | 'files'
+export type NavExperimentTab = 'home' | 'files' | 'chat' | 'code' | 'apps'
 export type PanelLayoutMainContentRef = React.RefObject<HTMLElement> | null
 export const PANEL_LAYOUT_DEFAULT_WIDTH: number = 245
 export const PANEL_LAYOUT_MIN_WIDTH: number = 160
 
 // Navbar resize: any width upward, snapping to collapsed below the threshold.
 export const PANEL_NAVBAR_DEFAULT_WIDTH: number = 215
-// Desktop app default: wide enough that the four tab labels (Apps/Files/Chat/Code) render next to their icons.
-export const DESKTOP_PANEL_NAVBAR_DEFAULT_WIDTH: number = 310
 // Below this the drag snaps to collapsed mode.
 export const PANEL_NAVBAR_COLLAPSE_THRESHOLD: number = 140
 
@@ -46,6 +44,7 @@ export interface panelLayoutLogicValues {
     isLayoutNavbarVisibleForMobile: boolean
     isLayoutPanelCloseable: boolean
     isLayoutPanelVisible: boolean
+    isNavOverlayOpen: boolean
     mainContentRect: DOMRect | null
     mainContentRef: PanelLayoutMainContentRef
     navExperimentActiveTab: NavExperimentTab
@@ -81,7 +80,10 @@ export interface panelLayoutLogicActions {
         ref: PanelLayoutMainContentRef
     }
     setNavExperimentTab: (tab: NavExperimentTab) => {
-        tab: NavExperimentTab
+        tab: 'chat' | 'code' | 'files' | 'home'
+    }
+    setNavOverlayOpen: (open: boolean) => {
+        open: boolean
     }
     setNavbarWidth: (width: number) => {
         width: number
@@ -163,10 +165,21 @@ export const panelLayoutLogic = kea<panelLayoutLogicType>([
         setMainContentRect: (rect: DOMRect) => ({ rect }),
         setSidePanelWidth: (width: number) => ({ width }),
         toggleNavSection: (section: string) => ({ section }),
-        setNavExperimentTab: (tab: NavExperimentTab) => ({ tab }),
+        setNavExperimentTab: (tab: NavExperimentTab) => ({ tab: tab === 'apps' ? 'home' : tab }),
         setNavbarWidth: (width: number) => ({ width }),
+        setNavOverlayOpen: (open: boolean) => ({ open }),
     }),
     reducers({
+        isNavOverlayOpen: [
+            false,
+            {
+                setNavOverlayOpen: (_, { open }) => open,
+                toggleLayoutNavCollapsed: () => false,
+                resetPanelLayout: () => false,
+                mobileLayout: () => false,
+                showLayoutNavBar: () => false,
+            },
+        ],
         isLayoutNavbarVisibleForDesktop: [
             true,
             { persist: true },
@@ -403,6 +416,9 @@ export const panelLayoutLogic = kea<panelLayoutLogicType>([
     }),
     urlToAction(({ actions, values }) => ({
         '*': () => {
+            if (values.isNavOverlayOpen) {
+                actions.setNavOverlayOpen(false)
+            }
             // URL-surfaced panels (DataAndPeople, DataManagement) set activePanelIdentifier
             // without flipping isLayoutPanelVisible, so check the identifier too — otherwise
             // navigating away from one leaves the panel and its dim mounted.

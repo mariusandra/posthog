@@ -3,7 +3,6 @@ import { useValues } from 'kea'
 import { IconGear } from '@posthog/icons'
 import { Link } from '@posthog/lemon-ui'
 
-import { NewAccountMenu } from 'lib/components/Account/NewAccountMenu'
 import { DebugNotice } from 'lib/components/DebugNotice'
 import { HelpMenu } from 'lib/components/HelpMenu/HelpMenu'
 import { NavPanelAdvertisement } from 'lib/components/NavPanelAdvertisement/NavPanelAdvertisement'
@@ -11,7 +10,6 @@ import { NotificationsMenu } from 'lib/components/NotificationsMenu/Notification
 import { PosthogStatusShownOnlyIfNotOperational } from 'lib/components/PosthogStatus/PosthogStatusShownOnlyIfNotOperational'
 import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
 import { cn } from 'lib/utils/css-classes'
-import { isDesktopApp } from 'lib/utils/isDesktopApp'
 import { urls } from 'scenes/urls'
 
 import { uiCustomizationLogic } from '~/layout/uiCustomizationLogic'
@@ -54,7 +52,6 @@ export function NavBarFooter({ isLayoutNavCollapsed }: { isLayoutNavCollapsed: b
                     {!isLayoutNavCollapsed && 'Settings'}
                 </Link>
                 {isSidebarItemShown('help') && <HelpMenu iconOnly={isLayoutNavCollapsed} />}
-                {isDesktopApp() && <NewAccountMenu isLayoutNavCollapsed={isLayoutNavCollapsed} />}
                 <PosthogStatusShownOnlyIfNotOperational iconOnly={isLayoutNavCollapsed} />
             </div>
         </div>
