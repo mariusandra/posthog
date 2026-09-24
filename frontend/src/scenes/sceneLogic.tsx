@@ -28,12 +28,7 @@ import { tabUiStateLogic } from 'lib/logic/tabUiStateLogic'
 import { getAppContext } from 'lib/utils/getAppContext'
 import { isChunkLoadError } from 'lib/utils/isChunkLoadError'
 import { isDesktopApp, isDesktopFreshWindow } from 'lib/utils/isDesktopApp'
-import {
-    addProjectIdIfMissing,
-    removeProjectIdIfPresent,
-    stripTrailingSlash,
-    getProjectIdentifierInPath,
-} from 'lib/utils/kea-router'
+import { addProjectIdIfMissing, removeProjectIdIfPresent, getProjectIdentifierInPath } from 'lib/utils/kea-router'
 import { retryImport } from 'lib/utils/retryImport'
 import { identifierToHuman } from 'lib/utils/strings'
 import { getRelativeNextPath } from 'lib/utils/url'
@@ -1497,14 +1492,6 @@ export const sceneLogic = kea<sceneLogicType>([
                 ])
             }
             persistTabs(values.tabs, values.homepage)
-
-            // Remove trailing slash from the address bar. Route matching itself is handled
-            // upstream via `pathFromWindowToRoutes` in initKea.ts so the scene loads even
-            // before this replace runs.
-            const stripped = stripTrailingSlash(pathname)
-            if (stripped !== pathname) {
-                router.actions.replace(stripped, search, hash)
-            }
         },
         setScene: ({ tabId, sceneKey, sceneId, exportedScene, params, scrollToTop }, _, __, previousState) => {
             const {
