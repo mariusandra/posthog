@@ -92,8 +92,10 @@ const isPostHogDomain = (url: string): boolean => {
     return /^https:\/\/((www|app|eu)\.)?posthog\.com/.test(url)
 }
 
+// Any scheme-qualified target belongs to the browser, not to the app router. A target the router
+// claims gets the project prefix, and `/project/<id>/chrome-extension://…` matches no route.
 const isDirectLink = (url: string): boolean => {
-    return /^(mailto:|https?:\/\/|:\/\/)/.test(url)
+    return /^([a-zA-Z][a-zA-Z\d+\-.]*:|:\/\/)/.test(url)
 }
 
 /** Resolve a `to` target into a concrete href string. */
@@ -145,7 +147,9 @@ export const LinkPrimitive: React.FC<LinkPrimitiveProps & React.RefAttributes<HT
         },
         ref
     ) => {
-        const externalLink = isExternalLink(to)
+        // `isExternalLink` knows http and mailto only, and `router.actions.push` rejects any other
+        // scheme with a `SecurityError`, so the scheme test widens the same exclusion.
+        const browserOwnedLink = isExternalLink(to) || (typeof to === 'string' && isDirectLink(to))
         const { elementProps: draggableProps } = useLinkDrag(typeof to === 'string' ? to : undefined)
 
         const onClick = (event: React.MouseEvent<HTMLElement>): void => {
@@ -153,7 +157,7 @@ export const LinkPrimitive: React.FC<LinkPrimitiveProps & React.RefAttributes<HT
                 event.stopPropagation()
                 // In the desktop app, cmd/ctrl+click on an internal link opens a scene tab
                 // (like a browser's "open in new tab") instead of a new window
-                if (isDesktopApp() && typeof to === 'string' && !externalLink && !disableClientSideRouting) {
+                if (isDesktopApp() && typeof to === 'string' && !browserOwnedLink && !disableClientSideRouting) {
                     event.preventDefault()
                     newInternalTab(to, { title: event.currentTarget.textContent?.trim() || undefined })
                 }
@@ -167,7 +171,7 @@ export const LinkPrimitive: React.FC<LinkPrimitiveProps & React.RefAttributes<HT
                 return
             }
 
-            if (!target && to && !externalLink && !disableClientSideRouting && !shouldForcePageLoad(to)) {
+            if (!target && to && !browserOwnedLink && !disableClientSideRouting && !shouldForcePageLoad(to)) {
                 event.preventDefault()
                 if (to && to !== '#' && !preventClick) {
                     if (Array.isArray(to)) {

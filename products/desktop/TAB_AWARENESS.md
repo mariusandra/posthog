@@ -51,6 +51,12 @@ The lists below this section describe the pre-sync audit and include paths that 
 - [ ] `products/web_analytics/frontend/heatmaps/scenes/heatmap/HeatmapScene.tsx`
 - [ ] `products/wizard/frontend/WizardRunsScene.tsx`
 
+Additional scenes from upstream `247b9b1ad96` need the same review:
+
+- [ ] `products/tracing/frontend/scenes/TracingRetentionDetailScene/TracingRetentionDetailScene.tsx`
+- [ ] `products/tracing/frontend/scenes/TracingRetentionNewScene/TracingRetentionNewScene.tsx`
+- [ ] `products/workflows/frontend/Broadcasts/BroadcastsScene.tsx`
+
 ## Tab aware (43)
 
 - [x] `frontend/src/scenes/activity/explore/EventsScene.tsx` (eventsSceneLogic)

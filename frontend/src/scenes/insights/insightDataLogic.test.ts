@@ -683,7 +683,34 @@ describe('insightDataLogic', () => {
                 {} as any
             )
             const findMountedSpy = jest.spyOn(insightSceneLogic, 'findMounted').mockReturnValue({
-                values: { insightLogicRef: { logic: { key: Insight42 } } },
+                values: { insightId: Insight42, dashboardId: null },
+            } as any)
+
+            try {
+                await expectLogic(logic, () => {
+                    logic.actions.persistDisplayOptions(updatedQuery)
+                }).toFinishAllListeners()
+
+                expect(patchSpy).not.toHaveBeenCalled()
+            } finally {
+                findMountedSpy.mockRestore()
+                sceneLogic.unmount()
+            }
+        })
+
+        it('skips the PATCH even when insightSceneLogic has not yet rebuilt its insightLogicRef for this insight', async () => {
+            // insightLogicRef can lag insightId/dashboardId right after the scene mounts, because a
+            // separate listener rebuilds it asynchronously. This mocks that lag: the guard must not
+            // rely on insightLogicRef being present or already correct.
+            sceneLogic.mount()
+            sceneLogic.actions.setScene(
+                Scene.Insight,
+                undefined,
+                sceneLogic.values.activeTabId || 'test-tab',
+                {} as any
+            )
+            const findMountedSpy = jest.spyOn(insightSceneLogic, 'findMounted').mockReturnValue({
+                values: { insightId: Insight42, dashboardId: null, insightLogicRef: null },
             } as any)
 
             try {
@@ -1149,7 +1176,12 @@ describe('insightDataLogic', () => {
         beforeEach(() => {
             localStorage.removeItem(draftKey)
             sceneLogic.mount()
-            sceneLogic.actions.setScene(Scene.Insight, undefined, 'test-tab', {} as any)
+            sceneLogic.actions.setScene(
+                Scene.Insight,
+                undefined,
+                sceneLogic.values.activeTabId || 'test-tab',
+                {} as any
+            )
             logic = insightDataLogic({ dashboardItemId: 'new' })
             logic.mount()
         })
