@@ -8,6 +8,10 @@ Status source: `scene: SceneExport` files, checked for `tabAwareScene()` / tabId
 
 ## September 2026 sync review
 
+The sync to upstream `cd7f5b6241b6` adds another scene that needs tab-awareness review:
+
+- [ ] `products/warehouse_sources/frontend/scenes/PipelineOverviewScene/PipelineOverviewScene.tsx`
+
 The following scene exports arrived or moved during the sync to upstream `e6fddf27007`.
 Their root and child logic need a tab-awareness review before treating them as isolated across desktop tabs.
 The lists below this section describe the pre-sync audit and include paths that have since moved.
