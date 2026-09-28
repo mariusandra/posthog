@@ -305,6 +305,7 @@ export function DashboardsTable({
                                                   setHomepage(
                                                       {
                                                           id: `homepage-dashboard-${id}`,
+                                                          active: false,
                                                           pathname: urls.dashboard(id),
                                                           search: '',
                                                           hash: '',
