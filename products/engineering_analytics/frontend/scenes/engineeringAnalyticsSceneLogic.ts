@@ -4,8 +4,8 @@ import { tabAwareScene } from 'lib/logic/scenes/tabAwareScene'
 
 import { sceneLogic } from '~/scenes/sceneLogic'
 
-/** The root scene's views: the repo hub and the pull request, workflow, test, deploy, and team list pages. */
-export type EngineeringAnalyticsView = 'hub' | 'pull-requests' | 'workflows' | 'tests' | 'deploys' | 'teams'
+/** The root scene's views: the repo hub and the pull request, workflow, test, deploy, team, and author list pages. */
+export type EngineeringAnalyticsView = 'hub' | 'pull-requests' | 'workflows' | 'tests' | 'deploys' | 'teams' | 'authors'
 
 export const VIEW_DESCRIPTIONS: Record<EngineeringAnalyticsView, string> = {
     hub: 'CI health, pull requests, workflows, and cost for the connected repo.',
@@ -15,6 +15,7 @@ export const VIEW_DESCRIPTIONS: Record<EngineeringAnalyticsView, string> = {
     deploys:
         'DORA-style deploy metrics from GitHub deployments: frequency, merge to deploy lead time, and failure proxies.',
     teams: 'Tests each team owns and their CI signal, from the owners.yaml map.',
+    authors: 'Friction each author meets in CI, review, and the merge queue, against the typical author.',
 }
 
 const SCENE_KEY_TO_VIEW: Record<string, EngineeringAnalyticsView> = {
@@ -23,6 +24,7 @@ const SCENE_KEY_TO_VIEW: Record<string, EngineeringAnalyticsView> = {
     engineeringAnalyticsWorkflows: 'workflows',
     engineeringAnalyticsTests: 'tests',
     engineeringAnalyticsTeams: 'teams',
+    engineeringAnalyticsAuthors: 'authors',
     engineeringAnalyticsDeploys: 'deploys',
 }
 

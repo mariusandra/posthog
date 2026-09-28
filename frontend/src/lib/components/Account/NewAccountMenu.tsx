@@ -88,7 +88,7 @@ export function NewAccountMenu({ isLayoutNavCollapsed }: AccountMenuProps): JSX.
                             // indicator lines up with the "More" row's caret above it
                             menuItem={isDesktopApp() && !isLayoutNavCollapsed}
                             className={cn('relative flex-1 py-1 min-w-0 group', {
-                                'pl-[3px] gap-[6px]': !isLayoutNavCollapsed,
+                                'pl-[3px] pr-1 gap-[2px]': !isLayoutNavCollapsed,
                             })}
                             data-attr="new-account-menu-button"
                             tooltip={

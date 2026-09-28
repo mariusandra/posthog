@@ -49,7 +49,7 @@ import { ActivityTab } from '~/types'
 
 import { BrowserLikeMenuItems } from '../../ProjectTree/menus/BrowserLikeMenuItems'
 import { PanelIndicatorIcon, SectionTrigger } from '../NavBar'
-import { editToolsLogic } from './editToolsLogic'
+import { editProductsLogic } from './editProductsLogic'
 import { navRecentsLogic } from './navRecentsLogic'
 
 const panelTriggerItems: {
@@ -73,7 +73,7 @@ const panelTriggerItems: {
     {
         identifier: 'Products',
         configKey: 'tools',
-        label: 'Tools',
+        label: 'Products',
         icon: <IconApps />,
     },
     {
@@ -177,10 +177,10 @@ export function NavTabBrowse(): JSX.Element {
     const isProductAutonomyEnabled = useFeatureFlag('PRODUCT_AUTONOMY')
     const { recentItems, recentItemsLoading } = useValues(navRecentsLogic)
     const { isSidebarSectionShown, isSidebarItemShown, uiCustomizationEnabled } = useValues(uiCustomizationLogic)
-    const { enabledToolPaths } = useValues(customProductsLogic)
+    const { enabledProductPaths } = useValues(customProductsLogic)
     // Flag-off path: the pre-customization edit mode and home modal.
-    const { isEditMode, checkedTools } = useValues(editToolsLogic)
-    const { enterEditMode, saveAndExitEditMode, toggleTool } = useActions(editToolsLogic)
+    const { isEditMode, checkedProducts } = useValues(editProductsLogic)
+    const { enterEditMode, saveAndExitEditMode, toggleProduct } = useActions(editProductsLogic)
     const { showConfigureHomeModal } = useActions(navigationLogic)
     const { reportNavItemClicked } = useActions(eventUsageLogic)
     const currentPath = removeProjectIdIfPresent(pathname)
@@ -412,12 +412,12 @@ export function NavTabBrowse(): JSX.Element {
                     data-attr="nav-section-tools"
                 >
                     <div className="relative">
-                        <SectionTrigger icon={<IconApps />} label="My Tools" isCollapsed={isLayoutNavCollapsed} />
+                        <SectionTrigger icon={<IconApps />} label="My products" isCollapsed={isLayoutNavCollapsed} />
                         {expandedNavSections.tools &&
                             (uiCustomizationEnabled ? (
                                 <Link
                                     to={urls.settings('user-navigation')}
-                                    tooltip="Choose which tools to show in the sidebar"
+                                    tooltip="Choose which products to show in the sidebar"
                                     tooltipPlacement="top"
                                     onClick={() => posthog.capture('nav tools customize clicked')}
                                     buttonProps={{
@@ -434,7 +434,7 @@ export function NavTabBrowse(): JSX.Element {
                                 <ButtonPrimitive
                                     iconOnly
                                     size="xs"
-                                    tooltip={isEditMode ? 'Save' : 'Choose which tools to show in the sidebar'}
+                                    tooltip={isEditMode ? 'Save' : 'Choose which products to show in the sidebar'}
                                     tooltipPlacement="top"
                                     onClick={() => {
                                         if (isEditMode) {
@@ -458,10 +458,10 @@ export function NavTabBrowse(): JSX.Element {
                     </div>
                     <Collapsible.Panel className="-ml-2 pl-3 pr-1 w-[calc(100%+(var(--spacing)*4))]">
                         {!(expandedNavSections.tools ?? false) ? null : uiCustomizationEnabled &&
-                          enabledToolPaths.size === 0 ? (
+                          enabledProductPaths.size === 0 ? (
                             // Without this the section header opens onto nothing, reading as broken
-                            // rather than as "you haven't picked any tools yet".
-                            <span className="text-xs text-tertiary px-2 py-1 block">No tools shown</span>
+                            // rather than as "you haven't picked any products yet".
+                            <span className="text-xs text-tertiary px-2 py-1 block">No products shown</span>
                         ) : (
                             <ProjectTree
                                 root={!uiCustomizationEnabled && isEditMode ? 'products://' : 'custom-products://'}
@@ -476,13 +476,15 @@ export function NavTabBrowse(): JSX.Element {
                                 onlyTree
                                 treeSize={isLayoutNavCollapsed ? 'narrow' : 'default'}
                                 selectModeOverride={!uiCustomizationEnabled && isEditMode ? 'multi' : undefined}
-                                checkedItemsOverride={!uiCustomizationEnabled && isEditMode ? checkedTools : undefined}
+                                checkedItemsOverride={
+                                    !uiCustomizationEnabled && isEditMode ? checkedProducts : undefined
+                                }
                                 onItemCheckedOverride={
                                     !uiCustomizationEnabled && isEditMode
                                         ? (id) => {
                                               // Tree item IDs for products:// are "products/{path}"
-                                              const toolPath = id.replace(/^products\//, '')
-                                              toggleTool(toolPath)
+                                              const productPath = id.replace(/^products\//, '')
+                                              toggleProduct(productPath)
                                           }
                                         : undefined
                                 }

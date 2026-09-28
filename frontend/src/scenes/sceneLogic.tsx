@@ -376,6 +376,7 @@ export interface sceneLogicValues {
     frozenWidths: Record<string, number> | null
     hashParams: Record<string, any>
     homepage: SceneTab | null
+    homepageSaving: boolean
     lastReloadAt: number | null
     lastSetScenePayload: Record<string, any>
     loadingScene: string | null
@@ -465,6 +466,9 @@ export interface sceneLogicActions {
     }
     freezeTabWidths: () => {
         value: true
+    }
+    homepageSaved: (tab: SceneTab | null) => {
+        tab: SceneTab | null
     }
     loadScene: (
         sceneId: string,
@@ -570,8 +574,15 @@ export interface sceneLogicActions {
     setFrozenWidths: (widths: Record<string, number> | null) => {
         widths: Record<string, number> | null
     }
-    setHomepage: (tab: SceneTab | null) => {
+    setHomepage: (
+        tab: SceneTab | null,
+        homepageSource?: 'dashboards list'
+    ) => {
+        homepageSource: 'dashboards list' | undefined
         tab: SceneTab | null
+    }
+    setHomepageSaving: (saving: boolean) => {
+        saving: boolean
     }
     setScene: (
         sceneId: string,
@@ -683,6 +694,8 @@ export const sceneLogic = kea<sceneLogicType>([
         cache.lastRegisteredTabCount = null as number | null
         // A fresh sceneLogic lifecycle means the desktop restore hasn't run yet for it
         desktopTabsRestored = false
+        cache.homepageSave = Promise.resolve()
+        cache.homepageRequest = 0
     }),
     actions({
         /* 1. Prepares to open the scene, as the listener may override and do something
@@ -768,7 +781,6 @@ export const sceneLogic = kea<sceneLogicType>([
             title,
             iconType,
         }),
-        setHomepage: (tab: SceneTab | null) => ({ tab }),
         closeTabId: (tabId: string, options?: { source?: TabCloseSource }) => ({ tabId, options }),
         removeTab: (tab: SceneTab, options?: { source?: TabCloseSource }) => ({ tab, options }),
         activateTab: (tab: SceneTab) => ({ tab }),
@@ -785,6 +797,9 @@ export const sceneLogic = kea<sceneLogicType>([
         setFrozenWidths: (widths: Record<string, number> | null) => ({ widths }),
         clearFrozenWidths: true,
         freezeTabWidths: true,
+        setHomepage: (tab: SceneTab | null, homepageSource?: 'dashboards list') => ({ tab, homepageSource }),
+        homepageSaved: (tab: SceneTab | null) => ({ tab }),
+        setHomepageSaving: (saving: boolean) => ({ saving }),
         resetUnavailableHomepage: (pathname: string) => ({ pathname }),
     }),
     reducers({
@@ -1048,9 +1063,16 @@ export const sceneLogic = kea<sceneLogicType>([
         homepage: [
             getBootstrappedHomepage(),
             {
-                setHomepage: (_, { tab }) => (tab ? sanitizeTabForPersistence(tab) : null),
+                setHomepage: (state, { tab, homepageSource }) => {
+                    if (homepageSource) {
+                        return state
+                    }
+                    return tab ? sanitizeTabForPersistence(tab) : null
+                },
+                homepageSaved: (_, { tab }) => (tab ? sanitizeTabForPersistence(tab) : null),
             },
         ],
+        homepageSaving: [false, { setHomepageSaving: (_, { saving }) => saving }],
     })),
     selectors({
         activeTab: [
@@ -1365,15 +1387,39 @@ export const sceneLogic = kea<sceneLogicType>([
                 )
             }
         },
-        setHomepage: ({ tab }) => {
-            if (isSharedView()) {
+        setHomepage: async ({ tab, homepageSource }) => {
+            if (isSharedView() || (homepageSource && values.homepageSaving)) {
                 return
             }
-            api.update('api/user_home_settings/@me/', {
-                homepage: tab ? sanitizeTabForPersistence(tab) : null,
-            }).catch((error) => {
-                console.error('Failed to persist homepage', error)
-            })
+            if (homepageSource) {
+                actions.setHomepageSaving(true)
+            }
+            const requestId = ++cache.homepageRequest
+            const previousSave = cache.homepageSave
+            cache.homepageSave = (async () => {
+                await previousSave
+                try {
+                    // nosemgrep: prefer-codegen-api -- Legacy raw API call with a hand-written URL and an unchecked response type. Use userHomeSettingsPartialUpdate() from 'products/platform_features/frontend/generated/api' instead.
+                    await api.update('api/user_home_settings/@me/', {
+                        homepage: tab ? sanitizeTabForPersistence(tab) : null,
+                    })
+                    if (homepageSource && requestId === cache.homepageRequest) {
+                        actions.homepageSaved(tab)
+                        lemonToast.success('Homepage updated')
+                        posthog.capture('dashboard set as homepage', { source: homepageSource })
+                    }
+                } catch (error) {
+                    console.error('Failed to persist homepage', error)
+                    if (homepageSource && requestId === cache.homepageRequest) {
+                        lemonToast.error('Could not save your homepage. Please try again.')
+                    }
+                } finally {
+                    if (homepageSource) {
+                        actions.setHomepageSaving(false)
+                    }
+                }
+            })()
+            await cache.homepageSave
         },
         closeTabId: ({ tabId, options }) => {
             const tab = values.tabs.find(({ id }) => id === tabId)

@@ -13,6 +13,7 @@ import { ProductKey } from '~/queries/schema/schema-general'
 
 import { engineeringAnalyticsEmptyState } from '../emptyState/engineeringAnalyticsEmptyState'
 import { doraLogic } from './doraLogic'
+import { EngineeringAnalyticsAuthors } from './EngineeringAnalyticsAuthors'
 import { EngineeringAnalyticsDeploys } from './EngineeringAnalyticsDeploys'
 import { engineeringAnalyticsLogic } from './engineeringAnalyticsLogic'
 import { EngineeringAnalyticsPullRequests } from './EngineeringAnalyticsPullRequests'
@@ -112,6 +113,13 @@ export function EngineeringAnalyticsScene({ tabId }: { tabId?: string }): JSX.El
             content: <EngineeringAnalyticsTeams />,
             link: combineUrl(urls.engineeringAnalyticsTeams(), linkParams).url,
             'data-attr': 'engineering-analytics-teams-tab',
+        },
+        {
+            key: 'authors',
+            label: 'Authors',
+            content: <EngineeringAnalyticsAuthors />,
+            link: combineUrl(urls.engineeringAnalyticsAuthors(), linkParams).url,
+            'data-attr': 'engineering-analytics-authors-tab',
         },
     ]
 
